@@ -1,4 +1,4 @@
-# intro-whatsapp-bridge
+# whatsapp-bridge
 
 A local daemon that puts **Intro** (the Grok Bot agent) on a **dedicated WhatsApp number**. It receives messages, acknowledges them with 👀 within seconds, hands them to Intro as one *turn* per burst, sends Intro's reply back in-thread, clears the 👀, and interrupts in-flight work when newer messages arrive. Intro's own reasoning stays outside this repo: the bridge is a messaging I/O layer with a small HTTP API on localhost.
 
@@ -17,6 +17,7 @@ Built as an [Effect v4](https://effect.website) service from top to bottom (serv
 - [Event schema (v1)](#event-schema-v1)
 - [Configuration](#configuration)
 - [Health and failure modes](#health-and-failure-modes)
+- [What happens when things go wrong](#what-happens-when-things-go-wrong)
 - [Security and privacy](#security-and-privacy)
 - [Development](#development)
 
@@ -25,8 +26,8 @@ Built as an [Effect v4](https://effect.website) service from top to bottom (serv
 Requirements: Node 22+, the dedicated phone with WhatsApp installed and online.
 
 ```sh
-git clone git@github.com:moishinetzer/intro-whatsapp-bridge.git
-cd intro-whatsapp-bridge
+git clone git@github.com:moishinetzer/whatsapp-bridge.git
+cd whatsapp-bridge
 npm install            # or: pnpm install
 cp .env.example .env   # every value has a default; edit if you must
 
@@ -56,6 +57,8 @@ npm run link -- --phone 447700900123      # digits with country code, no +
 
 On the phone: **Linked devices → Link a device → Link with phone number instead**, then type the code.
 
+`npm run link -- --timeout "10 minutes"` gives up if the phone never completes the link (default 5 minutes).
+
 **Re-linking.** When WhatsApp invalidates the session (you unlinked the device on the phone, the number was logged out or banned), the daemon reports `needs_relink`, moves the old session aside as `data/auth.invalid-<time>` and keeps serving `/health` so Intro can see the state. Run `npm run link` again; nothing else changes. To start from scratch on purpose: `npm run bridge -- unlink --yes`.
 
 ## Running
@@ -79,7 +82,7 @@ inbound message ──▶ 👀 within seconds ──▶ batch window (1.5 s) ─
 ```
 
 - **Seen acknowledgment.** Every accepted inbound message gets the 👀 reaction (retried with backoff). If the reaction cannot be applied after retries, a warning is logged; set `BRIDGE_SEEN_FALLBACK_TEXT` to send a short text instead.
-- **Batching.** Messages from the same chat that arrive within `BRIDGE_BATCH_WINDOW` of each other are one turn. A message that arrives during the window restarts it.
+- **Batching.** Messages from the same chat that arrive within `BRIDGE_BATCH_WINDOW` of each other are one turn. A message that arrives during the window restarts it, but a turn always opens within `BRIDGE_BATCH_MAX_WAIT` of its oldest message, so a steady trickle cannot postpone a reply forever.
 - **Interrupts.** If a message arrives while the responder is working (or while Intro is composing a reply in manual mode), the turn is *superseded*: the responder call is interrupted (an HTTP handler sees its request aborted), a `TurnSuperseded` event names the replacement, and a new `TurnOpened` carries every unanswered message. A reply posted for the old turn is refused with 409 so a stale answer is never sent.
 - **Commit is atomic.** Once the responder has answered, the send-and-clear step cannot be interrupted: the reply goes out, the 👀 come off, then any newer message starts a fresh turn of its own.
 - **Idempotency.** Each WhatsApp message id is handled once per daemon run: one 👀, one turn. Echoes of the bridge's own messages are ignored (no reply loops).
@@ -187,6 +190,7 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 | `INTRO_HANDLER_URL` | | Required for `http` |
 | `INTRO_HANDLER_TIMEOUT` | `120 seconds` | Per handler call |
 | `BRIDGE_BATCH_WINDOW` | `1500 millis` | Batch window per chat |
+| `BRIDGE_BATCH_MAX_WAIT` | `5 seconds` | Upper bound on batching per turn |
 | `BRIDGE_TURN_TIMEOUT` | `10 minutes` | Manual mode: how long a turn waits for a reply |
 | `BRIDGE_SEEN_EMOJI` | `👀` | The seen reaction |
 | `BRIDGE_SEEN_FALLBACK_TEXT` | unset | Text ack if the reaction fails |
@@ -195,7 +199,7 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 | `BRIDGE_OFFLINE_WINDOW` | `0 seconds` | Handle messages replayed after downtime that are younger than this |
 | `BRIDGE_TYPING` | `true` | Typing indicator while answering |
 | `LOG_LEVEL` / `LOG_FORMAT` / `LOG_BODIES` | `Info` / `pretty` / `false` | Logging |
-| `BAILEYS_LOG_LEVEL` | `silent` | The protocol library's logger |
+| `BAILEYS_LOG_LEVEL` | `warn` | The protocol library's own log level; lines are forwarded, redacted, into the bridge log |
 | `WA_BROWSER_NAME` | `Intro Bridge` | Name in the phone's Linked devices list |
 | `BRIDGE_URL` | `http://$HOST:$PORT` | Where the CLI client commands find the daemon |
 
@@ -207,7 +211,8 @@ Durations use Effect's format: `"1500 millis"`, `"2 seconds"`, `"10 minutes"`.
 
 ```json
 { "state": "ok", "linkedAs": { "jid": "4479...@s.whatsapp.net", "name": "Intro" }, "responder": "manual",
-  "version": "0.1.0", "startedAt": "...", "lastEventAt": "...", "lastInboundAt": "...", "lastOutboundAt": "...", "openTurns": 0 }
+  "version": "0.1.0", "startedAt": "...", "lastEventAt": "...", "lastInboundAt": "...", "lastOutboundAt": "...",
+  "reconnects": 2, "lastDisconnect": { "at": "...", "reason": "Connection Terminated (428)" }, "openTurns": 0 }
 ```
 
 | `state` | Meaning | What to do |
@@ -222,6 +227,30 @@ Durations use Effect's format: `"1500 millis"`, `"2 seconds"`, `"10 minutes"`.
 While `connecting`, sends fail with `NotConnected`; the engine retries outbound calls with backoff for about half a minute, which covers a normal reconnect. `TurnFailed` events and the `failure` field on a turn carry the reason when it does not.
 
 Message bodies never appear in logs above Debug, and only with `LOG_BODIES=true`. Session credentials never appear in logs at all.
+
+## What happens when things go wrong
+
+The bridge is built so that every failure is either recovered automatically or reported with its reason. The table is the contract.
+
+| Situation | Behaviour |
+|---|---|
+| Network drops, WhatsApp closes the socket | Reconnect with jittered exponential backoff (1 s up to 60 s). A connection that lived 30 s resets the backoff. "Restart required" closes reconnect at once, at most 3 times in a row. `/health` shows `connecting` with the reason, `reconnects` counts, `lastDisconnect` explains. |
+| WhatsApp logs the number out, bans it, rejects the session | `needs_relink` with the reason; the session is moved to `data/auth.invalid-<time>` (last three kept) so `bridge link` starts clean. The daemon keeps serving the API. |
+| Socket creation or the connection attempt crashes | Logged with its cause, treated as a reconnect. The supervisor itself is restarted after 5 s if it ever dies. |
+| The protocol library logs a warning or error | Forwarded into the bridge log at the same level, redacted (`BAILEYS_LOG_LEVEL`). |
+| A phone shows "waiting for this message" | WhatsApp's resend request is answered from an in-memory outbox of the last 1000 sent messages. |
+| Two daemons on one session | The second refuses to start: `another bridge process (pid N) holds this session`. Stale locks from crashed processes are taken over. |
+| A message cannot be decoded | Logged with the reason, skipped; everything else flows. |
+| WhatsApp re-delivers a message | Ignored: one 👀 and one turn per message id, checked in the transport and again in the engine. |
+| Messages keep trickling in | The turn opens at `BRIDGE_BATCH_MAX_WAIT` regardless. |
+| The responder fails, times out, or throws | `TurnFailed` with the reason, 👀 left on, typing cleared; the worker moves on to the next message. |
+| Sending the reply fails | Retried 5 times with backoff (about 30 s, enough for a reconnect); then `TurnFailed`. The message id is fixed before the first attempt, so a send that timed out but went through is never delivered twice. |
+| A reply is very long or empty | Text over 4000 characters is split at paragraph, line or sentence boundaries into several messages; blank replies are dropped. |
+| The 👀 reaction fails | Warning logged; `BRIDGE_SEEN_FALLBACK_TEXT` sends a text instead. |
+| Intro's SSE client stalls | Its buffer slides (oldest dropped) instead of growing; reconnect with `?since=` to catch up. |
+| A promise inside the protocol library rejects unhandled | Logged with its reason, the daemon keeps running. An uncaught exception is logged and the process exits 1 for the supervisor to restart. |
+| Ctrl-C / SIGTERM | In-flight replies finish (that step is uninterruptible), the socket and server close within 5 s, the lock is removed. |
+| Bad configuration | The daemon refuses to start and names the variable. |
 
 ## Security and privacy
 

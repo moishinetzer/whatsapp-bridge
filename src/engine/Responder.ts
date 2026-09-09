@@ -40,7 +40,11 @@ export type ResponderReply =
 export class HandlerFailed extends Schema.TaggedError<HandlerFailed>()("HandlerFailed", {
   turnId: TurnId,
   detail: Schema.String,
-}) {}
+}) {
+  override get message() {
+    return `handler failed for ${this.turnId}: ${this.detail}`
+  }
+}
 
 export interface ResponderShape {
   readonly kind: ResponderKind

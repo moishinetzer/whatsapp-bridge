@@ -312,3 +312,132 @@ describe("TurnEngine", () => {
     }).pipe(Effect.provide(EngineTestLayer())),
   )
 })
+
+describe("TurnEngine hardening", () => {
+  it.effect("survives a responder that throws: the turn fails, the worker lives on", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      const events = yield* collectEvents(2)
+      yield* Ref.set(responder.behaviour, () => Effect.die(new Error("kaboom")))
+
+      const m1 = message("explode")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      const seen = yield* events
+      expect(seen.map((e) => e._tag)).toEqual(["TurnOpened", "TurnFailed"])
+      expect((yield* registry.get(call.turnId)).failure).toContain("crashed")
+      // typing was switched off again
+      const typing = yield* Ref.get(wa.typing)
+      expect(typing.at(-1)?.composing).toBe(false)
+
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(replies("alive")))
+      yield* wa.deliver(message("still there?"))
+      yield* takeSoon(wa.reactions)
+      yield* takeSoon(responder.calls)
+      expect((yield* takeSoon(wa.sent)).text).toBe("alive")
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("handles a re-delivered message id exactly once", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const m1 = message("once")
+      yield* wa.deliver(m1)
+      yield* wa.deliver(m1)
+      expect((yield* takeSoon(wa.reactions)).emoji).toBe("👀")
+      const call = yield* takeSoon(responder.calls)
+      expect(call.messages.length).toBe(1)
+      yield* takeSoon(wa.sent)
+      expect((yield* takeSoon(wa.reactions)).emoji).toBe("")
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.reactions))).toBe(true)
+      expect(Option.isNone(yield* Queue.poll(responder.calls))).toBe(true)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("opens a turn after the max wait even when messages keep trickling in", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+
+      yield* wa.deliver(message("one"))
+      yield* takeSoon(wa.reactions)
+      yield* settle
+      yield* TestClock.adjust("900 millis")
+      yield* wa.deliver(message("two"))
+      yield* takeSoon(wa.reactions)
+      yield* settle
+      yield* TestClock.adjust("900 millis")
+      yield* wa.deliver(message("three"))
+      yield* takeSoon(wa.reactions)
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(responder.calls))).toBe(true)
+      // the window alone would wait until t=2.8s; the max wait of 2s opens the turn at t=2.0s
+      yield* TestClock.adjust("900 millis")
+      const call = yield* takeSoon(responder.calls)
+      expect(call.messages.map((m) => m.text)).toEqual(["one", "two", "three"])
+    }).pipe(Effect.provide(EngineTestLayer({ batchWindow: Duration.seconds(1), batchMaxWait: Duration.seconds(2) }))),
+  )
+})
+
+describe("TurnEngine sending", () => {
+  it.effect("fixes the message id before retrying so a flaky send cannot double-deliver", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      yield* Ref.set(wa.failNextSends, 1)
+      yield* wa.deliver(message("once please"))
+      yield* takeSoon(wa.reactions)
+      yield* takeSoon(responder.calls)
+      yield* settle
+      yield* TestClock.adjust("1 second")
+      const sent = yield* takeSoon(wa.sent)
+      // the id was minted before the first attempt (out_1); the retry reused it instead of minting out_2
+      expect(sent.messageId).toBe("out_1")
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("splits a long reply into several messages and drops empty ones", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      const long = `${"first paragraph ".repeat(150)}\n\n${"second paragraph ".repeat(150)}`
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(replies("", long, "   ", "tail")))
+      yield* wa.deliver(message("essay please"))
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      const a = yield* takeSoon(wa.sent)
+      const b = yield* takeSoon(wa.sent)
+      const c = yield* takeSoon(wa.sent)
+      expect(a.text.length).toBeLessThanOrEqual(4_000)
+      expect(b.text.length).toBeLessThanOrEqual(4_000)
+      expect(c.text).toBe("tail")
+      yield* takeSoon(wa.reactions)
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
+      expect((yield* registry.get(call.turnId)).sentMessageIds?.length).toBe(3)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("an empty answer completes the turn and clears 👀 without sending", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(replies()))
+      const m1 = message("no need to answer")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "" })
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
+      expect((yield* registry.get(call.turnId)).state).toBe("committed")
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+})

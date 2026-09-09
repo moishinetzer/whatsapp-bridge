@@ -1,7 +1,8 @@
 import { NodeHttpServer } from "@effect/platform-node"
-import { DateTime, Effect, Layer, Option, Redacted, Schedule, Stream } from "effect"
+import { Cause, Clock, DateTime, Effect, Layer, Option, Redacted, Schedule, Stream } from "effect"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiScalar } from "effect/unstable/httpapi"
+import { createHash, timingSafeEqual } from "node:crypto"
 import { createServer } from "node:http"
 import { BridgeConfig } from "../config.ts"
 import { Events } from "../engine/Events.ts"
@@ -93,6 +94,10 @@ export const ApiLive = Layer.mergeAll(
 /** Public paths that never need the bearer token. */
 const OPEN_PATHS = ["/health", "/docs", "/openapi.json"]
 
+/** Constant-time comparison; hashing first equalises lengths so nothing leaks through timing. */
+const sameToken = (presented: string, expected: string): boolean =>
+  timingSafeEqual(createHash("sha256").update(presented).digest(), createHash("sha256").update(expected).digest())
+
 /** When `BRIDGE_API_TOKEN` is set, everything but `/health` and the docs requires it. */
 export const bearerAuth =
   (token: Option.Option<Redacted.Redacted<string>>) =>
@@ -104,17 +109,42 @@ export const bearerAuth =
           const request = yield* HttpServerRequest.HttpServerRequest
           const path = request.url.split("?")[0] ?? request.url
           if (OPEN_PATHS.some((p) => path === p || path.startsWith(`${p}/`))) return yield* app
-          if (request.headers.authorization === `Bearer ${Redacted.value(secret)}`) return yield* app
+          const header = request.headers.authorization ?? ""
+          const presented = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : ""
+          if (presented.length > 0 && sameToken(presented, Redacted.value(secret))) return yield* app
           return HttpServerResponse.jsonUnsafe({ _tag: "Unauthorized", message: "missing or wrong bearer token" }, { status: 401 })
         }),
     })
+
+/** One Info line per request; a client that hangs up (an SSE consumer leaving) is Debug, not an error. */
+export const requestLog = <E, R>(app: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>) =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
+    const started = yield* Clock.currentTimeMillis
+    const fields = (extra: Record<string, unknown>) =>
+      Effect.map(Clock.currentTimeMillis, (now) => ({ method: request.method, path: request.url, ms: now - started, ...extra }))
+    return yield* app.pipe(
+      Effect.tap((response) => Effect.flatMap(fields({ status: response.status }), (f) => Effect.logInfo("http").pipe(Effect.annotateLogs(f)))),
+      Effect.tapCause((cause) =>
+        Effect.flatMap(fields({}), (f) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.logDebug("http client went away").pipe(Effect.annotateLogs(f))
+            : Effect.logWarning("http request failed", cause).pipe(Effect.annotateLogs(f)),
+        ),
+      ),
+    )
+  })
 
 /** The listening server. Binds `BRIDGE_HOST:BRIDGE_PORT` (loopback by default). */
 export const HttpServerLive = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* BridgeConfig
-    return HttpRouter.serve(ApiLive, { middleware: bearerAuth(config.apiToken) }).pipe(
-      Layer.provide(NodeHttpServer.layer(createServer, { host: config.host, port: config.port })),
+    const auth = bearerAuth(config.apiToken)
+    return HttpRouter.serve(ApiLive, { disableLogger: true, middleware: (app) => requestLog(auth(app)) }).pipe(
+      Layer.provide(
+        // Open SSE connections are cut after the deadline so Ctrl-C never hangs on a subscriber.
+        NodeHttpServer.layer(createServer, { host: config.host, port: config.port, gracefulShutdownTimeout: "3 seconds" }),
+      ),
     )
   }),
 )

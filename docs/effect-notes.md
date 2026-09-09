@@ -21,7 +21,10 @@ What this codebase leans on, and the traps met while building it against `effect
 5. **`Schema.TaggedError`, not `TaggedErrorClass`**; `Schema.Literals([...])` and `Schema.Union([...])` take arrays; `Schema.check(Schema.isNonEmpty())` for refinements; `Schema.DateTimeUtcFromString` for ISO timestamps on the wire.
 6. **`Layer.scoped` does not exist**; `Layer.effect` already runs in the layer scope, so `Effect.scope`, `Effect.addFinalizer` and `Effect.forkScoped` work inside it.
 7. **`Effect.retry({ schedule, while })`**: the schedule's input type must match the error channel, so narrow the error first (the socket supervisor converts `AuthStoreError` into a terminal outcome before retrying on `ReconnectNeeded`).
-8. **`TestClock` sleeps of zero return immediately**, which is why tests default to `batchWindow: 0` and only the batching test advances the clock.
+8. **`TestClock` sleeps of zero return immediately**, which is why tests default to `batchWindow: 0` and only the batching tests advance the clock.
+9. **`Effect.catchCauseIf` with a plain predicate widens the error channel to `unknown`.** Where the typed error must survive (a retry schedule keyed on it), use `Effect.catchCause` and re-fail interruptions with `Effect.failCause`, as the socket supervisor does.
+10. **Callbacks outside fibers need a captured runtime.** `FiberSet.makeRuntime()` returns a run function bound to the layer's context and scope; the protocol library's logger and the process guards use it so their logs go through the configured loggers.
+11. **`PubSub.unbounded` buffers per subscriber without limit.** A stalled SSE client would grow memory; `PubSub.sliding({ capacity, replay })` drops the oldest for that subscriber and `?since=` lets it catch up.
 
 ## Where to look things up
 

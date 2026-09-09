@@ -1,5 +1,5 @@
 {
-  "name": "intro-whatsapp-bridge",
+  "name": "whatsapp-bridge",
   "version": "0.1.0",
   "private": true,
   "description": "WhatsApp <-> Intro bridge: a local daemon on a dedicated number, built on Effect v4 and Baileys",
@@ -50,6 +50,6 @@
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
-    "url": "https://github.com/moishinetzer/intro-whatsapp-bridge.git"
+    "url": "https://github.com/moishinetzer/whatsapp-bridge.git"
   }
 }

@@ -11,6 +11,8 @@ export interface HealthShape {
   readonly setState: (state: BridgeState, detail?: string) => Effect.Effect<void>
   readonly setLinked: (linkedAs: LinkedIdentity) => Effect.Effect<void>
   readonly touch: (kind: TouchKind) => Effect.Effect<void>
+  /** Record a socket close: bumps `reconnects` and remembers the reason. */
+  readonly noteDisconnect: (reason: string) => Effect.Effect<void>
 }
 
 /**
@@ -30,6 +32,7 @@ export const HealthLive = Layer.effect(
         responder: config.responder,
         version: VERSION,
         startedAt,
+        reconnects: 0,
       })
 
       const setState = Effect.fn("Health.setState")(function* (state: BridgeState, detail?: string) {
@@ -60,12 +63,18 @@ export const HealthLive = Layer.effect(
         })
       })
 
+      const noteDisconnect = Effect.fn("Health.noteDisconnect")(function* (reason: string) {
+        const at = yield* DateTime.now
+        yield* SubscriptionRef.update(ref, (s) => ({ ...s, reconnects: s.reconnects + 1, lastDisconnect: { at, reason } }))
+      })
+
       return Health.of({
         get: SubscriptionRef.get(ref),
         changes: SubscriptionRef.changes(ref),
         setState,
         setLinked,
         touch,
+        noteDisconnect,
       })
   }),
 )

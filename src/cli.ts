@@ -14,11 +14,28 @@ import { WhatsApp } from "./whatsapp/WhatsApp.ts"
 class DaemonUnreachable extends Schema.TaggedError<DaemonUnreachable>()("DaemonUnreachable", {
   url: Schema.String,
   detail: Schema.String,
-}) {}
+}) {
+  override get message() {
+    return `daemon not reachable at ${this.url}: ${this.detail}`
+  }
+}
 
 class ConfirmationRequired extends Schema.TaggedError<ConfirmationRequired>()("ConfirmationRequired", {
   hint: Schema.String,
-}) {}
+}) {
+  override get message() {
+    return this.hint
+  }
+}
+
+class LinkTimedOut extends Schema.TaggedError<LinkTimedOut>()("LinkTimedOut", {
+  after: Schema.String,
+  hint: Schema.String,
+}) {
+  override get message() {
+    return `not linked after ${this.after}: ${this.hint}`
+  }
+}
 
 const json = (value: unknown) => Console.log(JSON.stringify(value, null, 2))
 
@@ -48,12 +65,22 @@ const link = Command.make(
       Flag.optional,
       Flag.withDescription("Link with a pairing code for this number (digits, with country code) instead of a QR"),
     ),
+    timeout: Flag.string("timeout").pipe(
+      Flag.withSchema(Schema.DurationFromString),
+      Flag.withDefault(Duration.minutes(5)),
+      Flag.withDescription("Give up if the phone has not linked within this long, e.g. \"10 minutes\""),
+    ),
   },
-  ({ phone }) =>
+  ({ phone, timeout }) =>
     Effect.gen(function* () {
       const whatsapp = yield* WhatsApp
       yield* Console.log("Linking the dedicated number. Keep this terminal open until it says linked.")
-      const identity = yield* whatsapp.linked
+      const identity = yield* whatsapp.linked.pipe(
+        Effect.timeout(timeout),
+        Effect.catchTag("TimeoutError", () =>
+          new LinkTimedOut({ after: Duration.format(timeout), hint: "the phone never completed the link; run `bridge link` again" }),
+        ),
+      )
       // Give the credential writer a moment to flush the last keys.
       yield* Effect.sleep("2 seconds")
       yield* Console.log(`\nLinked as ${identity.jid}${identity.name ? ` (${identity.name})` : ""}.`)
@@ -63,7 +90,7 @@ const link = Command.make(
 
 const run = Command.make("run", {}, () =>
   Effect.gen(function* () {
-    yield* Effect.logInfo("intro-whatsapp-bridge starting").pipe(Effect.annotateLogs({ version: VERSION }))
+    yield* Effect.logInfo("whatsapp-bridge starting").pipe(Effect.annotateLogs({ version: VERSION }))
     yield* Effect.never
   }).pipe(Effect.provide(daemonLayer())),
 ).pipe(Command.withDescription("Run the bridge daemon: WhatsApp connection, turn engine and the local HTTP API"))

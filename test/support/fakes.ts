@@ -22,6 +22,7 @@ export const testConfig = (overrides: Partial<BridgeConfigShape> = {}): BridgeCo
   handlerUrl: Option.none(),
   handlerTimeout: Duration.seconds(5),
   batchWindow: Duration.zero,
+  batchMaxWait: Duration.seconds(5),
   turnTimeout: Duration.minutes(1),
   seenEmoji: "👀",
   seenFallbackText: Option.none(),
@@ -83,12 +84,14 @@ export const FakeWhatsAppLive = Layer.effectContext(
     const sendGate = yield* Ref.make<Option.Option<Latch.Latch>>(Option.none())
     const counter = yield* Ref.make(0)
 
-    const sendText = (chatId: ChatId, text: string) =>
+    const newOutboundId = Effect.map(Ref.updateAndGet(counter, (c) => c + 1), (n) => MessageId.make(`out_${n}`))
+
+    const sendText = (chatId: ChatId, text: string, options?: { readonly messageId?: MessageId | undefined }) =>
       Effect.gen(function* () {
         const failing = yield* Ref.modify(failNextSends, (n) => [n > 0, Math.max(0, n - 1)] as const)
         if (failing) return yield* new SendFailed({ operation: "sendText", chatId, detail: "simulated failure" })
-        const n = yield* Ref.updateAndGet(counter, (c) => c + 1)
-        const out: Outbound = { chatId, text, messageId: MessageId.make(`out_${n}`) }
+        const messageId = options?.messageId ?? (yield* newOutboundId)
+        const out: Outbound = { chatId, text, messageId }
         const gate = yield* Ref.get(sendGate)
         if (Option.isSome(gate)) {
           yield* Queue.offer(sending, out)
@@ -101,6 +104,7 @@ export const FakeWhatsAppLive = Layer.effectContext(
     const service = WhatsApp.of({
       inbound: Stream.fromQueue(inbound),
       linked: Effect.succeed({ jid: "bridge@s.whatsapp.net", name: "Intro" }),
+      newOutboundId,
       sendText,
       react: (chatId, messageId, emoji) => Queue.offer(reactions, { chatId, messageId, emoji }).pipe(Effect.asVoid),
       unreact: (chatId, messageId) => Queue.offer(reactions, { chatId, messageId, emoji: "" }).pipe(Effect.asVoid),

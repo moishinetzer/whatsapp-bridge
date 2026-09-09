@@ -1,4 +1,5 @@
 import {
+  Cache,
   Cause,
   Context,
   DateTime,
@@ -21,6 +22,7 @@ import { InboundMessage } from "../domain/message.ts"
 import { WhatsApp, type WhatsAppError } from "../whatsapp/WhatsApp.ts"
 import { Events } from "./Events.ts"
 import { Responder, type TurnPayload } from "./Responder.ts"
+import { prepareReplies } from "./text.ts"
 
 // ---------------------------------------------------------------------------
 // Turn model
@@ -58,31 +60,61 @@ export class TurnNotFound extends Schema.TaggedError<TurnNotFound>()(
   "TurnNotFound",
   { turnId: TurnId },
   { httpApiStatus: 404 },
-) {}
+) {
+  override get message() {
+    return `no such turn: ${this.turnId}`
+  }
+}
 
 /** The turn was interrupted by newer messages; answer `currentTurnId` instead. */
 export class TurnSuperseded extends Schema.TaggedError<TurnSuperseded>()(
   "TurnSuperseded",
   { turnId: TurnId, chatId: ChatId, currentTurnId: TurnId },
   { httpApiStatus: 409 },
-) {}
+) {
+  override get message() {
+    return `turn ${this.turnId} was superseded by ${this.currentTurnId}; answer that one`
+  }
+}
 
 export class TurnNotAwaitingReply extends Schema.TaggedError<TurnNotAwaitingReply>()(
   "TurnNotAwaitingReply",
   { turnId: TurnId, state: TurnState },
   { httpApiStatus: 409 },
-) {}
+) {
+  override get message() {
+    return `turn ${this.turnId} is ${this.state}, not awaiting a reply`
+  }
+}
 
 export class TurnFailedError extends Schema.TaggedError<TurnFailedError>()(
   "TurnFailedError",
   { turnId: TurnId, reason: Schema.String },
   { httpApiStatus: 502 },
-) {}
+) {
+  override get message() {
+    return `turn ${this.turnId} failed: ${this.reason}`
+  }
+}
 
 export class TurnTimedOut extends Schema.TaggedError<TurnTimedOut>()("TurnTimedOut", {
   turnId: TurnId,
   afterMs: Schema.Number,
-}) {}
+}) {
+  override get message() {
+    return `turn ${this.turnId}: no reply within ${this.afterMs} ms`
+  }
+}
+
+/** A defect inside a turn (a bug, or a throwing responder), turned into a typed failure so the worker survives. */
+class TurnCrashed extends Schema.TaggedError<TurnCrashed>()("TurnCrashed", {
+  turnId: TurnId,
+  detail: Schema.String,
+}) {
+  override get message() {
+    return `turn ${this.turnId} crashed: ${this.detail}`
+  }
+}
 
 export type ReplyError = TurnNotFound | TurnSuperseded | TurnNotAwaitingReply | TurnFailedError
 
@@ -255,6 +287,8 @@ interface PendingMessage {
   readonly message: InboundMessage
   /** The fiber applying 👀. Awaited (briefly) before the reaction is cleared. */
   readonly seen: Fiber.Fiber<void>
+  /** Local receipt time; bounds how long batching may hold a message (`BRIDGE_BATCH_MAX_WAIT`). */
+  readonly acceptedAt: DateTime.Utc
 }
 
 interface ChatState {
@@ -289,6 +323,8 @@ const describeFailure = (cause: Cause.Cause<unknown>): string => {
         return `sending failed: ${e.detail}`
       case "NotConnected":
         return `not connected: ${e.detail ?? "no socket"}`
+      case "TurnCrashed":
+        return `crashed: ${e.detail}`
       default:
         return e.message ?? String(e)
     }
@@ -312,6 +348,8 @@ export const TurnEngineLive = Layer.effectDiscard(
     const responder = yield* Responder
     const scope = yield* Effect.scope
     const chats = yield* Ref.make(HashMap.empty<ChatId, ChatState>())
+    // Defence in depth: the transport dedupes too, but one 👀 and one turn per message is this engine's promise.
+    const handled = yield* Cache.make<string, true>({ capacity: 20_000, lookup: () => Effect.succeed(true) })
 
     const retrySend = <A>(effect: Effect.Effect<A, WhatsAppError>) =>
       effect.pipe(
@@ -358,7 +396,7 @@ export const TurnEngineLive = Layer.effectDiscard(
         pending,
         (p) =>
           Effect.gen(function* () {
-            yield* Fiber.await(p.seen).pipe(Effect.timeout("5 seconds"), Effect.ignore)
+            yield* Fiber.await(p.seen).pipe(Effect.timeout("3 seconds"), Effect.ignore)
             yield* whatsapp.unreact(chatId, p.message.messageId).pipe(
               retrySend,
               Effect.catch((e) =>
@@ -366,7 +404,7 @@ export const TurnEngineLive = Layer.effectDiscard(
               ),
             )
           }),
-        { discard: true },
+        { discard: true, concurrency: 4 },
       )
 
     const dropPending = (chatId: ChatId, pending: ReadonlyArray<PendingMessage>) => {
@@ -391,10 +429,27 @@ export const TurnEngineLive = Layer.effectDiscard(
       ...(turn.supersedes === undefined ? {} : { supersedes: turn.supersedes }),
     })
 
+    /**
+     * How long to keep batching: the window, unless the oldest pending message
+     * is about to hit `batchMaxWait`, so a steady trickle of messages can never
+     * postpone a reply forever.
+     */
+    const batchDelay = (pending: ReadonlyArray<PendingMessage>) =>
+      Effect.map(DateTime.now, (now) => {
+        const oldest = pending.reduce(
+          (min, p) => Math.min(min, DateTime.toEpochMillis(p.acceptedAt)),
+          Number.POSITIVE_INFINITY,
+        )
+        const waited = Duration.millis(Math.max(0, DateTime.toEpochMillis(now) - oldest))
+        const remaining = Duration.subtract(config.batchMaxWait, waited)
+        return Duration.min(config.batchWindow, Duration.isNegative(remaining) ? Duration.zero : remaining)
+      })
+
     /** One attempt at answering a turn. Interruptible until the reply is committed. */
     const runTurn = (turn: TurnSummary, pending: ReadonlyArray<PendingMessage>, phase: Ref.Ref<Phase>) =>
       Effect.gen(function* () {
-        if (!Duration.isZero(config.batchWindow)) yield* Effect.sleep(config.batchWindow)
+        const delay = yield* batchDelay(pending)
+        if (!Duration.isZero(delay)) yield* Effect.sleep(delay)
         yield* Ref.set(phase, "responding")
         yield* registry.setState(turn.turnId, "responding")
         yield* events.publish({
@@ -423,7 +478,13 @@ export const TurnEngineLive = Layer.effectDiscard(
                   )
             // From here on nothing interrupts us: the reply goes out and the 👀 come off.
             yield* Ref.set(phase, "committed")
-            const sent = yield* Effect.forEach(replies, (text) => whatsapp.sendText(turn.chatId, text).pipe(retrySend))
+            const sent = yield* Effect.forEach(prepareReplies(replies), (text) =>
+              Effect.gen(function* () {
+                // One id per chunk, fixed before the retries, so a timed-out send that went through is not sent twice.
+                const messageId = yield* whatsapp.newOutboundId
+                return yield* whatsapp.sendText(turn.chatId, text, { messageId }).pipe(retrySend)
+              }),
+            )
             yield* clearSeen(turn.chatId, pending)
             yield* dropPending(turn.chatId, pending)
             yield* registry.complete(turn.turnId, sent)
@@ -436,80 +497,120 @@ export const TurnEngineLive = Layer.effectDiscard(
         )
       })
 
-    /** Serialises turns for one chat. Ends when nothing is pending; restarted by the next message. */
+    /** What the next iteration should carry over. */
+    interface Carry {
+      readonly nextTurnId: TurnId | undefined
+      readonly supersedes: TurnId | undefined
+    }
+
+    const fresh: Carry = { nextTurnId: undefined, supersedes: undefined }
+
+    const failTurn = (turnId: TurnId, chatId: ChatId, pending: ReadonlyArray<PendingMessage>, reason: string) =>
+      Effect.gen(function* () {
+        yield* dropPending(chatId, pending)
+        yield* registry.fail(turnId, reason)
+        yield* events.publish({ _tag: "TurnFailed", turnId, chatId, reason })
+        yield* Effect.logError("turn failed").pipe(Effect.annotateLogs({ turnId, chatId, reason }))
+        yield* typing(chatId, false)
+      })
+
+    /** One turn for one chat: returns what the next iteration carries, or `None` when nothing is pending. */
+    const iteration = (chatId: ChatId, carry: Carry) =>
+      Effect.gen(function* () {
+        const snapshot = yield* Ref.modify(chats, (map) => {
+          const current = Option.getOrElse(HashMap.get(map, chatId), idleChat)
+          if (current.pending.length === 0) {
+            return [Option.none(), HashMap.set(map, chatId, { ...current, worker: "idle", generation: current.generation + 1 })] as const
+          }
+          const wake = Deferred.makeUnsafe<void>()
+          return [
+            Option.some({ pending: current.pending, wake }),
+            HashMap.set(map, chatId, { ...current, wake, generation: current.generation + 1 }),
+          ] as const
+        })
+        if (Option.isNone(snapshot)) return Option.none<Carry>()
+        const { pending, wake } = snapshot.value
+        const first = pending[0]
+        if (first === undefined) return Option.none<Carry>()
+
+        const turnId = carry.nextTurnId ?? newTurnId()
+        const turn: TurnSummary = {
+          turnId,
+          chatId,
+          isGroup: first.message.isGroup,
+          state: "batching",
+          messages: pending.map((p) => p.message),
+          ...(carry.supersedes === undefined ? {} : { supersedes: carry.supersedes }),
+          openedAt: yield* DateTime.now,
+        }
+        yield* registry.open(turn)
+        const phase = yield* Ref.make<Phase>("batching")
+
+        // Typed failures stay typed; only defects (bugs, throwing responders) become `TurnCrashed`.
+        const body = runTurn(turn, pending, phase).pipe(
+          Effect.catchCauseIf(
+            (cause) => Cause.hasDies(cause) && !Cause.hasInterrupts(cause),
+            (cause) => Effect.fail(new TurnCrashed({ turnId, detail: describeFailure(cause) })),
+          ),
+        )
+        const fiber = yield* Effect.forkChild(body)
+        const outcome = yield* Effect.raceFirst(
+          Fiber.await(fiber).pipe(Effect.map((exit) => ({ _tag: "Finished", exit }) as const)),
+          Deferred.await(wake).pipe(Effect.as({ _tag: "Woken" } as const)),
+        )
+        if (outcome._tag === "Woken") yield* Fiber.interrupt(fiber)
+        const exit = outcome._tag === "Finished" ? outcome.exit : yield* Fiber.await(fiber)
+        const finalPhase = yield* Ref.get(phase)
+        const interruptedOnly = Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
+
+        if (Exit.isSuccess(exit) || (finalPhase === "committed" && interruptedOnly)) {
+          return Option.some(fresh)
+        }
+        if (outcome._tag === "Woken" && interruptedOnly && finalPhase === "batching") {
+          // Never opened: fold the new messages in under the same id.
+          return Option.some<Carry>({ nextTurnId: turnId, supersedes: carry.supersedes })
+        }
+        if (outcome._tag === "Woken" && interruptedOnly && finalPhase === "responding") {
+          const by = newTurnId()
+          yield* registry.supersede(turnId, by)
+          yield* events.publish({ _tag: "TurnSuperseded", turnId, chatId, by })
+          yield* Effect.logInfo("turn superseded by newer messages").pipe(Effect.annotateLogs({ turnId, chatId, by }))
+          return Option.some<Carry>({ nextTurnId: by, supersedes: turnId })
+        }
+        const reason = Exit.isFailure(exit) ? describeFailure(exit.cause) : "unknown"
+        yield* failTurn(turnId, chatId, pending, reason)
+        return Option.some(fresh)
+      })
+
+    /**
+     * Serialises turns for one chat. Ends when nothing is pending; restarted by
+     * the next message. A defect in one iteration is logged and the worker
+     * carries on with the next message rather than dying with messages pending.
+     */
     const runWorker = (chatId: ChatId) =>
       Effect.gen(function* () {
-        let nextTurnId: TurnId | undefined
-        let supersedes: TurnId | undefined
+        let carry: Carry = fresh
         while (true) {
-          const snapshot = yield* Ref.modify(chats, (map) => {
-            const current = Option.getOrElse(HashMap.get(map, chatId), idleChat)
-            if (current.pending.length === 0) {
-              return [Option.none(), HashMap.set(map, chatId, { ...current, worker: "idle", generation: current.generation + 1 })] as const
-            }
-            const wake = Deferred.makeUnsafe<void>()
-            return [
-              Option.some({ pending: current.pending, wake }),
-              HashMap.set(map, chatId, { ...current, wake, generation: current.generation + 1 }),
-            ] as const
-          })
-          if (Option.isNone(snapshot)) return
-          const { pending, wake } = snapshot.value
-          const first = pending[0]
-          if (first === undefined) return
-
-          const turnId = nextTurnId ?? newTurnId()
-          const turn: TurnSummary = {
-            turnId,
-            chatId,
-            isGroup: first.message.isGroup,
-            state: "batching",
-            messages: pending.map((p) => p.message),
-            ...(supersedes === undefined ? {} : { supersedes }),
-            openedAt: yield* DateTime.now,
-          }
-          yield* registry.open(turn)
-          const phase = yield* Ref.make<Phase>("batching")
-
-          const fiber = yield* Effect.forkChild(runTurn(turn, pending, phase))
-          const outcome = yield* Effect.raceFirst(
-            Fiber.await(fiber).pipe(Effect.map((exit) => ({ _tag: "Finished", exit }) as const)),
-            Deferred.await(wake).pipe(Effect.as({ _tag: "Woken" } as const)),
+          const next = yield* iteration(chatId, carry).pipe(
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterrupts(cause),
+              (cause) =>
+                Effect.logError("chat worker iteration crashed; continuing", cause).pipe(
+                  Effect.annotateLogs({ chatId }),
+                  Effect.andThen(
+                    // Drop whatever this iteration was holding so the crash cannot repeat on the same input.
+                    Ref.update(chats, (map) =>
+                      HashMap.modifyAt(map, chatId, Option.map((s): ChatState => ({ ...s, pending: [], generation: s.generation + 1 }))),
+                    ),
+                  ),
+                  Effect.as(Option.some(fresh)),
+                ),
+            ),
           )
-          if (outcome._tag === "Woken") yield* Fiber.interrupt(fiber)
-          const exit = outcome._tag === "Finished" ? outcome.exit : yield* Fiber.await(fiber)
-          const finalPhase = yield* Ref.get(phase)
-          const interruptedOnly = Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
-
-          if (Exit.isSuccess(exit) || (finalPhase === "committed" && interruptedOnly)) {
-            nextTurnId = undefined
-            supersedes = undefined
-            continue
-          }
-          if (outcome._tag === "Woken" && interruptedOnly && finalPhase === "batching") {
-            // Never opened: fold the new messages in under the same id.
-            nextTurnId = turnId
-            continue
-          }
-          if (outcome._tag === "Woken" && interruptedOnly && finalPhase === "responding") {
-            const by = newTurnId()
-            yield* registry.supersede(turnId, by)
-            yield* events.publish({ _tag: "TurnSuperseded", turnId, chatId, by })
-            yield* Effect.logInfo("turn superseded by newer messages").pipe(Effect.annotateLogs({ turnId, chatId, by }))
-            nextTurnId = by
-            supersedes = turnId
-            continue
-          }
-          const reason = Exit.isFailure(exit) ? describeFailure(exit.cause) : "unknown"
-          yield* dropPending(chatId, pending)
-          yield* registry.fail(turnId, reason)
-          yield* events.publish({ _tag: "TurnFailed", turnId, chatId, reason })
-          yield* Effect.logError("turn failed").pipe(Effect.annotateLogs({ turnId, chatId, reason }))
-          nextTurnId = undefined
-          supersedes = undefined
+          if (Option.isNone(next)) return
+          carry = next.value
         }
       }).pipe(
-        Effect.catchCause((cause) => Effect.logError("chat worker crashed", cause).pipe(Effect.annotateLogs({ chatId }))),
         Effect.ensuring(
           Ref.update(chats, (map) =>
             HashMap.modifyAt(map, chatId, Option.map((s): ChatState => ({ ...s, worker: "idle", generation: s.generation + 1 }))),
@@ -518,11 +619,18 @@ export const TurnEngineLive = Layer.effectDiscard(
       )
 
     const onInbound = Effect.fn("TurnEngine.onInbound")(function* (message: InboundMessage) {
+      const key = `${message.chatId}:${message.messageId}`
+      if (yield* Cache.has(handled, key)) {
+        yield* Effect.logDebug("message already handled; ignoring duplicate").pipe(Effect.annotateLogs({ messageId: message.messageId }))
+        return
+      }
+      yield* Cache.set(handled, key, true)
+      const acceptedAt = yield* DateTime.now
       const seen = yield* applySeen(message)
       const { start, wake } = yield* Ref.modify(chats, (map) => {
         const current = Option.getOrElse(HashMap.get(map, message.chatId), idleChat)
         const next: ChatState = {
-          pending: [...current.pending, { message, seen }],
+          pending: [...current.pending, { message, seen, acceptedAt }],
           worker: "running",
           wake: current.wake,
           generation: current.generation + 1,
@@ -545,7 +653,11 @@ export const TurnEngineLive = Layer.effectDiscard(
       Effect.forkScoped,
     )
     yield* Effect.logInfo("turn engine ready").pipe(
-      Effect.annotateLogs({ responder: responder.kind, batchWindowMs: Duration.toMillis(config.batchWindow) }),
+      Effect.annotateLogs({
+        responder: responder.kind,
+        batchWindowMs: Duration.toMillis(config.batchWindow),
+        batchMaxWaitMs: Duration.toMillis(config.batchMaxWait),
+      }),
     )
   }),
 )

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import { NodeHttpServer } from "@effect/platform-node"
-import { Effect, Fiber, Layer, Option, Redacted, Ref, Stream } from "effect"
-import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
+import { Effect, Fiber, Layer, Option, Queue, Redacted, Ref, Stream } from "effect"
+import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiClient } from "effect/unstable/httpapi"
 import { toChatId } from "../src/domain/ids.ts"
 import { Events } from "../src/engine/Events.ts"
@@ -127,6 +127,33 @@ describe("HTTP API", () => {
       expect(ready?.seq).toBe(1)
       expect(first?._tag).toBe("ConnectionChanged")
       expect(first?.seq).toBe(1)
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+})
+
+describe("HTTP API validation", () => {
+  it.effect("rejects an invalid payload with 400 instead of touching the transport", () =>
+    Effect.gen(function* () {
+      // The typed client validates before sending, so go raw to exercise the server's own check.
+      const raw = yield* HttpClient.HttpClient
+      const wa = yield* FakeWhatsApp
+      const response = yield* raw.post("/chats/447700900123@s.whatsapp.net/messages", {
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: HttpBody.jsonUnsafe({ text: "" }),
+      })
+      expect(response.status).toBe(400)
+      const malformed = yield* raw.post("/chats/447700900123@s.whatsapp.net/messages", {
+        headers: { authorization: `Bearer ${TOKEN}` },
+        body: HttpBody.text("{not json", "application/json"),
+      })
+      expect(malformed.status).toBe(400)
+      const wrongType = yield* raw.post("/chats/447700900123@s.whatsapp.net/messages", {
+        headers: { authorization: `Bearer ${TOKEN}` },
+        body: HttpBody.text("text=hi", "text/plain"),
+      })
+      expect(wrongType.status).toBe(415)
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
     }).pipe(Effect.provide(ServerTestLayer)),
   )
 })

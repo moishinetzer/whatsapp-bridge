@@ -8,7 +8,11 @@ import { TurnFailedError, TurnNotAwaitingReply, TurnNotFound, TurnSummary, TurnS
 import { NotConnected, SendFailed } from "../whatsapp/WhatsApp.ts"
 
 /** `GET /health` answers 503 with the same body when the bridge is not `ok`. */
-export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", { status: BridgeStatus }, { httpApiStatus: 503 }) {}
+export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", { status: BridgeStatus }, { httpApiStatus: 503 }) {
+  override get message() {
+    return `bridge is ${this.status.state}${this.status.detail === undefined ? "" : `: ${this.status.detail}`}`
+  }
+}
 
 export const SendTextPayload = Schema.Struct({ text: Schema.String.pipe(Schema.check(Schema.isNonEmpty())) })
 export const SentMessage = Schema.Struct({ chatId: ChatId, messageId: MessageId })
@@ -77,11 +81,11 @@ export const TurnsGroup = HttpApiGroup.make("turns").add(
  * `HttpApiClient` derives the typed client the CLI uses; `/openapi.json` and
  * `/docs` are generated from the same definition.
  */
-export const BridgeApi = HttpApi.make("intro-whatsapp-bridge")
+export const BridgeApi = HttpApi.make("whatsapp-bridge")
   .add(HealthGroup, EventsGroup, ChatsGroup, TurnsGroup)
   .annotateMerge(
     OpenApi.annotations({
-      title: "intro-whatsapp-bridge",
+      title: "whatsapp-bridge",
       version: VERSION,
       description: "Local API of the WhatsApp ↔ Intro bridge. Events stream over SSE from /events; replies go to /turns/{id}/reply.",
     }),

@@ -33,6 +33,9 @@ export const HealthSnapshot = Schema.Struct({
   lastEventAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
   lastInboundAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
   lastOutboundAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
+  /** Socket closes seen this run (a reconnect follows each unless the close was terminal). */
+  reconnects: Schema.Number,
+  lastDisconnect: Schema.optionalKey(Schema.Struct({ at: Schema.DateTimeUtcFromString, reason: Schema.String })),
 })
 export type HealthSnapshot = typeof HealthSnapshot.Type
 

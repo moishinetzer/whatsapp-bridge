@@ -51,7 +51,8 @@ export const EventsLive = Layer.effect(
   Events,
   Effect.gen(function* () {
     const health = yield* Health
-    const pubsub = yield* PubSub.unbounded<BridgeEvent>({ replay: REPLAY })
+    // Sliding: a stalled SSE client drops its oldest buffered events instead of growing memory; it recovers with `?since=`.
+    const pubsub = yield* PubSub.sliding<BridgeEvent>({ capacity: 2_048, replay: REPLAY })
     const seq = yield* Ref.make(0)
 
     const publish = Effect.fn("Events.publish")(function* (body: BridgeEventBody) {
