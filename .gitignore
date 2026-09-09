@@ -1,0 +1,23 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Runtime data: the linked WhatsApp session lives here. NEVER commit it.
+data/
+**/auth/
+**/auth.invalid-*/
+*.creds.json
+creds.json
+session-*/
+baileys_store*.json
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Logs and editor noise
+*.log
+.DS_Store
+coverage/
