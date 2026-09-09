@@ -6,6 +6,7 @@ import {
   Deferred,
   Duration,
   Effect,
+  Equal,
   Exit,
   Fiber,
   HashMap,
@@ -18,9 +19,10 @@ import {
 } from "effect"
 import { BridgeConfig } from "../config.ts"
 import { ChatId, MessageId, TurnId, newTurnId } from "../domain/ids.ts"
-import { InboundMessage } from "../domain/message.ts"
+import { InboundMessage, type MediaFile } from "../domain/message.ts"
 import { WhatsApp, type WhatsAppError } from "../whatsapp/WhatsApp.ts"
 import { Events } from "./Events.ts"
+import { MediaStore, type MediaError } from "./Media.ts"
 import { Responder, type TurnPayload } from "./Responder.ts"
 import { prepareReplies } from "./text.ts"
 
@@ -118,6 +120,15 @@ class TurnCrashed extends Schema.TaggedError<TurnCrashed>()("TurnCrashed", {
 
 export type ReplyError = TurnNotFound | TurnSuperseded | TurnNotAwaitingReply | TurnFailedError
 
+/**
+ * Effect v4 compares and hashes plain objects structurally, walking every key.
+ * State that carries runtime handles (Fibers, Deferreds) must never be walked:
+ * two fresh Deferreds compare equal (so `HashMap.set` would keep the stale
+ * one) and hashing a Fiber reads function properties that throw. Marking the
+ * object as reference-equal keeps Effect out of it entirely.
+ */
+const byRef = <T extends object>(value: T): T => Equal.byReferenceUnsafe(value)
+
 // ---------------------------------------------------------------------------
 // Registry: the source of truth for turns. Read by the HTTP API, written by the engine.
 // ---------------------------------------------------------------------------
@@ -177,7 +188,7 @@ export const TurnRegistryLive = Layer.effect(
       Ref.update(turns, (map) =>
         Option.match(HashMap.get(map, turnId), {
           onNone: () => map,
-          onSome: (record) => HashMap.set(map, turnId, { ...f(record), revision: record.revision + 1 }),
+          onSome: (record) => HashMap.set(map, turnId, byRef({ ...f(record), revision: record.revision + 1 })),
         }),
       )
 
@@ -198,12 +209,12 @@ export const TurnRegistryLive = Layer.effect(
       const done = yield* Deferred.make<ReadonlyArray<MessageId>, TurnFailedError>()
       yield* Ref.update(turns, (map) => {
         const existing = HashMap.get(map, summary.turnId)
-        const record: TurnRecord = {
+        const record: TurnRecord = byRef({
           summary,
           awaiting: Option.none(),
           done: Option.match(existing, { onNone: () => done, onSome: (r) => r.done }),
           revision: Option.match(existing, { onNone: () => 0, onSome: (r) => r.revision + 1 }),
-        }
+        })
         return prune(HashMap.set(map, summary.turnId, record))
       })
     })
@@ -289,6 +300,8 @@ interface PendingMessage {
   readonly seen: Fiber.Fiber<void>
   /** Local receipt time; bounds how long batching may hold a message (`BRIDGE_BATCH_MAX_WAIT`). */
   readonly acceptedAt: DateTime.Utc
+  /** The automatic download of the attachment, when the policy asks for one. */
+  readonly media: Option.Option<Fiber.Fiber<MediaFile, MediaError>>
 }
 
 interface ChatState {
@@ -308,7 +321,7 @@ interface ChatState {
 
 type Phase = "batching" | "responding" | "committed"
 
-const idleChat = (): ChatState => ({ pending: [], worker: "idle", wake: Deferred.makeUnsafe<void>(), generation: 0 })
+const idleChat = (): ChatState => byRef({ pending: [], worker: "idle", wake: Deferred.makeUnsafe<void>(), generation: 0 })
 
 const describeFailure = (cause: Cause.Cause<unknown>): string => {
   const error = Cause.findErrorOption(cause)
@@ -346,6 +359,7 @@ export const TurnEngineLive = Layer.effectDiscard(
     const events = yield* Events
     const registry = yield* TurnRegistry
     const responder = yield* Responder
+    const mediaStore = yield* MediaStore
     const scope = yield* Effect.scope
     const chats = yield* Ref.make(HashMap.empty<ChatId, ChatState>())
     // Defence in depth: the transport dedupes too, but one 👀 and one turn per message is this engine's promise.
@@ -414,7 +428,7 @@ export const TurnEngineLive = Layer.effectDiscard(
           map,
           chatId,
           Option.map(
-            (s): ChatState => ({ ...s, pending: s.pending.filter((p) => !ids.has(p.message.messageId)), generation: s.generation + 1 }),
+            (s): ChatState => byRef({ ...s, pending: s.pending.filter((p) => !ids.has(p.message.messageId)), generation: s.generation + 1 }),
           ),
         ),
       )
@@ -445,12 +459,36 @@ export const TurnEngineLive = Layer.effectDiscard(
         return Duration.min(config.batchWindow, Duration.isNegative(remaining) ? Duration.zero : remaining)
       })
 
+    /** Attach the downloaded file to each message whose download finished within `mediaWait`; the rest go out as they are. */
+    const withMedia = (pending: ReadonlyArray<PendingMessage>) =>
+      Effect.forEach(
+        pending,
+        (p) =>
+          Option.match(p.media, {
+            onNone: () => Effect.succeed(p.message),
+            onSome: (fiber) =>
+              Fiber.await(fiber).pipe(
+                Effect.timeout(config.mediaWait),
+                Effect.map((exit) => (Exit.isSuccess(exit) ? { ...p.message, media: exit.value } : p.message)),
+                Effect.catchTag("TimeoutError", () =>
+                  Effect.logDebug("media not ready in time; opening the turn without it").pipe(
+                    Effect.annotateLogs({ messageId: p.message.messageId }),
+                    Effect.as(p.message),
+                  ),
+                ),
+              ),
+          }),
+        { concurrency: "unbounded" },
+      )
+
     /** One attempt at answering a turn. Interruptible until the reply is committed. */
-    const runTurn = (turn: TurnSummary, pending: ReadonlyArray<PendingMessage>, phase: Ref.Ref<Phase>) =>
+    const runTurn = (opened: TurnSummary, pending: ReadonlyArray<PendingMessage>, phase: Ref.Ref<Phase>) =>
       Effect.gen(function* () {
         const delay = yield* batchDelay(pending)
         if (!Duration.isZero(delay)) yield* Effect.sleep(delay)
+        const turn: TurnSummary = { ...opened, messages: yield* withMedia(pending) }
         yield* Ref.set(phase, "responding")
+        yield* registry.open(turn)
         yield* registry.setState(turn.turnId, "responding")
         yield* events.publish({
           _tag: "TurnOpened",
@@ -520,12 +558,12 @@ export const TurnEngineLive = Layer.effectDiscard(
         const snapshot = yield* Ref.modify(chats, (map) => {
           const current = Option.getOrElse(HashMap.get(map, chatId), idleChat)
           if (current.pending.length === 0) {
-            return [Option.none(), HashMap.set(map, chatId, { ...current, worker: "idle", generation: current.generation + 1 })] as const
+            return [Option.none(), HashMap.set(map, chatId, byRef({ ...current, worker: "idle", generation: current.generation + 1 }))] as const
           }
           const wake = Deferred.makeUnsafe<void>()
           return [
             Option.some({ pending: current.pending, wake }),
-            HashMap.set(map, chatId, { ...current, wake, generation: current.generation + 1 }),
+            HashMap.set(map, chatId, byRef({ ...current, wake, generation: current.generation + 1 })),
           ] as const
         })
         if (Option.isNone(snapshot)) return Option.none<Carry>()
@@ -600,7 +638,7 @@ export const TurnEngineLive = Layer.effectDiscard(
                   Effect.andThen(
                     // Drop whatever this iteration was holding so the crash cannot repeat on the same input.
                     Ref.update(chats, (map) =>
-                      HashMap.modifyAt(map, chatId, Option.map((s): ChatState => ({ ...s, pending: [], generation: s.generation + 1 }))),
+                      HashMap.modifyAt(map, chatId, Option.map((s): ChatState => byRef({ ...s, pending: [], generation: s.generation + 1 }))),
                     ),
                   ),
                   Effect.as(Option.some(fresh)),
@@ -613,7 +651,7 @@ export const TurnEngineLive = Layer.effectDiscard(
       }).pipe(
         Effect.ensuring(
           Ref.update(chats, (map) =>
-            HashMap.modifyAt(map, chatId, Option.map((s): ChatState => ({ ...s, worker: "idle", generation: s.generation + 1 }))),
+            HashMap.modifyAt(map, chatId, Option.map((s): ChatState => byRef({ ...s, worker: "idle", generation: s.generation + 1 }))),
           ),
         ),
       )
@@ -627,14 +665,25 @@ export const TurnEngineLive = Layer.effectDiscard(
       yield* Cache.set(handled, key, true)
       const acceptedAt = yield* DateTime.now
       const seen = yield* applySeen(message)
+      const media =
+        message.hasMedia && mediaStore.autoKinds.has(message.kind)
+          ? Option.some(
+              yield* mediaStore.get(message.chatId, message.messageId).pipe(
+                Effect.tapError((e) =>
+                  Effect.logWarning("automatic media download failed").pipe(Effect.annotateLogs({ messageId: message.messageId, reason: e.message })),
+                ),
+                Effect.forkIn(scope),
+              ),
+            )
+          : Option.none()
       const { start, wake } = yield* Ref.modify(chats, (map) => {
         const current = Option.getOrElse(HashMap.get(map, message.chatId), idleChat)
-        const next: ChatState = {
-          pending: [...current.pending, { message, seen, acceptedAt }],
+        const next: ChatState = byRef({
+          pending: [...current.pending, { message, seen, acceptedAt, media }],
           worker: "running",
           wake: current.wake,
           generation: current.generation + 1,
-        }
+        })
         return [{ start: current.worker === "idle", wake: current.wake }, HashMap.set(map, message.chatId, next)] as const
       })
       if (start) {

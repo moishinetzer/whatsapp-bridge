@@ -3,9 +3,11 @@ import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "
 import { VERSION } from "../version.ts"
 import { BridgeEvent } from "../domain/events.ts"
 import { ChatId, MessageId, TurnId } from "../domain/ids.ts"
+import { MediaFile } from "../domain/message.ts"
 import { BridgeStatus } from "../domain/status.ts"
+import { MediaStoreError } from "../engine/Media.ts"
 import { TurnFailedError, TurnNotAwaitingReply, TurnNotFound, TurnSummary, TurnSuperseded } from "../engine/Turns.ts"
-import { NotConnected, SendFailed } from "../whatsapp/WhatsApp.ts"
+import { MediaDownloadFailed, MediaTooLarge, MediaUnavailable, NotConnected, SendFailed } from "../whatsapp/WhatsApp.ts"
 
 /** `GET /health` answers 503 with the same body when the bridge is not `ok`. */
 export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", { status: BridgeStatus }, { httpApiStatus: 503 }) {
@@ -62,6 +64,16 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
     params: chatParams,
     payload: TypingPayload,
     error: [NotConnected, SendFailed],
+  }),
+  HttpApiEndpoint.get("media", "/chats/:chatId/messages/:messageId/media", {
+    params: messageParams,
+    success: MediaFile,
+    error: [MediaUnavailable, MediaTooLarge, MediaDownloadFailed, MediaStoreError],
+  }),
+  HttpApiEndpoint.get("mediaContent", "/chats/:chatId/messages/:messageId/media/content", {
+    params: messageParams,
+    success: HttpApiSchema.StreamUint8Array({ contentType: "application/octet-stream" }),
+    error: [MediaUnavailable, MediaTooLarge, MediaDownloadFailed, MediaStoreError],
   }),
 )
 

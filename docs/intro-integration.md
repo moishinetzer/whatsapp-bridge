@@ -27,7 +27,7 @@ Moishi may be talking to Intro in the app and on WhatsApp at the same time. Ever
 
 ## Media
 
-v1 delivers `kind`, `hasMedia`, `mimetype` and the caption as `text`, not the bytes. When Moishi sends a photo or a voice note, Intro should say what it can and cannot do with it rather than ignore it.
+Photos and stickers arrive with `media.path` on the `TurnOpened` message: a local file Intro can open (read it as bytes, or pass the path to a vision-capable model). Videos, voice notes and documents are fetched on demand with `GET /chats/{chatId}/messages/{messageId}/media`, which also covers an image whose download was still running when the turn opened. Files are deleted after seven days by default (`BRIDGE_MEDIA_RETENTION`); copy anything worth keeping. When a download fails, say so in the reply rather than pretending the attachment was seen.
 
 ## Being alive
 

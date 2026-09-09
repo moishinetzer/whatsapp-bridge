@@ -1,6 +1,6 @@
 import { Context, Effect, Schema, Stream } from "effect"
 import { ChatId, MessageId } from "../domain/ids.ts"
-import type { InboundMessage } from "../domain/message.ts"
+import type { InboundMessage, MessageKind } from "../domain/message.ts"
 import { BridgeState, LinkedIdentity } from "../domain/status.ts"
 
 /** No live socket. Retry later; `state` says whether waiting will help. */
@@ -25,7 +25,47 @@ export class SendFailed extends Schema.TaggedError<SendFailed>()(
   }
 }
 
+/** The bridge no longer holds the message (it restarted) or the message carried no media. */
+export class MediaUnavailable extends Schema.TaggedError<MediaUnavailable>()(
+  "MediaUnavailable",
+  { chatId: ChatId, messageId: MessageId, reason: Schema.String },
+  { httpApiStatus: 404 },
+) {
+  override get message() {
+    return `media for ${this.messageId} unavailable: ${this.reason}`
+  }
+}
+
+export class MediaTooLarge extends Schema.TaggedError<MediaTooLarge>()(
+  "MediaTooLarge",
+  { chatId: ChatId, messageId: MessageId, size: Schema.Number, maxBytes: Schema.Number },
+  { httpApiStatus: 413 },
+) {
+  override get message() {
+    return `media for ${this.messageId} is ${this.size} bytes, over the ${this.maxBytes} byte limit`
+  }
+}
+
+export class MediaDownloadFailed extends Schema.TaggedError<MediaDownloadFailed>()(
+  "MediaDownloadFailed",
+  { chatId: ChatId, messageId: MessageId, detail: Schema.String },
+  { httpApiStatus: 502 },
+) {
+  override get message() {
+    return `downloading media for ${this.messageId} failed: ${this.detail}`
+  }
+}
+
 export type WhatsAppError = NotConnected | SendFailed
+export type MediaTransportError = MediaUnavailable | MediaTooLarge | MediaDownloadFailed
+
+export interface DownloadedMedia {
+  readonly bytes: Uint8Array
+  readonly mimetype: string
+  /** File extension without the dot, derived from the mimetype (`jpeg`, `webp`, `ogg`, `pdf`, ...). */
+  readonly extension: string
+  readonly kind: MessageKind
+}
 
 export interface SendOptions {
   /**
@@ -47,6 +87,16 @@ export interface WhatsAppShape {
   readonly react: (chatId: ChatId, messageId: MessageId, emoji: string) => Effect.Effect<void, WhatsAppError>
   readonly unreact: (chatId: ChatId, messageId: MessageId) => Effect.Effect<void, WhatsAppError>
   readonly setTyping: (chatId: ChatId, composing: boolean) => Effect.Effect<void, WhatsAppError>
+  /**
+   * Fetch and decrypt the attachment of a message seen this run. Refuses
+   * anything bigger than `maxBytes` before downloading. Persisting the bytes is
+   * the `MediaStore`'s job.
+   */
+  readonly downloadMedia: (
+    chatId: ChatId,
+    messageId: MessageId,
+    options: { readonly maxBytes: number },
+  ) => Effect.Effect<DownloadedMedia, MediaTransportError>
 }
 
 /**

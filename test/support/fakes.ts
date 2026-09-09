@@ -1,20 +1,34 @@
+import { NodeServices } from "@effect/platform-node"
 import { Context, DateTime, Duration, Effect, Latch, Layer, Option, Queue, Ref, Schedule, Stream } from "effect"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { BridgeConfig, type BridgeConfigShape } from "../../src/config.ts"
 import { ChatId, MessageId } from "../../src/domain/ids.ts"
-import { InboundMessage } from "../../src/domain/message.ts"
+import { InboundMessage, type MessageKind } from "../../src/domain/message.ts"
 import { EventsLive } from "../../src/engine/Events.ts"
+import { MediaStoreLive } from "../../src/engine/Media.ts"
 import { HealthLive } from "../../src/engine/Health.ts"
 import { HandlerFailed, Responder, type ResponderReply, type TurnPayload } from "../../src/engine/Responder.ts"
 import { TurnEngineLive, TurnRegistryLive } from "../../src/engine/Turns.ts"
-import { SendFailed, WhatsApp } from "../../src/whatsapp/WhatsApp.ts"
+import { MediaTooLarge, MediaUnavailable, SendFailed, WhatsApp, type DownloadedMedia } from "../../src/whatsapp/WhatsApp.ts"
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
+/** One scratch directory per test process for media files. */
+export const testMediaDir = mkdtempSync(join(tmpdir(), "bridge-media-"))
+
 export const testConfig = (overrides: Partial<BridgeConfigShape> = {}): BridgeConfigShape => ({
   dataDir: "./data-test",
   authDir: "./data-test/auth",
+  mediaDir: testMediaDir,
+  mediaAuto: "images",
+  mediaMaxBytes: 25 * 1024 * 1024,
+  mediaWait: Duration.seconds(8),
+  mediaRetention: Duration.days(7),
+  mediaSweepEvery: Duration.hours(1),
   host: "127.0.0.1",
   port: 0,
   apiToken: Option.none(),
@@ -69,6 +83,12 @@ export interface FakeWhatsAppShape {
   readonly failNextSends: Ref.Ref<number>
   /** When set, `sendText` blocks until the latch opens. */
   readonly sendGate: Ref.Ref<Option.Option<Latch.Latch>>
+  /** Attachments the fake transport can "download", by message id. */
+  readonly media: Ref.Ref<ReadonlyMap<MessageId, DownloadedMedia>>
+  /** When set, `downloadMedia` blocks until the latch opens. */
+  readonly mediaGate: Ref.Ref<Option.Option<Latch.Latch>>
+  /** How many times the transport was asked to download anything. */
+  readonly downloads: Ref.Ref<number>
 }
 
 export class FakeWhatsApp extends Context.Service<FakeWhatsApp, FakeWhatsAppShape>()("test/FakeWhatsApp") {}
@@ -82,7 +102,23 @@ export const FakeWhatsAppLive = Layer.effectContext(
     const typing = yield* Ref.make<ReadonlyArray<{ readonly chatId: ChatId; readonly composing: boolean }>>([])
     const failNextSends = yield* Ref.make(0)
     const sendGate = yield* Ref.make<Option.Option<Latch.Latch>>(Option.none())
+    const media = yield* Ref.make<ReadonlyMap<MessageId, DownloadedMedia>>(new Map())
+    const mediaGate = yield* Ref.make<Option.Option<Latch.Latch>>(Option.none())
+    const downloads = yield* Ref.make(0)
     const counter = yield* Ref.make(0)
+
+    const downloadMedia = (chatId: ChatId, messageId: MessageId, options: { readonly maxBytes: number }) =>
+      Effect.gen(function* () {
+        yield* Ref.update(downloads, (n) => n + 1)
+        const gate = yield* Ref.get(mediaGate)
+        if (Option.isSome(gate)) yield* gate.value.await
+        const found = (yield* Ref.get(media)).get(messageId)
+        if (found === undefined) return yield* new MediaUnavailable({ chatId, messageId, reason: "not in the fake" })
+        if (found.bytes.byteLength > options.maxBytes) {
+          return yield* new MediaTooLarge({ chatId, messageId, size: found.bytes.byteLength, maxBytes: options.maxBytes })
+        }
+        return found
+      })
 
     const newOutboundId = Effect.map(Ref.updateAndGet(counter, (c) => c + 1), (n) => MessageId.make(`out_${n}`))
 
@@ -109,6 +145,7 @@ export const FakeWhatsAppLive = Layer.effectContext(
       react: (chatId, messageId, emoji) => Queue.offer(reactions, { chatId, messageId, emoji }).pipe(Effect.asVoid),
       unreact: (chatId, messageId) => Queue.offer(reactions, { chatId, messageId, emoji: "" }).pipe(Effect.asVoid),
       setTyping: (chatId, composing) => Ref.update(typing, (t) => [...t, { chatId, composing }]),
+      downloadMedia,
     })
 
     const control = FakeWhatsApp.of({
@@ -119,6 +156,9 @@ export const FakeWhatsAppLive = Layer.effectContext(
       typing,
       failNextSends,
       sendGate,
+      media,
+      mediaGate,
+      downloads,
     })
 
     return Context.make(WhatsApp, service).pipe(Context.add(FakeWhatsApp, control))
@@ -172,8 +212,9 @@ export const EngineTestLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
   const Health = HealthLive.pipe(Layer.provide(Config))
   const Events = EventsLive.pipe(Layer.provide(Health))
   const Registry = TurnRegistryLive
-  const Engine = TurnEngineLive.pipe(Layer.provide([Config, FakeWhatsAppLive, Events, Registry, TestResponderLive]))
-  return Layer.mergeAll(Config, Health, Events, FakeWhatsAppLive, Registry, TestResponderLive, Engine)
+  const Media = MediaStoreLive.pipe(Layer.provide([Config, FakeWhatsAppLive, NodeServices.layer]))
+  const Engine = TurnEngineLive.pipe(Layer.provide([Config, FakeWhatsAppLive, Events, Registry, TestResponderLive, Media]))
+  return Layer.mergeAll(Config, Health, Events, FakeWhatsAppLive, Registry, TestResponderLive, Media, Engine)
 }
 
 // ---------------------------------------------------------------------------
@@ -184,8 +225,13 @@ let counter = 0
 
 export const chat = ChatId.make("447700900123@s.whatsapp.net")
 
-export const message = (text: string, options: { readonly chatId?: ChatId; readonly isGroup?: boolean } = {}): InboundMessage =>
-  InboundMessage.make({
+export const message = (
+  text: string,
+  options: { readonly chatId?: ChatId; readonly isGroup?: boolean; readonly kind?: MessageKind; readonly mimetype?: string } = {},
+): InboundMessage => {
+  const kind = options.kind ?? "text"
+  const hasMedia = kind === "image" || kind === "sticker" || kind === "video" || kind === "audio" || kind === "document"
+  return InboundMessage.make({
     chatId: options.chatId ?? chat,
     messageId: MessageId.make(`in_${++counter}`),
     senderId: options.chatId ?? chat,
@@ -193,10 +239,19 @@ export const message = (text: string, options: { readonly chatId?: ChatId; reado
     senderName: "Moishi",
     isGroup: options.isGroup ?? false,
     timestamp: DateTime.makeUnsafe(1_700_000_000_000 + counter),
-    kind: "text",
+    kind,
     text,
-    hasMedia: false,
+    hasMedia,
+    ...(options.mimetype === undefined ? {} : { mimetype: options.mimetype }),
   })
+}
+
+export const jpeg = (bytes = 64): DownloadedMedia => ({
+  bytes: new Uint8Array(bytes).map((_, i) => i % 256),
+  mimetype: "image/jpeg",
+  extension: "jpeg",
+  kind: "image",
+})
 
 /** Let every scheduled fiber run a few times (forks start on the next tick). */
 export const settle = Effect.yieldNow.pipe(Effect.repeat(Schedule.recurs(10)), Effect.asVoid)

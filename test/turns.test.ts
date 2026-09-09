@@ -4,8 +4,9 @@ import { TestClock } from "effect/testing"
 import type { BridgeEvent } from "../src/domain/events.ts"
 import { Events } from "../src/engine/Events.ts"
 import { HandlerFailed } from "../src/engine/Responder.ts"
+import { MediaStore } from "../src/engine/Media.ts"
 import { TurnRegistry } from "../src/engine/Turns.ts"
-import { EngineTestLayer, FakeWhatsApp, TestResponder, chat, external, message, replies, settle, takeSoon } from "./support/fakes.ts"
+import { EngineTestLayer, FakeWhatsApp, TestResponder, chat, external, jpeg, message, replies, settle, takeSoon } from "./support/fakes.ts"
 
 /** Collect the next `n` events without missing any published before we subscribe. */
 const collectEvents = (n: number) =>
@@ -439,5 +440,76 @@ describe("TurnEngine sending", () => {
       expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
       expect((yield* registry.get(call.turnId)).state).toBe("committed")
     }).pipe(Effect.provide(EngineTestLayer())),
+  )
+})
+
+describe("TurnEngine media", () => {
+  it.effect("opens the turn with the downloaded image attached", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const events = yield* collectEvents(1)
+      const m = message("what is this?", { kind: "image", mimetype: "image/jpeg" })
+      yield* Ref.set(wa.media, new Map([[m.messageId, jpeg(300)]]))
+      yield* wa.deliver(m)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      const media = call.messages[0]?.media
+      expect(media?.mimetype).toBe("image/jpeg")
+      expect(media?.size).toBe(300)
+      expect(media?.path.endsWith(`${m.messageId}.jpeg`)).toBe(true)
+      const [opened] = yield* events
+      expect(opened?._tag === "TurnOpened" && opened.messages[0]?.media?.path).toBe(media?.path)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("opens the turn without the attachment when the download outlasts the media wait", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const m = message("slow photo", { kind: "image" })
+      yield* Ref.set(wa.media, new Map([[m.messageId, jpeg()]]))
+      const latch = yield* Latch.make(false)
+      yield* Ref.set(wa.mediaGate, Option.some(latch))
+      yield* wa.deliver(m)
+      yield* takeSoon(wa.reactions)
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(responder.calls))).toBe(true)
+      yield* TestClock.adjust("8 seconds")
+      const call = yield* takeSoon(responder.calls)
+      expect(call.messages[0]?.media).toBeUndefined()
+      // the download still completes in the background and is served on demand afterwards
+      yield* latch.open
+      const store = yield* MediaStore
+      expect((yield* store.get(chat, m.messageId)).size).toBe(64)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("respects the policy: no automatic download for documents under `images`, none at all under `none`", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const doc = message("contract", { kind: "document", mimetype: "application/pdf" })
+      yield* Ref.set(wa.media, new Map([[doc.messageId, { ...jpeg(), mimetype: "application/pdf", extension: "pdf", kind: "document" }]]))
+      yield* wa.deliver(doc)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      expect(call.messages[0]?.media).toBeUndefined()
+      expect(yield* Ref.get(wa.downloads)).toBe(0)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("policy none skips images too", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const m = message("photo", { kind: "image" })
+      yield* Ref.set(wa.media, new Map([[m.messageId, jpeg()]]))
+      yield* wa.deliver(m)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      expect(call.messages[0]?.media).toBeUndefined()
+      expect(yield* Ref.get(wa.downloads)).toBe(0)
+    }).pipe(Effect.provide(EngineTestLayer({ mediaAuto: "none" }))),
   )
 })

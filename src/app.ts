@@ -4,6 +4,7 @@ import { Duration, Effect, FiberSet, Layer, Option } from "effect"
 import { BridgeConfig, BridgeConfigLive, DotEnvLive, type BridgeConfigShape } from "./config.ts"
 import { EventsLive } from "./engine/Events.ts"
 import { HealthLive } from "./engine/Health.ts"
+import { MediaStoreLive } from "./engine/Media.ts"
 import { ResponderLive } from "./engine/Responder.ts"
 import { TurnEngineLive, TurnRegistryLive } from "./engine/Turns.ts"
 import { HttpServerLive } from "./http/Server.ts"
@@ -61,6 +62,9 @@ export const StartupLogLive = Layer.effectDiscard(
         turnTimeoutMs: Duration.toMillis(c.turnTimeout),
         groups: c.groups,
         allowedSenders: c.allowedSenders.length === 0 ? "anyone" : c.allowedSenders.length,
+        mediaDir: c.mediaDir,
+        mediaAuto: c.mediaAuto,
+        mediaMaxBytes: c.mediaMaxBytes,
         typing: c.typing,
         logBodies: c.logBodies,
       }),
@@ -92,11 +96,12 @@ export const coreLayer = (transport: BaileysOptions, overrides: Partial<BridgeCo
 export const daemonLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
   const Core = coreLayer({ mode: "serve" }, overrides)
   const Registry = TurnRegistryLive
+  const Media = MediaStoreLive.pipe(Layer.provide([Core, NodeServices.layer]))
   const Responder = ResponderLive.pipe(Layer.provide([Core, FetchHttpClient.layer]))
-  const Engine = TurnEngineLive.pipe(Layer.provide([Core, Registry, Responder]))
-  const Server = HttpServerLive.pipe(Layer.provide([Core, Registry]))
+  const Engine = TurnEngineLive.pipe(Layer.provide([Core, Registry, Responder, Media]))
+  const Server = HttpServerLive.pipe(Layer.provide([Core, Registry, Media]))
   const Startup = StartupLogLive.pipe(Layer.provide(Core))
-  return Layer.mergeAll(Core, Registry, Responder, Engine, Server, Startup, ProcessGuardsLive).pipe(Layer.provideMerge(AmbientLive))
+  return Layer.mergeAll(Core, Registry, Media, Responder, Engine, Server, Startup, ProcessGuardsLive).pipe(Layer.provideMerge(AmbientLive))
 }
 
 /** `bridge link`: the transport in link mode, nothing else. */

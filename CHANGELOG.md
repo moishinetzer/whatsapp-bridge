@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here. Intro pins on a tag.
 
+## v0.2.0 — 2026-09-09
+
+Attachments reach Intro as local files.
+
+- Images and stickers are downloaded automatically when a message arrives, and `TurnOpened` carries `messages[].media` = `{ path, mimetype, size, kind, downloadedAt }` once the download finished within `BRIDGE_MEDIA_WAIT` (default 8 s). The turn opens without it otherwise; the file is still fetched in the background.
+- `GET /chats/{chatId}/messages/{messageId}/media` downloads on demand (any kind: video, audio, document too) and returns the same record; `.../media/content` streams the bytes for a remote consumer. `bridge media --chat --message` on the CLI.
+- Files live under `<data dir>/media/<chat>/<messageId>.<ext>` with a `.json` sidecar, 0600 in 0700 directories, served across restarts from the sidecar, deleted after `BRIDGE_MEDIA_RETENTION` (default 7 days) by an hourly sweep. `BRIDGE_MEDIA_MAX_BYTES` (default 25 MB) refuses larger attachments before downloading. Expired WhatsApp media URLs are refreshed through a re-upload request.
+- Event schema stays v1: the new `media` field is optional.
+- `.env.example` values are quoted so the file is safe to `source` from shell scripts.
+
 ## v0.1.0 — 2026-09-09
 
 First release: the WhatsApp ↔ Intro bridge as a local daemon on a dedicated number.

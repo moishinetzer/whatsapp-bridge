@@ -1,8 +1,12 @@
 import makeWASocket, {
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
+  extensionForMediaMessage,
   fetchLatestBaileysVersion,
   generateMessageIDV2,
+  getContentType,
+  normalizeMessageContent,
   isJidBroadcast,
   isJidNewsletter,
   type ConnectionState,
@@ -13,6 +17,11 @@ import makeWASocket, {
   type proto,
 } from "@whiskeysockets/baileys"
 import { Cache, Cause, DateTime, Deferred, Duration, Effect, FiberSet, Layer, Option, Queue, Ref, Schedule, Schema, Stream } from "effect"
+
+/** protobuf's 64-bit numbers arrive as `Long` objects; only `toNumber` is needed here. */
+interface LongLike {
+  toNumber(): number
+}
 import qrcode from "qrcode-terminal"
 import { BridgeConfig } from "../config.ts"
 import { phoneOfJid, type ChatId, type MessageId } from "../domain/ids.ts"
@@ -23,7 +32,16 @@ import { Health } from "../engine/Health.ts"
 import { AuthStore } from "./AuthStore.ts"
 import { isBaileysLogLevel, makeBaileysLogger } from "./BaileysLogger.ts"
 import { extractInbound, type Extracted } from "./extract.ts"
-import { NotConnected, SendFailed, WhatsApp, type SendOptions } from "./WhatsApp.ts"
+import {
+  MediaDownloadFailed,
+  MediaTooLarge,
+  MediaUnavailable,
+  NotConnected,
+  SendFailed,
+  WhatsApp,
+  type DownloadedMedia,
+  type SendOptions,
+} from "./WhatsApp.ts"
 
 export interface BaileysOptions {
   /**
@@ -155,6 +173,11 @@ export const BaileysLive = (options: BaileysOptions) =>
       })
       // Idempotency: one 👀 and one turn per message, even if WhatsApp re-delivers.
       const seen = yield* Cache.make<string, true>({ capacity: 20_000, lookup: () => Effect.succeed(true) })
+      // Raw media messages seen this run: the encrypted blob's location and key live in them.
+      const rawMedia = yield* Cache.make<string, { readonly raw: WAMessage; readonly message: InboundMessage }>({
+        capacity: 2_000,
+        lookup: (key) => Effect.die(`no media message cached for ${key}`),
+      })
       // What we sent recently, so WhatsApp's "resend this" requests can be honoured instead of leaving a phone on "waiting for this message".
       const outbox = yield* Cache.make<string, proto.IMessage>({
         capacity: 1_000,
@@ -224,6 +247,7 @@ export const BaileysLive = (options: BaileysOptions) =>
           }
           yield* Cache.set(seen, id, true)
           yield* Cache.set(keys, id, key)
+          if (message.hasMedia) yield* Cache.set(rawMedia, id, { raw, message })
           yield* health.touch("inbound")
           yield* Effect.logInfo("inbound message").pipe(log, Effect.annotateLogs({ kind: message.kind, isGroup: message.isGroup }))
           if (config.logBodies) yield* Effect.logDebug("inbound body").pipe(log, Effect.annotateLogs({ text: message.text }))
@@ -527,6 +551,51 @@ export const BaileysLive = (options: BaileysOptions) =>
         yield* withSocket("presence", chatId, (s) => s.sendPresenceUpdate(composing ? "composing" : "paused", chatId))
       })
 
+      const toNumber = (n: number | LongLike | null | undefined): number | undefined => {
+        if (n === null || n === undefined) return undefined
+        if (typeof n === "number") return n
+        return typeof n === "object" && "toNumber" in n && typeof n.toNumber === "function" ? n.toNumber() : undefined
+      }
+
+      const downloadMedia = Effect.fn("WhatsApp.downloadMedia")(function* (
+        chatId: ChatId,
+        messageId: MessageId,
+        options: { readonly maxBytes: number },
+      ) {
+        const cached = yield* Cache.getOption(rawMedia, dedupeKey(chatId, messageId))
+        if (Option.isNone(cached)) {
+          return yield* new MediaUnavailable({ chatId, messageId, reason: "not a media message seen this run (the bridge may have restarted)" })
+        }
+        const { raw, message } = cached.value
+        const content = normalizeMessageContent(raw.message)
+        const contentType = content === undefined ? undefined : getContentType(content)
+        const media = content && contentType ? (content[contentType] as { mimetype?: string | null; fileLength?: number | LongLike | null } | null) : null
+        if (!media || typeof media !== "object") {
+          return yield* new MediaUnavailable({ chatId, messageId, reason: "message carries no downloadable media" })
+        }
+        const declared = toNumber(media.fileLength)
+        if (declared !== undefined && declared > options.maxBytes) {
+          return yield* new MediaTooLarge({ chatId, messageId, size: declared, maxBytes: options.maxBytes })
+        }
+        const sock = yield* Ref.get(socket)
+        const context = Option.isSome(sock) ? { reuploadRequest: (m: WAMessage) => sock.value.updateMediaMessage(m), logger } : undefined
+        const bytes = yield* Effect.tryPromise({
+          try: () => downloadMediaMessage(raw, "buffer", {}, context),
+          catch: (e) => new MediaDownloadFailed({ chatId, messageId, detail: messageOf(e) }),
+        }).pipe(
+          Effect.timeout("60 seconds"),
+          Effect.catchTag("TimeoutError", () => new MediaDownloadFailed({ chatId, messageId, detail: "timed out after 60 seconds" })),
+        )
+        if (bytes.byteLength > options.maxBytes) {
+          return yield* new MediaTooLarge({ chatId, messageId, size: bytes.byteLength, maxBytes: options.maxBytes })
+        }
+        const mimetype = (media.mimetype ?? message.mimetype ?? "application/octet-stream").split(";")[0] ?? "application/octet-stream"
+        const extension = (content ? extensionForMediaMessage(content) : undefined) ?? mimetype.split("/")[1] ?? "bin"
+        yield* Effect.logInfo("media downloaded").pipe(Effect.annotateLogs({ chatId, messageId, bytes: bytes.byteLength, mimetype }))
+        const result: DownloadedMedia = { bytes: new Uint8Array(bytes), mimetype, extension: extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "bin", kind: message.kind }
+        return result
+      })
+
       return WhatsApp.of({
         inbound: Stream.fromQueue(inbound),
         linked: Deferred.await(linked),
@@ -535,6 +604,7 @@ export const BaileysLive = (options: BaileysOptions) =>
         react,
         unreact,
         setTyping,
+        downloadMedia,
       })
     }),
   )

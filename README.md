@@ -13,6 +13,7 @@ Built as an [Effect v4](https://effect.website) service from top to bottom (serv
 - [Running](#running)
 - [How a turn works](#how-a-turn-works)
 - [Integrating Intro](#integrating-intro)
+- [Attachments](#attachments)
 - [HTTP API](#http-api)
 - [Event schema (v1)](#event-schema-v1)
 - [Configuration](#configuration)
@@ -110,9 +111,35 @@ Set `BRIDGE_RESPONDER=http` and `INTRO_HANDLER_URL=http://127.0.0.1:9000/turn`. 
 
 Any time, in either mode, Intro can `POST /chats/{chatId}/messages` to say something unprompted. That is how it asks Moishi to open the Grok Bot app: *"This needs the app: open Grok Bot → approve the Link spend for X."* The bridge never pretends an app-side action happened; that is Intro's rule to keep (see `docs/intro-integration.md` for all product rules Intro follows on this line).
 
+### Attachments
+
+Images and stickers are downloaded before the turn opens, so `TurnOpened` messages carry `media.path`, a local file Intro can open directly:
+
+```json
+{ "kind": "image", "hasMedia": true, "mimetype": "image/jpeg", "text": "what is this?",
+  "media": { "path": "/home/box/whatsapp-bridge/data/media/447700900123@s.whatsapp.net/3EB0C8F1.jpeg",
+             "mimetype": "image/jpeg", "size": 183211, "kind": "image", "downloadedAt": "2026-09-09T10:15:31.204Z" } }
+```
+
+Anything else (video, audio, documents), or an image whose download was slower than `BRIDGE_MEDIA_WAIT`, is fetched on demand: `GET /chats/{chatId}/messages/{messageId}/media` returns the same record after downloading (once; later calls are served from disk, restarts included), and `.../media/content` streams the bytes. See [Attachments](#attachments) below for limits and retention.
+
 ### Chat ids
 
 A DM's `chatId` is `<digits>@s.whatsapp.net`; a group's ends in `@g.us`; newer WhatsApp builds may hand out `<id>@lid`. Always send to the `chatId` you received. The CLI accepts a phone number and converts it (`bridge send --to "+44 7700 900123" --text hi`).
+
+## Attachments
+
+| | |
+|---|---|
+| Where | `BRIDGE_MEDIA_DIR` (default `<data dir>/media`), one folder per chat, `<messageId>.<ext>` plus a `<messageId>.json` sidecar with the record above. Files 0600, directories 0700. |
+| What is automatic | `BRIDGE_MEDIA_AUTO=images` (default): image and sticker. `all`: video, audio and documents too. `none`: only on demand. |
+| How long a turn waits | `BRIDGE_MEDIA_WAIT` (8 s). Slower downloads finish in the background and are served on demand. |
+| Size limit | `BRIDGE_MEDIA_MAX_BYTES` (25 MB), checked against WhatsApp's declared size before downloading: `413 MediaTooLarge`. |
+| Retention | `BRIDGE_MEDIA_RETENTION` (7 days); an hourly sweep deletes older files and their sidecars. |
+| After a restart | Already-downloaded files are still served (the sidecar is the index). A message that arrived before the restart and was never downloaded cannot be fetched any more: `404 MediaUnavailable`. |
+| Expired links | WhatsApp media URLs expire; the bridge asks the phone to re-upload and retries once. |
+
+Voice notes arrive as `audio/ogg; codecs=opus`; transcription is Intro's job.
 
 ## HTTP API
 
@@ -127,6 +154,8 @@ Interactive docs: `http://127.0.0.1:8787/docs`; the OpenAPI document: `/openapi.
 | POST | `/chats/{chatId}/messages/{messageId}/reactions` | `{emoji}` | 204 | same |
 | DELETE | `/chats/{chatId}/messages/{messageId}/reactions` | | 204 | same |
 | POST | `/chats/{chatId}/typing` | `{composing: bool}` | 204 | same |
+| GET | `/chats/{chatId}/messages/{messageId}/media` | | `MediaFile` (downloads if needed) | 404 `MediaUnavailable`, 413 `MediaTooLarge`, 502 `MediaDownloadFailed`, 500 `MediaStoreError` |
+| GET | `/chats/{chatId}/messages/{messageId}/media/content` | | the bytes, with the file's content type | same |
 | GET | `/turns` | | open `TurnSummary[]` | |
 | GET | `/turns/{turnId}` | | `TurnSummary` | 404 `TurnNotFound` |
 | POST | `/turns/{turnId}/reply` | `{text}` or `{replies: []}` | `{turnId, sentMessageIds}` | 404 `TurnNotFound`, 409 `TurnSuperseded{currentTurnId}`, 409 `TurnNotAwaitingReply{state}`, 502 `TurnFailedError{reason}` |
@@ -135,7 +164,7 @@ Interactive docs: `http://127.0.0.1:8787/docs`; the OpenAPI document: `/openapi.
 
 With `BRIDGE_API_TOKEN` set, every endpoint except `/health`, `/docs` and `/openapi.json` requires `Authorization: Bearer <token>`.
 
-The same commands exist on the CLI for hand testing: `bridge health | send | react | unreact | turns | reply`.
+The same commands exist on the CLI for hand testing: `bridge health | send | react | unreact | media | turns | reply`.
 
 ## Event schema (v1)
 
@@ -171,7 +200,7 @@ Every event carries the envelope `{ "_tag", "v": 1, "seq", "at" }` (`seq` increa
 }
 ```
 
-`kind` is one of `text, image, video, audio, document, sticker, location, contact, other`. **Media bytes are not delivered in v1**: `hasMedia`, `kind` and `mimetype` tell Intro something was attached and `text` carries the caption. Fetching media is planned for a later version.
+`kind` is one of `text, image, video, audio, document, sticker, location, contact, other`. `hasMedia`, `kind` and `mimetype` say something was attached and `text` carries the caption; `media` (optional) is the local file, see [Attachments](#attachments).
 
 `TurnPayload` (what the `http` responder POSTs and what `TurnOpened` contains): `{ "v": 1, "turnId", "chatId", "isGroup", "messages": [InboundMessage], "supersedes"? }`.
 
@@ -201,6 +230,12 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 | `LOG_LEVEL` / `LOG_FORMAT` / `LOG_BODIES` | `Info` / `pretty` / `false` | Logging |
 | `BAILEYS_LOG_LEVEL` | `warn` | The protocol library's own log level; lines are forwarded, redacted, into the bridge log |
 | `WA_BROWSER_NAME` | `Intro Bridge` | Name in the phone's Linked devices list |
+| `BRIDGE_MEDIA_DIR` | `<data dir>/media` | Where attachments are stored |
+| `BRIDGE_MEDIA_AUTO` | `images` | `images`, `all` or `none`: what is downloaded before a turn opens |
+| `BRIDGE_MEDIA_MAX_BYTES` | `26214400` | Refuse larger attachments |
+| `BRIDGE_MEDIA_WAIT` | `8 seconds` | How long a turn waits for an automatic download |
+| `BRIDGE_MEDIA_RETENTION` | `7 days` | Downloaded files older than this are deleted |
+| `BRIDGE_MEDIA_SWEEP_EVERY` | `1 hour` | How often the retention sweep runs |
 | `BRIDGE_URL` | `http://$HOST:$PORT` | Where the CLI client commands find the daemon |
 
 Durations use Effect's format: `"1500 millis"`, `"2 seconds"`, `"10 minutes"`.
@@ -246,6 +281,7 @@ The bridge is built so that every failure is either recovered automatically or r
 | The responder fails, times out, or throws | `TurnFailed` with the reason, 👀 left on, typing cleared; the worker moves on to the next message. |
 | Sending the reply fails | Retried 5 times with backoff (about 30 s, enough for a reconnect); then `TurnFailed`. The message id is fixed before the first attempt, so a send that timed out but went through is never delivered twice. |
 | A reply is very long or empty | Text over 4000 characters is split at paragraph, line or sentence boundaries into several messages; blank replies are dropped. |
+| An attachment fails to download | The turn still opens (without `media`) after `BRIDGE_MEDIA_WAIT`; the failure is logged; the on-demand endpoint retries (failures are never cached). |
 | The 👀 reaction fails | Warning logged; `BRIDGE_SEEN_FALLBACK_TEXT` sends a text instead. |
 | Intro's SSE client stalls | Its buffer slides (oldest dropped) instead of growing; reconnect with `?since=` to catch up. |
 | A promise inside the protocol library rejects unhandled | Logged with its reason, the daemon keeps running. An uncaught exception is logged and the process exits 1 for the supervisor to restart. |

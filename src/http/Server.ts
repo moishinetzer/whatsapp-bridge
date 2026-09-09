@@ -7,6 +7,7 @@ import { createServer } from "node:http"
 import { BridgeConfig } from "../config.ts"
 import { Events } from "../engine/Events.ts"
 import { Health } from "../engine/Health.ts"
+import { MediaStore, MediaStoreError } from "../engine/Media.ts"
 import { TurnRegistry } from "../engine/Turns.ts"
 import { WhatsApp } from "../whatsapp/WhatsApp.ts"
 import { EVENT_SCHEMA_VERSION, type BridgeEvent } from "../domain/events.ts"
@@ -66,7 +67,17 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
     )
     .handle("react", ({ params, payload }) => WhatsApp.use((w) => w.react(params.chatId, params.messageId, payload.emoji)))
     .handle("unreact", ({ params }) => WhatsApp.use((w) => w.unreact(params.chatId, params.messageId)))
-    .handle("typing", ({ params, payload }) => WhatsApp.use((w) => w.setTyping(params.chatId, payload.composing))),
+    .handle("typing", ({ params, payload }) => WhatsApp.use((w) => w.setTyping(params.chatId, payload.composing)))
+    .handle("media", ({ params }) => MediaStore.use((m) => m.get(params.chatId, params.messageId)))
+    .handle("mediaContent", ({ params }) =>
+      Effect.gen(function* () {
+        const store = yield* MediaStore
+        const file = yield* store.get(params.chatId, params.messageId)
+        return yield* HttpServerResponse.file(file.path, { contentType: file.mimetype }).pipe(
+          Effect.mapError((e) => new MediaStoreError({ operation: "serve", detail: e.message })),
+        )
+      }),
+    ),
 )
 
 export const TurnsGroupLive = HttpApiBuilder.group(BridgeApi, "turns", (handlers) =>

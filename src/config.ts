@@ -35,6 +35,17 @@ export interface BridgeConfigShape {
   readonly logBodies: boolean
   readonly baileysLogLevel: string
   readonly browserName: string
+  /** Where downloaded attachments live. Defaults to `<dataDir>/media`. */
+  readonly mediaDir: string
+  /** Which attachments are downloaded before a turn opens: `images` (image + sticker), `all`, or `none`. */
+  readonly mediaAuto: "images" | "all" | "none"
+  readonly mediaMaxBytes: number
+  /** How long a turn waits for an automatic download before opening without it. */
+  readonly mediaWait: Duration.Duration
+  /** Downloaded files older than this are deleted by the sweep. */
+  readonly mediaRetention: Duration.Duration
+  /** How often the retention sweep runs. */
+  readonly mediaSweepEvery: Duration.Duration
   /** Harness only: how long the pong responder pretends to think. */
   readonly harnessSlow: Duration.Duration
 }
@@ -82,6 +93,12 @@ const knobs = {
     Config.literals(["trace", "debug", "info", "warn", "error", "silent"], "BAILEYS_LOG_LEVEL").pipe(Config.withDefault("warn")),
   ),
   browserName: knob("WA_BROWSER_NAME", Config.string("WA_BROWSER_NAME").pipe(Config.withDefault("Intro Bridge"))),
+  mediaDir: knob("BRIDGE_MEDIA_DIR", Config.option(Config.string("BRIDGE_MEDIA_DIR"))),
+  mediaAuto: knob("BRIDGE_MEDIA_AUTO", Config.literals(["images", "all", "none"], "BRIDGE_MEDIA_AUTO").pipe(Config.withDefault("images"))),
+  mediaMaxBytes: knob("BRIDGE_MEDIA_MAX_BYTES", Config.int("BRIDGE_MEDIA_MAX_BYTES").pipe(Config.withDefault(25 * 1024 * 1024))),
+  mediaWait: knob("BRIDGE_MEDIA_WAIT", Config.duration("BRIDGE_MEDIA_WAIT").pipe(Config.withDefault(Duration.seconds(8)))),
+  mediaRetention: knob("BRIDGE_MEDIA_RETENTION", Config.duration("BRIDGE_MEDIA_RETENTION").pipe(Config.withDefault(Duration.days(7)))),
+  mediaSweepEvery: knob("BRIDGE_MEDIA_SWEEP_EVERY", Config.duration("BRIDGE_MEDIA_SWEEP_EVERY").pipe(Config.withDefault(Duration.hours(1)))),
   harnessSlow: knob("BRIDGE_HARNESS_SLOW", Config.duration("BRIDGE_HARNESS_SLOW").pipe(Config.withDefault(Duration.zero))),
 }
 
@@ -92,10 +109,14 @@ const configs = Object.fromEntries(Object.entries(knobs).map(([k, v]) => [k, v.c
 
 /** Every knob, read from the active `ConfigProvider` (env, then `.env`). */
 export const bridgeConfig: Config.Config<BridgeConfigShape> = Config.all(configs).pipe(
-  Config.map((c) => ({
-    ...c,
-    authDir: `${c.dataDir.replace(/\/+$/, "")}/auth`,
-  })),
+  Config.map((c) => {
+    const dataDir = c.dataDir.replace(/\/+$/, "")
+    return {
+      ...c,
+      authDir: `${dataDir}/auth`,
+      mediaDir: Option.getOrElse(c.mediaDir, () => `${dataDir}/media`),
+    }
+  }),
 )
 
 /** Re-reads each knob on its own to name the ones that failed. */

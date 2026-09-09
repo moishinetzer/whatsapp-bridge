@@ -9,7 +9,7 @@ import { Health } from "../src/engine/Health.ts"
 import { TurnId } from "../src/domain/ids.ts"
 import { BridgeApi } from "../src/http/Api.ts"
 import { ApiLive, bearerAuth } from "../src/http/Server.ts"
-import { EngineTestLayer, FakeWhatsApp, TestResponder, external, message, settle, takeSoon } from "./support/fakes.ts"
+import { EngineTestLayer, FakeWhatsApp, TestResponder, chat, external, jpeg, message, settle, takeSoon } from "./support/fakes.ts"
 
 const TOKEN = "s3cret"
 
@@ -154,6 +154,33 @@ describe("HTTP API validation", () => {
       expect(wrongType.status).toBe(415)
       yield* settle
       expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+})
+
+describe("HTTP API media", () => {
+  it.effect("returns the local file record and streams the bytes", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const raw = yield* HttpClient.HttpClient
+      const wa = yield* FakeWhatsApp
+      const m = message("photo", { kind: "image", mimetype: "image/jpeg" })
+      yield* Ref.set(wa.media, new Map([[m.messageId, jpeg(100)]]))
+
+      const file = yield* api.chats.media({ params: { chatId: chat, messageId: m.messageId } })
+      expect(file.size).toBe(100)
+      expect(file.mimetype).toBe("image/jpeg")
+
+      const response = yield* raw.get(`/chats/${chat}/messages/${m.messageId}/media/content`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      })
+      expect(response.status).toBe(200)
+      expect(response.headers["content-type"]).toContain("image/jpeg")
+      const bytes = yield* response.arrayBuffer
+      expect(new Uint8Array(bytes)).toEqual(jpeg(100).bytes)
+
+      const missing = yield* api.chats.media({ params: { chatId: chat, messageId: message("x").messageId } }).pipe(Effect.flip)
+      expect(missing._tag).toBe("MediaUnavailable")
     }).pipe(Effect.provide(ServerTestLayer)),
   )
 })

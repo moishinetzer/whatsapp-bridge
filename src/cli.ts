@@ -169,6 +169,18 @@ const unreact = Command.make(
     ),
 ).pipe(Command.withDescription("Remove our reaction from a message"))
 
+const media = Command.make(
+  "media",
+  {
+    chat: Flag.string("chat"),
+    message: Flag.string("message").pipe(Flag.withDescription("The WhatsApp message id carrying the attachment")),
+  },
+  ({ chat, message }) =>
+    withClient((client) => client.chats.media({ params: { chatId: toChatId(chat), messageId: MessageId.make(message) } })).pipe(
+      Effect.flatMap(json),
+    ),
+).pipe(Command.withDescription("Download a message's attachment (if not already on disk) and print where it is"))
+
 const turns = Command.make("turns", {}, () => withClient((client) => client.turns.list()).pipe(Effect.flatMap(json))).pipe(
   Command.withDescription("List the turns still waiting for a reply"),
 )
@@ -194,7 +206,7 @@ const unlink = Command.make(
 
 const bridge = Command.make("bridge").pipe(
   Command.withDescription("WhatsApp ↔ Intro bridge on a dedicated number"),
-  Command.withSubcommands([link, run, harness, health, send, react, unreact, turns, reply, unlink]),
+  Command.withSubcommands([link, run, harness, health, send, react, unreact, media, turns, reply, unlink]),
 )
 
 /** The whole CLI, needing only the Node platform services. */

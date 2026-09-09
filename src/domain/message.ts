@@ -14,10 +14,23 @@ export const MessageKind = Schema.Literals([
 ])
 export type MessageKind = typeof MessageKind.Type
 
+/** A media attachment the bridge downloaded to local disk. */
+export const MediaFile = Schema.Struct({
+  /** Absolute path on the bridge machine; readable by the user the daemon runs as. */
+  path: Schema.String,
+  mimetype: Schema.String,
+  /** Bytes on disk. */
+  size: Schema.Number,
+  kind: MessageKind,
+  downloadedAt: Schema.DateTimeUtcFromString,
+})
+export type MediaFile = typeof MediaFile.Type
+
 /**
  * One inbound WhatsApp message as Intro sees it. This is the versioned wire
- * shape (see `BridgeEvent` for the envelope). Media bytes are not delivered in
- * v1; `hasMedia` / `mimetype` tell Intro that something was attached.
+ * shape (see `BridgeEvent` for the envelope). `hasMedia` / `mimetype` say
+ * something was attached; `media` carries the local file once the bridge has
+ * downloaded it (automatically for images, on demand for the rest).
  */
 export const InboundMessage = Schema.Struct({
   chatId: ChatId,
@@ -38,5 +51,7 @@ export const InboundMessage = Schema.Struct({
   mimetype: Schema.optionalKey(Schema.String),
   /** Id of the message this one quotes/replies to, when any. */
   quotedMessageId: Schema.optionalKey(MessageId),
+  /** Present on `TurnOpened` when the attachment was downloaded in time; otherwise fetch it via the media endpoint. */
+  media: Schema.optionalKey(MediaFile),
 })
 export type InboundMessage = typeof InboundMessage.Type
