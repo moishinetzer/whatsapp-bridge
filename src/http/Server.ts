@@ -1,7 +1,7 @@
 import { NodeHttpServer } from "@effect/platform-node"
-import { Cause, Clock, DateTime, Effect, Layer, Option, Redacted, Schedule, Stream } from "effect"
-import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
-import { HttpApiBuilder, HttpApiScalar } from "effect/unstable/httpapi"
+import { Cause, Clock, DateTime, Effect, Layer, Option, Redacted, Result, Schedule, Stream } from "effect"
+import { HttpRouter, HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import { HttpApiBuilder, HttpApiError, HttpApiScalar } from "effect/unstable/httpapi"
 import { createHash, timingSafeEqual } from "node:crypto"
 import { createServer } from "node:http"
 import { BridgeConfig } from "../config.ts"
@@ -94,12 +94,50 @@ export const TurnsGroupLive = HttpApiBuilder.group(BridgeApi, "turns", (handlers
     ),
 )
 
+/**
+ * Client mistakes get a JSON body an agent can read, instead of the framework's
+ * empty 400 / 404: a request that fails its schema (params, query, payload) and
+ * an unknown route. This has to be router middleware, not server middleware:
+ * the server turns a failed handler into a response and sends it before any
+ * outer middleware sees the cause.
+ */
+const CLIENT_KINDS: ReadonlySet<string> = new Set(["Params", "Query", "Headers", "Payload"])
+
+export const ClientErrorsLive = HttpRouter.middleware(
+  (app) =>
+    Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest
+      return yield* app.pipe(
+        Effect.catchCause((cause) => {
+          const failure = Option.getOrUndefined(Cause.findErrorOption(cause)) ?? Result.getOrUndefined(Cause.findDefect(cause))
+          // `Body` / `ResponseHeaders` are the server failing to encode its own answer: a bug, not the client's fault.
+          if (HttpApiError.HttpApiSchemaError.is(failure) && CLIENT_KINDS.has(failure.kind)) {
+            return Effect.succeed(
+              HttpServerResponse.jsonUnsafe(
+                { _tag: "InvalidRequest", kind: failure.kind, message: failure.cause.message, method: request.method, path: request.url },
+                { status: 400 },
+              ),
+            )
+          }
+          if (HttpServerError.isHttpServerError(failure) && failure.reason._tag === "RouteNotFound") {
+            return Effect.succeed(
+              HttpServerResponse.jsonUnsafe({ _tag: "RouteNotFound", method: request.method, path: request.url }, { status: 404 }),
+            )
+          }
+          return Effect.failCause(cause)
+        }),
+      )
+    }),
+  { global: true },
+)
+
 /** All groups mounted, plus the OpenAPI document and the Scalar UI. */
 export const ApiLive = Layer.mergeAll(
   HttpApiBuilder.layer(BridgeApi, { openapiPath: "/openapi.json" }).pipe(
     Layer.provide([HealthGroupLive, EventsGroupLive, ChatsGroupLive, TurnsGroupLive]),
   ),
   HttpApiScalar.layer(BridgeApi, { path: "/docs" }),
+  ClientErrorsLive,
 )
 
 /** Public paths that never need the bearer token. */

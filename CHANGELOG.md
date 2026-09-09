@@ -11,6 +11,9 @@ Attachments reach Intro as local files.
 - Files live under `<data dir>/media/<chat>/<messageId>.<ext>` with a `.json` sidecar, 0600 in 0700 directories, served across restarts from the sidecar, deleted after `BRIDGE_MEDIA_RETENTION` (default 7 days) by an hourly sweep. `BRIDGE_MEDIA_MAX_BYTES` (default 25 MB) refuses larger attachments before downloading. Expired WhatsApp media URLs are refreshed through a re-upload request.
 - Event schema stays v1: the new `media` field is optional.
 - `.env.example` values are quoted so the file is safe to `source` from shell scripts.
+- Requests that fail validation answer `400 {"_tag":"InvalidRequest","kind","message"}` and unknown routes `404 {"_tag":"RouteNotFound"}` instead of empty bodies.
+- `GET /events?since=` rejects anything but a non-negative integer with that 400; before, a bad cursor decoded to NaN and the stream silently delivered nothing.
+- README: a complete reference of the tool surface for the agent (every endpoint with exact shapes, the event and object schemas, the error catalogue, the CLI, the responder contracts, and playbooks).
 
 ## v0.1.0 — 2026-09-09
 

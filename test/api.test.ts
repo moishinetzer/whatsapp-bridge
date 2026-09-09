@@ -142,6 +142,16 @@ describe("HTTP API validation", () => {
         body: HttpBody.jsonUnsafe({ text: "" }),
       })
       expect(response.status).toBe(400)
+      const body = (yield* response.json) as { _tag: string; kind: string; message: string }
+      expect(body._tag).toBe("InvalidRequest")
+      expect(body.kind).toBe("Payload")
+      expect(body.message).toContain("length")
+      const badCursor = yield* raw.get("/events?since=abc", { headers: { authorization: `Bearer ${TOKEN}` } })
+      expect(badCursor.status).toBe(400)
+      expect(((yield* badCursor.json) as { _tag: string; kind: string }).kind).toBe("Query")
+      const unknown = yield* raw.get("/nope", { headers: { authorization: `Bearer ${TOKEN}` } })
+      expect(unknown.status).toBe(404)
+      expect(((yield* unknown.json) as { _tag: string })._tag).toBe("RouteNotFound")
       const malformed = yield* raw.post("/chats/447700900123@s.whatsapp.net/messages", {
         headers: { authorization: `Bearer ${TOKEN}` },
         body: HttpBody.text("{not json", "application/json"),

@@ -36,8 +36,12 @@ export const HealthGroup = HttpApiGroup.make("health").add(
 )
 
 export const EventsQuery = Schema.Struct({
-  /** Replay buffered events with `seq` greater than this before going live. Default: live only. */
-  since: Schema.optionalKey(Schema.NumberFromString),
+  /**
+   * Replay buffered events with `seq` greater than this before going live.
+   * Default: live only. Must be a non-negative integer: `NumberFromString`
+   * alone turns "abc" into NaN, which would silently filter out every event.
+   */
+  since: Schema.optionalKey(Schema.NumberFromString.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)))),
 })
 
 export const EventsGroup = HttpApiGroup.make("events").add(
