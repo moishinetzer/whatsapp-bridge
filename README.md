@@ -1,6 +1,6 @@
 # whatsapp-bridge
 
-A local daemon that puts **Intro** (the Grok Bot agent) on a **dedicated WhatsApp number**. It receives messages, acknowledges them with 👀 within seconds, hands them to Intro as one *turn* per burst, sends Intro's reply back in-thread, clears the 👀, and interrupts in-flight work when newer messages arrive. Intro's own reasoning stays outside this repo: the bridge is a messaging I/O layer with a small HTTP API on localhost.
+A local daemon that puts **Intro** (the Grok Bot agent) on a **dedicated WhatsApp number**. It receives messages (attachments included), acknowledges them with 👀 within seconds, hands them to Intro as one *turn* per burst, sends Intro's reply back in-thread (text, images, files), clears the 👀, and interrupts in-flight work when newer messages arrive. Intro's own reasoning stays outside this repo: the bridge is a messaging I/O layer with a small HTTP API on localhost.
 
 Built as an [Effect v4](https://effect.website) service from top to bottom (services, layers, schemas, schedules, fibers, typed errors) over [Baileys](https://github.com/WhiskeySockets/Baileys) for the WhatsApp Web protocol.
 
@@ -105,18 +105,18 @@ The integration style is **A: local daemon + API**. Intro never touches the What
 
 1. `GET /events` (server-sent events). The first event is always `Ready`; then `TurnOpened` events arrive with the batched messages.
 2. Generate the reply.
-3. `POST /turns/{turnId}/reply` with `{"text": "..."}` (or `{"replies": ["...", "..."]}` for several bubbles). The call returns once the messages are sent and the 👀 cleared, with the sent message ids.
+3. `POST /turns/{turnId}/reply` with `{"text": "..."}` (or `{"replies": ["...", "..."]}` for several bubbles, plus `"attachments": [{"path": "/tmp/chart.png", "caption": "..."}]` for files). The call returns once the messages are sent and the 👀 cleared, with the sent message ids.
 4. On `409 TurnSuperseded`, drop the stale answer; the event stream already carries the replacement turn (`currentTurnId`).
 
 `examples/manual-loop.mjs` implements exactly this loop, including reconnecting with `?since=<last seq>` so nothing is missed.
 
 ### HTTP handler: the bridge pushes turns to Intro
 
-Set `BRIDGE_RESPONDER=http` and `INTRO_HANDLER_URL=http://127.0.0.1:9000/turn`. The bridge POSTs a `TurnPayload` for each turn and sends whatever the handler returns: `{"text": "..."}`, `{"replies": [...]}`, `{}` (nothing to say; the turn completes and 👀 clears), or `{"async": true}` (answer later through `POST /turns/{id}/reply`). If newer messages supersede the turn, the request is **aborted** and a new one arrives. `examples/http-handler.mjs` is a working stub.
+Set `BRIDGE_RESPONDER=http` and `INTRO_HANDLER_URL=http://127.0.0.1:9000/turn`. The bridge POSTs a `TurnPayload` for each turn and sends whatever the handler returns: `{"text": "..."}`, `{"replies": [...]}`, `{"attachments": [...]}` (files, see below), `{}` (nothing to say; the turn completes and 👀 clears), or `{"async": true}` (answer later through `POST /turns/{id}/reply`). If newer messages supersede the turn, the request is **aborted** and a new one arrives. `examples/http-handler.mjs` is a working stub.
 
 ### Proactive messages and escalation
 
-Any time, in either mode, Intro can `POST /chats/{chatId}/messages` to say something unprompted. That is how it asks Moishi to open the Grok Bot app: *"This needs the app: open Grok Bot → approve the Link spend for X."* The bridge never pretends an app-side action happened; that is Intro's rule to keep (see `docs/intro-integration.md` for all product rules Intro follows on this line).
+Any time, in either mode, Intro can `POST /chats/{chatId}/messages` to say something unprompted, or `POST /chats/{chatId}/media` to send a file. That is how it asks Moishi to open the Grok Bot app: *"This needs the app: open Grok Bot → approve the Link spend for X."* The bridge never pretends an app-side action happened; that is Intro's rule to keep (see `docs/intro-integration.md` for all product rules Intro follows on this line).
 
 ### Chat ids
 
@@ -146,6 +146,22 @@ Anything else (video, audio, documents), or an image whose download was slower t
 
 Voice notes arrive as `audio/ogg; codecs=opus`; transcription is Intro's job.
 
+### Sending files to the user
+
+The other direction works the same way, by path. Intro writes the file somewhere on the bridge machine and hands over its path, either as a turn reply or on its own:
+
+```sh
+# as the answer to a turn: text first, then the file
+curl -X POST http://127.0.0.1:8787/turns/turn_1f3c9e2ab7d04c6e8a1b/reply -H 'content-type: application/json' \
+  -d '{"text": "Here is Q3.", "attachments": [{"path": "/tmp/q3.png", "caption": "Revenue by month"}]}'
+
+# unprompted, any time
+curl -X POST http://127.0.0.1:8787/chats/447700900123@s.whatsapp.net/media -H 'content-type: application/json' \
+  -d '{"path": "/tmp/q3.png", "caption": "Revenue by month"}'
+```
+
+Or from a shell: `npm run bridge -- send --to 447700900123 --file /tmp/q3.png --caption "Revenue by month"`. A consumer on another machine sends the bytes instead of a path: `{"data": "<base64>", "mimetype": "image/png"}`. Images, videos, audio (voice notes included) and any document work; WhatsApp decides the presentation from the `kind`, which the bridge infers from the file type. The full contract is [`POST /chats/{chatId}/media`](#post-chatschatidmedia) and [`OutboundMediaPayload`](#outboundmediapayload).
+
 ## Reference for the agent
 
 Everything Intro can call, with exact shapes. The daemon also serves this as OpenAPI at `GET /openapi.json` and as interactive docs at `GET /docs`; the schemas in `src/domain/*.ts`, `src/http/Api.ts` and `src/engine/*.ts` are what both are generated from, so the code wins if this page and the code ever disagree.
@@ -164,6 +180,7 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | Ordering | `messages` arrays are oldest first. `GET /turns` is oldest first. Events are in `seq` order. |
 | Concurrency | One worker per chat. Turns from different chats are independent and may be answered concurrently; within a chat there is at most one open turn. |
 | Text limits | A turn reply longer than 4000 characters is split at paragraph, line, sentence or space boundaries into several messages; whitespace-only replies are dropped. `POST /chats/{chatId}/messages` sends its text as **one** message and does not split, so keep it short. |
+| Files | Outgoing files are described by an [`OutboundMediaPayload`](#outboundmediapayload): a local `path` (preferred, the bridge reads it) or base64 `data` with a `mimetype`. `BRIDGE_MEDIA_MAX_BYTES` (25 MB) applies in both directions. Files are read and checked before anything is sent, so a bad path is a 4xx and nothing goes out. |
 | Idempotency | Sending a message twice sends it twice. A turn accepts exactly one reply; the second gets `409 TurnNotAwaitingReply` with `state: "committed"`. Inbound messages are deduplicated by id inside the bridge. |
 | Schema version | Every event carries `v: 1`. The version only changes on an incompatible change; new optional fields do not bump it. |
 
@@ -175,6 +192,7 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | GET | [`/status`](#get-status) | The same body, always 200 |
 | GET | [`/events`](#get-events) | Server-sent events: turns, completions, connection changes |
 | POST | [`/chats/{chatId}/messages`](#post-chatschatidmessages) | Send a text |
+| POST | [`/chats/{chatId}/media`](#post-chatschatidmedia) | Send an image, video, audio or document |
 | POST | [`/chats/{chatId}/messages/{messageId}/reactions`](#post-chatschatidmessagesmessageidreactions) | React to a message |
 | DELETE | [`/chats/{chatId}/messages/{messageId}/reactions`](#delete-chatschatidmessagesmessageidreactions) | Remove our reaction |
 | POST | [`/chats/{chatId}/typing`](#post-chatschatidtyping) | Typing indicator on/off |
@@ -261,6 +279,38 @@ Content-Type: application/json
 | `text` | string | non-empty, else `400 InvalidRequest` |
 
 Errors: `503 NotConnected`, `502 SendFailed`. Direct sends are **not** retried by the bridge (turn replies are); a single attempt is capped at 30 seconds. On `NotConnected` with `state: "connecting"` wait and retry; on `SendFailed` retry once after a pause, then give up and tell the user another way.
+
+#### `POST /chats/{chatId}/media`
+
+Send one file to a chat, unprompted, in any responder mode. The body is an [`OutboundMediaPayload`](#outboundmediapayload). The bridge reads the file (or decodes the bytes), checks the size, uploads it to WhatsApp and returns the sent message id. Sending blocks until the upload is done, up to 3 minutes for a large document.
+
+```http
+POST /chats/447700900123@s.whatsapp.net/media
+Content-Type: application/json
+
+{"path": "/tmp/q3.png", "caption": "Revenue by month"}
+```
+
+```json
+200 {"chatId":"447700900123@s.whatsapp.net","messageId":"3EB0A1B2C3D4E5F60719"}
+```
+
+The same with bytes instead of a path (for a consumer that cannot see the bridge's disk):
+
+```json
+{"data": "iVBORw0KGgoAAAANSUhEUgAA...", "mimetype": "image/png", "caption": "Revenue by month"}
+```
+
+| Status | `_tag` | When |
+|---|---|---|
+| 400 | `InvalidRequest` | Neither or both of `path` and `data`, `data` not valid base64, an unknown `kind`. |
+| 400 | `OutboundInvalid` | `data` without a `mimetype`, or an empty file. `detail` says which. |
+| 404 | `OutboundFileUnreadable` | `path` does not exist, is a directory, or the daemon's user cannot read it. |
+| 413 | `OutboundTooLarge` | Over `BRIDGE_MEDIA_MAX_BYTES`; `size` and `maxBytes` in bytes. |
+| 503 | `NotConnected` | No WhatsApp socket; nothing was read. |
+| 502 | `SendFailed` | The upload or the send was rejected or took too long. Not retried; retry yourself. |
+
+What WhatsApp shows depends on `kind`: `image` and `video` get an inline preview with the caption under it (WhatsApp recompresses them); `audio` is a playable clip, or a voice-note bubble with `voiceNote: true` (which needs `audio/ogg; codecs=opus`); `document` is a file card with `fileName`, full quality, for anything else or for an image you want delivered untouched (`"kind": "document"`).
 
 #### `POST /chats/{chatId}/messages/{messageId}/reactions`
 
@@ -352,8 +402,13 @@ Content-Type: application/json
 |---|---|---|
 | `text` | string, optional | One reply bubble. |
 | `replies` | string[], optional | Several bubbles, sent in order. When both are given, `replies` go first, then `text`. |
+| `attachments` | [`OutboundMediaPayload`](#outboundmediapayload)[], optional | Files, sent after the text bubbles, in order. Each may carry its own `caption`. |
 
-Both may be omitted or empty: `{}` completes the turn **without sending anything** (the 👀 still clear, `sentMessageIds` is `[]`). Use that when the messages need no answer. Whitespace-only strings are dropped; strings over 4000 characters are split.
+Everything may be omitted: `{}` completes the turn **without sending anything** (the 👀 still clear, `sentMessageIds` is `[]`). Use that when the messages need no answer. Whitespace-only strings are dropped; strings over 4000 characters are split. `sentMessageIds` has one id per bubble and per file, in the order they went out.
+
+```json
+{"text": "Here is Q3.", "attachments": [{"path": "/tmp/q3.png", "caption": "Revenue by month"}]}
+```
 
 | Status | `_tag` | Meaning | What to do |
 |---|---|---|---|
@@ -361,6 +416,7 @@ Both may be omitted or empty: `{}` completes the turn **without sending anything
 | 409 | `TurnSuperseded` | Newer messages replaced this turn. `currentTurnId` names the replacement. | Drop the answer; answer `currentTurnId` instead (its `TurnOpened` carries every unanswered message). |
 | 409 | `TurnNotAwaitingReply` | The turn is not waiting for an external reply; `state` says what it is doing. `responding`: the `http` handler call is still running. `committed`: it was already answered. `failed`: it failed before your reply arrived. `batching`: it has not opened yet. | Nothing to send. |
 | 502 | `TurnFailedError` | The reply was accepted but sending failed after retries, or took over 90 seconds. `reason` explains. | The 👀 stays on. Tell the user through a fresh `POST /chats/{chatId}/messages` if the line is back, or wait for their next message. |
+| 400 / 404 / 413 | `OutboundInvalid` / `OutboundFileUnreadable` / `OutboundTooLarge` | An attachment could not be read or is too big. Checked **before** the turn is touched: it stays `awaiting`. | Fix the file and post the reply again. |
 
 In manual mode a turn waits `BRIDGE_TURN_TIMEOUT` (10 minutes) for this call; after that it fails with `TurnFailed` and a late reply gets `409 TurnNotAwaitingReply{state:"failed"}`.
 
@@ -485,9 +541,24 @@ What an `http` handler answers with. All fields optional.
 |---|---|---|
 | `text` | string or null | One bubble. |
 | `replies` | string[] | Several bubbles, in order; sent before `text` when both are present. |
+| `attachments` | [`OutboundMediaPayload`](#outboundmediapayload)[] | Files, sent after the text. An attachment that cannot be read fails the turn (`responder failed: OutboundFileUnreadable: ...`). |
 | `async` | boolean | `true`: "I will answer through `POST /turns/{turnId}/reply`"; the turn moves to `awaiting`. |
 
 `{}` completes the turn without sending anything.
+
+#### `OutboundMediaPayload`
+
+A file to send: the body of `POST /chats/{chatId}/media`, each element of `attachments` on a reply and in a `HandlerResponse`. Exactly one of `path` and `data`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `path` | string | Absolute path of a file on the bridge machine, readable by the user the daemon runs as. Preferred when Intro runs there too. |
+| `data` | string | The bytes, base64 (standard alphabet, padded). Needs `mimetype`. |
+| `mimetype` | string | Required with `data`; with `path` inferred from the extension (`jpg png gif webp mp4 mov 3gp mp3 m4a aac wav ogg oga opus pdf txt md csv json zip doc docx xls xlsx ppt pptx`), else `application/octet-stream`. |
+| `kind` | `image` `video` `audio` `document` | How WhatsApp presents it. Inferred from the mimetype's major type (`image/*`, `video/*`, `audio/*`, anything else a document); set it to `document` to send an image or video as a file, untouched. |
+| `caption` | string | Text under an image, video or document. Ignored for audio. |
+| `fileName` | string | Shown on document cards. Defaults to the path's basename, or `file.<ext>` for raw data. |
+| `voiceNote` | boolean | Audio only: send as a voice-note bubble. WhatsApp plays those only as `audio/ogg; codecs=opus`. |
 
 #### `BridgeStatus`
 
@@ -521,6 +592,9 @@ Every error body is `{"_tag": "...", ...fields}`. The status code is fixed per t
 | 404 | `RouteNotFound` | `method`, `path` | No such endpoint (also an empty path segment, e.g. `/turns//reply`). | Check the path. |
 | 404 | `TurnNotFound` | `turnId` | Unknown or pruned turn, or the daemon restarted. | Drop the answer. |
 | 404 | `MediaUnavailable` | `chatId`, `messageId`, `reason` | No media on that message, or not seen this run and nothing on disk. | Say so in the reply rather than pretending the attachment was seen. |
+| 404 | `OutboundFileUnreadable` | `path`, `detail` | The file to send does not exist, is a directory, or is not readable by the daemon. | Check the path (absolute, on the bridge machine). |
+| 400 | `OutboundInvalid` | `detail` | Raw `data` without a `mimetype`, or an empty file. | Fix the payload. |
+| 413 | `OutboundTooLarge` | `size`, `maxBytes` | The file to send is over `BRIDGE_MEDIA_MAX_BYTES`. | Shrink it, or raise the limit. |
 | 409 | `TurnSuperseded` | `turnId`, `chatId`, `currentTurnId` | The turn was replaced by newer messages. | Answer `currentTurnId`. |
 | 409 | `TurnNotAwaitingReply` | `turnId`, `state` | The turn is not waiting for a reply (`responding`, `committed`, `failed`, `batching`). | Nothing to send. |
 | 413 | `MediaTooLarge` | `chatId`, `messageId`, `size`, `maxBytes` | Over `BRIDGE_MEDIA_MAX_BYTES`. | Tell the user; raise the limit if it should have been allowed. |
@@ -546,7 +620,7 @@ Every error body is `{"_tag": "...", ...fields}`. The status code is fixed per t
 | Request | `POST <INTRO_HANDLER_URL>`, `Content-Type: application/json`, body a [`TurnPayload`](#turnpayload). No authentication header is added. |
 | Timeout | `INTRO_HANDLER_TIMEOUT` (120 seconds) for the whole call. |
 | Retries | A transport error (connection refused, reset) is retried twice more. A non-2xx status is **not** retried: it fails the turn with `responder failed: HttpClientError: ...` naming the status and URL. |
-| Response | `2xx` with a JSON [`HandlerResponse`](#handlerresponse): `{"text"}`, `{"replies": []}`, both, `{}` (nothing to send), or `{"async": true}` (answer later through `POST /turns/{turnId}/reply`, within `BRIDGE_TURN_TIMEOUT`). A body that is not valid `HandlerResponse` fails the turn. |
+| Response | `2xx` with a JSON [`HandlerResponse`](#handlerresponse): `{"text"}`, `{"replies": []}`, `{"attachments": []}`, any mix, `{}` (nothing to send), or `{"async": true}` (answer later through `POST /turns/{turnId}/reply`, within `BRIDGE_TURN_TIMEOUT`). A body that is not valid `HandlerResponse`, or an attachment that cannot be read, fails the turn. |
 | Interrupts | When newer messages supersede the turn, the request is **aborted** (the socket closes). A slow handler should watch for the close and stop working; the replacement turn arrives as a new request with `supersedes` set. |
 | While the call runs | The turn's `state` is `responding`; `POST /turns/{turnId}/reply` answers `409 TurnNotAwaitingReply` until the handler returns `{"async": true}`. |
 
@@ -564,12 +638,12 @@ The client commands (`health`, `send`, `react`, `unreact`, `media`, `turns`, `re
 | `run` | | The daemon: WhatsApp connection, turn engine, HTTP API. Long-lived; Ctrl-C stops it after in-flight replies finish. | Logs |
 | `harness` | `--slow <duration>` (0), `--once` | `run` with the `pong` responder. `--once` exits after the first completed turn. | Logs |
 | `health` | | `GET /status` | The `BridgeStatus`; **exit code 0 only when `state` is `ok`**, 1 otherwise. Unreachable daemon: `{"state":"stopped","detail":"daemon not reachable at ..."}` and exit 1. |
-| `send` | `--to <jid or phone>`, `--text <text>` | `POST /chats/{chatId}/messages`. A phone number in any format is converted to a jid. | `{"chatId","messageId"}` |
+| `send` | `--to <jid or phone>`, then `--text <text>` or `--file <path>` (with `--caption`, `--as <image\|video\|audio\|document>`) | `POST /chats/{chatId}/messages` or `POST /chats/{chatId}/media`. A phone number in any format is converted to a jid. | `{"chatId","messageId"}` |
 | `react` | `--chat <jid or phone>`, `--message <id>`, `--emoji <emoji>` (👀) | `POST .../reactions` | `{"ok":true}` |
 | `unreact` | `--chat`, `--message` | `DELETE .../reactions` | `{"ok":true}` |
 | `media` | `--chat`, `--message` | `GET .../media`: downloads if needed. | The `MediaFile` |
 | `turns` | | `GET /turns` | The open `TurnSummary[]` |
-| `reply` | `--turn <turnId>`, `--text <text>` | `POST /turns/{turnId}/reply` | `{"turnId","sentMessageIds"}` |
+| `reply` | `--turn <turnId>`, `--text <text>` and/or `--file <path>` (`--caption`, `--as`) | `POST /turns/{turnId}/reply`; the file goes after the text. | `{"turnId","sentMessageIds"}` |
 | `unlink` | `--yes` (required) | Deletes the saved session so the next `link` starts clean. Without `--yes` it refuses. | `Removed <dir>.` |
 
 Durations on the CLI use the same format as the configuration: `"15 seconds"`, `"10 minutes"`.
@@ -587,6 +661,8 @@ Durations on the CLI use the same format as the configuration: `"15 seconds"`, `
 **Handle an image.** On `TurnOpened`, a message with `kind: "image"` (or `sticker`) usually carries `media.path`: open the file, or read it as bytes. If `media` is missing (download slower than 8 seconds, or automatic downloads disabled), call `GET /chats/{chatId}/messages/{messageId}/media` and use the returned `path`. On `404 MediaUnavailable` or `502 MediaDownloadFailed`, say in the reply that the attachment could not be read.
 
 **Handle a voice note or a document.** `kind: "audio"` (`audio/ogg; codecs=opus`) or `document`. Call `GET .../media`, then transcribe or read the file at `path`. `413 MediaTooLarge` means the file is over the configured limit; tell the user.
+
+**Send an image or a file.** Write it to disk on the bridge machine, then either answer the turn with it (`POST /turns/{turnId}/reply {"text": "...", "attachments": [{"path": "/tmp/q3.png", "caption": "..."}]}`) or send it on its own (`POST /chats/{chatId}/media {"path": "/tmp/q3.png"}`). Use `"kind": "document"` for a PDF, a spreadsheet, or a picture that must arrive uncompressed. From another machine, send `{"data": "<base64>", "mimetype": "image/png"}` instead. On `404 OutboundFileUnreadable` check the path is absolute and readable by the daemon's user; on `413 OutboundTooLarge` shrink the file.
 
 **Say something unprompted.** `POST /chats/{chatId}/messages {"text"}` with the `chatId` of an earlier message. `503 NotConnected` with `state: "connecting"`: wait a minute and retry. With `state: "needs_relink"`: a human must run `npm run link` on the bridge machine; tell them through another channel.
 
@@ -624,7 +700,7 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 | `WA_BROWSER_NAME` | `Intro Bridge` | Name in the phone's Linked devices list |
 | `BRIDGE_MEDIA_DIR` | `<data dir>/media` | Where attachments are stored |
 | `BRIDGE_MEDIA_AUTO` | `images` | `images`, `all` or `none`: what is downloaded before a turn opens |
-| `BRIDGE_MEDIA_MAX_BYTES` | `26214400` | Refuse larger attachments |
+| `BRIDGE_MEDIA_MAX_BYTES` | `26214400` | Refuse larger attachments, inbound and outbound |
 | `BRIDGE_MEDIA_WAIT` | `8 seconds` | How long a turn waits for an automatic download |
 | `BRIDGE_MEDIA_RETENTION` | `7 days` | Downloaded files older than this are deleted |
 | `BRIDGE_MEDIA_SWEEP_EVERY` | `1 hour` | How often the retention sweep runs |
@@ -675,6 +751,8 @@ The bridge is built so that every failure is either recovered automatically or r
 | Sending the reply fails | Retried 5 times with backoff (about 30 s, enough for a reconnect); then `TurnFailed`. The message id is fixed before the first attempt, so a send that timed out but went through is never delivered twice. |
 | A reply is very long or empty | Text over 4000 characters is split at paragraph, line or sentence boundaries into several messages; blank replies are dropped. |
 | An attachment fails to download | The turn still opens (without `media`) after `BRIDGE_MEDIA_WAIT`; the failure is logged; the on-demand endpoint retries (failures are never cached). |
+| A file Intro wants to send is missing, unreadable or too big | Refused with `OutboundFileUnreadable` / `OutboundTooLarge` before anything is sent; on a reply the turn stays `awaiting`; in `http` mode the turn fails with the reason. |
+| Uploading a file to WhatsApp stalls | The send is capped at 3 minutes and answers `SendFailed`; a turn reply is retried like a text. |
 | The 👀 reaction fails | Warning logged; `BRIDGE_SEEN_FALLBACK_TEXT` sends a text instead. |
 | Intro's SSE client stalls | Its buffer slides (oldest dropped) instead of growing; reconnect with `?since=` to catch up. |
 | A request is malformed | `400 InvalidRequest` naming the field, `404 RouteNotFound`, `415` for a non-JSON body; the daemon is unaffected. |
@@ -686,6 +764,7 @@ The bridge is built so that every failure is either recovered automatically or r
 
 - The session under `data/auth` is the keys to the number. The directory is created with mode 0700 and is git-ignored, as are `.env` files. Never commit or share it.
 - The API binds to loopback by default. If you must expose it, set `BRIDGE_API_TOKEN` and put it behind something that terminates TLS.
+- Sending by `path` reads any file the daemon's user can read and hands it to WhatsApp. That is the point on Intro's own machine; it is one more reason to keep the API on loopback or behind the token, and to run the daemon as a user with nothing to leak.
 - The bridge makes no calls to OpenAI, xAI or any model provider. Its only outbound connections are WhatsApp's servers, the WhatsApp Web version lookup at startup, and `INTRO_HANDLER_URL` if you configure one.
 - `markOnlineOnConnect` is off so the phone keeps receiving notifications.
 
@@ -693,7 +772,7 @@ The bridge is built so that every failure is either recovered automatically or r
 
 ```sh
 npm run typecheck     # tsc, strict
-npm test              # vitest: engine (batching, interrupts, atomic commit, failures, manual replies), API, media, extraction
+npm test              # vitest: engine (batching, interrupts, atomic commit, failures, manual replies), API, media in and out, the http responder, extraction
 npm run check         # both
 npm run build         # dist/ + bin/bridge.js
 ```

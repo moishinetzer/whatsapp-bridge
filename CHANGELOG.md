@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here. Intro pins on a tag.
 
+## v0.3.0 — 2026-09-09
+
+Intro can send images and files.
+
+- `POST /chats/{chatId}/media` sends an image, video, audio clip (or voice note) or document to a chat, from a local `path` or base64 `data`; `kind`, `mimetype` and `fileName` are inferred from the file and can be overridden. `POST /turns/{turnId}/reply` and the `http` responder's `HandlerResponse` take the same objects as `attachments`, sent after the text bubbles; `sentMessageIds` covers them.
+- Files are read and size-checked (`BRIDGE_MEDIA_MAX_BYTES`, now both directions) before anything is sent: `404 OutboundFileUnreadable`, `400 OutboundInvalid`, `413 OutboundTooLarge`, and a reply with a bad attachment leaves the turn `awaiting`. Uploads get a 3 minute cap instead of the 30 second one for texts; a failed upload in a turn reply is retried like a text.
+- CLI: `send --file <path> [--caption] [--as image|video|audio|document]`, `reply --file`.
+- Tests cover the loader, the endpoint, replies with attachments, the ordering of mixed replies in the engine, and (for the first time) the `http` responder through a fake HTTP client.
+
 ## v0.2.0 — 2026-09-09
 
 Attachments reach Intro as local files.

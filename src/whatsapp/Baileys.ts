@@ -1,4 +1,5 @@
 import makeWASocket, {
+  type AnyMessageContent,
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
@@ -26,6 +27,7 @@ import qrcode from "qrcode-terminal"
 import { BridgeConfig } from "../config.ts"
 import { phoneOfJid, type ChatId, type MessageId } from "../domain/ids.ts"
 import type { InboundMessage } from "../domain/message.ts"
+import type { OutboundMedia } from "../domain/outbound.ts"
 import type { LinkedIdentity } from "../domain/status.ts"
 import { Events } from "../engine/Events.ts"
 import { Health } from "../engine/Health.ts"
@@ -120,6 +122,11 @@ export const classifyClose = (error: unknown, uptime: Duration.Duration): CloseO
 }
 
 /** Exponential backoff with jitter, capped at a minute, forever. A healthy run resets it. */
+/** One text, reaction or presence call. */
+const SEND_TIMEOUT = Duration.seconds(30)
+/** A file has to be encrypted and uploaded first; large documents take a while. */
+const MEDIA_SEND_TIMEOUT = Duration.minutes(3)
+
 const reconnectSchedule: Schedule.Schedule<Duration.Duration, ReconnectNeeded> = Schedule.exponential("1 second", 2).pipe(
   Schedule.jittered,
   Schedule.modifyDelay(({ duration }) => Effect.succeed(Duration.min(duration, Duration.seconds(60)))),
@@ -503,7 +510,7 @@ export const BaileysLive = (options: BaileysOptions) =>
 
       yield* superviseForever.pipe(Effect.forkScoped)
 
-      const withSocket = <A>(operation: string, chatId: ChatId, f: (sock: WASocket) => Promise<A>) =>
+      const withSocket = <A>(operation: string, chatId: ChatId, f: (sock: WASocket) => Promise<A>, timeout: Duration.Duration = SEND_TIMEOUT) =>
         Effect.gen(function* () {
           const current = yield* Ref.get(socket)
           if (Option.isNone(current)) {
@@ -511,8 +518,8 @@ export const BaileysLive = (options: BaileysOptions) =>
             return yield* new NotConnected({ state: status.state, ...(status.detail === undefined ? {} : { detail: status.detail }) })
           }
           return yield* Effect.tryPromise({ try: () => f(current.value), catch: sendFailed(operation, chatId) }).pipe(
-            Effect.timeout("30 seconds"),
-            Effect.catchTag("TimeoutError", () => new SendFailed({ operation, chatId, detail: "timed out after 30 seconds" })),
+            Effect.timeout(timeout),
+            Effect.catchTag("TimeoutError", () => new SendFailed({ operation, chatId, detail: `timed out after ${Duration.format(timeout)}` })),
           )
         })
 
@@ -535,6 +542,43 @@ export const BaileysLive = (options: BaileysOptions) =>
         yield* health.touch("outbound")
         yield* Effect.logInfo("sent text").pipe(Effect.annotateLogs({ chatId, messageId: id }))
         if (config.logBodies) yield* Effect.logDebug("outbound body").pipe(Effect.annotateLogs({ chatId, text }))
+        return id as MessageId
+      })
+
+      /** The library needs a Buffer; it uploads, encrypts and (for images and videos) makes the thumbnail itself. */
+      const mediaContent = (media: OutboundMedia): AnyMessageContent => {
+        const buffer = Buffer.from(media.bytes)
+        const caption = media.caption === undefined ? {} : { caption: media.caption }
+        switch (media.kind) {
+          case "image":
+            return { image: buffer, mimetype: media.mimetype, ...caption }
+          case "video":
+            return { video: buffer, mimetype: media.mimetype, ...caption }
+          case "audio":
+            return { audio: buffer, mimetype: media.mimetype, ptt: media.voiceNote === true }
+          case "document":
+            return { document: buffer, mimetype: media.mimetype, fileName: media.fileName ?? "file", ...caption }
+        }
+      }
+
+      const sendMedia = Effect.fn("WhatsApp.sendMedia")(function* (chatId: ChatId, media: OutboundMedia, options?: SendOptions) {
+        const sent = yield* withSocket(
+          `send${media.kind[0]?.toUpperCase()}${media.kind.slice(1)}`,
+          chatId,
+          (s) =>
+            s.sendMessage(chatId, mediaContent(media), {
+              mediaUploadTimeoutMs: Duration.toMillis(MEDIA_SEND_TIMEOUT),
+              ...(options?.messageId === undefined ? {} : { messageId: options.messageId }),
+            }),
+          MEDIA_SEND_TIMEOUT,
+        )
+        const id = sent?.key?.id
+        if (!id) return yield* new SendFailed({ operation: `send ${media.kind}`, chatId, detail: "WhatsApp returned no message id" })
+        if (sent.message) yield* Cache.set(outbox, id, sent.message)
+        yield* health.touch("outbound")
+        yield* Effect.logInfo("sent media").pipe(
+          Effect.annotateLogs({ chatId, messageId: id, kind: media.kind, mimetype: media.mimetype, bytes: media.bytes.byteLength }),
+        )
         return id as MessageId
       })
 
@@ -601,6 +645,7 @@ export const BaileysLive = (options: BaileysOptions) =>
         linked: Deferred.await(linked),
         newOutboundId,
         sendText,
+        sendMedia,
         react,
         unreact,
         setTyping,

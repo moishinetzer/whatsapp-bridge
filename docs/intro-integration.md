@@ -29,6 +29,8 @@ Moishi may be talking to Intro in the app and on WhatsApp at the same time. Ever
 
 Photos and stickers arrive with `media.path` on the `TurnOpened` message: a local file Intro can open (read it as bytes, or pass the path to a vision-capable model). Videos, voice notes and documents are fetched on demand with `GET /chats/{chatId}/messages/{messageId}/media`, which also covers an image whose download was still running when the turn opened. Files are deleted after seven days by default (`BRIDGE_MEDIA_RETENTION`); copy anything worth keeping. When a download fails, say so in the reply rather than pretending the attachment was seen.
 
+Sending works the same way in reverse. Write the file on the bridge machine and hand over its path: as part of the turn's answer (`POST /turns/{turnId}/reply` with `"attachments": [{"path": "/tmp/q3.png", "caption": "..."}]`, sent after the text) or on its own (`POST /chats/{chatId}/media`). Images and videos arrive as previews with the caption under them; a PDF, a spreadsheet, or a picture that must stay uncompressed goes as `"kind": "document"`. The bridge refuses a missing path or a file over the limit before sending anything, so a 4xx there means nothing reached the user.
+
 ## Being alive
 
 Moishi's signal that Intro saw a message is the 👀; the bridge applies it, Intro does not need to. Intro's signal that the *line* is alive is `GET /health` (`ok` versus `needs_relink`). When it reports `needs_relink`, Intro cannot fix that from code: it tells Moishi (through whatever other channel it has) to run `npm run link` on the bridge machine.

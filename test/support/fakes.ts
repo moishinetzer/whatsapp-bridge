@@ -8,6 +8,8 @@ import { ChatId, MessageId } from "../../src/domain/ids.ts"
 import { InboundMessage, type MessageKind } from "../../src/domain/message.ts"
 import { EventsLive } from "../../src/engine/Events.ts"
 import { MediaStoreLive } from "../../src/engine/Media.ts"
+import { OutboundLive } from "../../src/engine/Outbound.ts"
+import type { OutboundMedia } from "../../src/domain/outbound.ts"
 import { HealthLive } from "../../src/engine/Health.ts"
 import { HandlerFailed, Responder, type ResponderReply, type TurnPayload } from "../../src/engine/Responder.ts"
 import { TurnEngineLive, TurnRegistryLive } from "../../src/engine/Turns.ts"
@@ -64,6 +66,12 @@ export interface Outbound {
   readonly messageId: MessageId
 }
 
+export interface OutboundFile {
+  readonly chatId: ChatId
+  readonly media: OutboundMedia
+  readonly messageId: MessageId
+}
+
 export interface Reaction {
   readonly chatId: ChatId
   readonly messageId: MessageId
@@ -74,6 +82,10 @@ export interface FakeWhatsAppShape {
   readonly deliver: (message: InboundMessage) => Effect.Effect<void>
   /** Every text the bridge sent, in order. */
   readonly sent: Queue.Queue<Outbound>
+  /** Every file the bridge sent, in order. */
+  readonly sentMedia: Queue.Queue<OutboundFile>
+  /** Texts and files interleaved as they went out (`text` or `media`), for ordering assertions. */
+  readonly order: Queue.Queue<"text" | "media">
   /** Every reaction call; `emoji: ""` is a removal. */
   readonly reactions: Queue.Queue<Reaction>
   /** Announced right before a send waits on `sendGate` (when one is set). */
@@ -97,6 +109,8 @@ export const FakeWhatsAppLive = Layer.effectContext(
   Effect.gen(function* () {
     const inbound = yield* Queue.unbounded<InboundMessage>()
     const sent = yield* Queue.unbounded<Outbound>()
+    const sentMedia = yield* Queue.unbounded<OutboundFile>()
+    const order = yield* Queue.unbounded<"text" | "media">()
     const sending = yield* Queue.unbounded<Outbound>()
     const reactions = yield* Queue.unbounded<Reaction>()
     const typing = yield* Ref.make<ReadonlyArray<{ readonly chatId: ChatId; readonly composing: boolean }>>([])
@@ -134,7 +148,18 @@ export const FakeWhatsAppLive = Layer.effectContext(
           yield* gate.value.await
         }
         yield* Queue.offer(sent, out)
+        yield* Queue.offer(order, "text")
         return out.messageId
+      })
+
+    const sendMedia = (chatId: ChatId, media: OutboundMedia, options?: { readonly messageId?: MessageId | undefined }) =>
+      Effect.gen(function* () {
+        const failing = yield* Ref.modify(failNextSends, (n) => [n > 0, Math.max(0, n - 1)] as const)
+        if (failing) return yield* new SendFailed({ operation: `send ${media.kind}`, chatId, detail: "simulated failure" })
+        const messageId = options?.messageId ?? (yield* newOutboundId)
+        yield* Queue.offer(sentMedia, { chatId, media, messageId })
+        yield* Queue.offer(order, "media")
+        return messageId
       })
 
     const service = WhatsApp.of({
@@ -142,6 +167,7 @@ export const FakeWhatsAppLive = Layer.effectContext(
       linked: Effect.succeed({ jid: "bridge@s.whatsapp.net", name: "Intro" }),
       newOutboundId,
       sendText,
+      sendMedia,
       react: (chatId, messageId, emoji) => Queue.offer(reactions, { chatId, messageId, emoji }).pipe(Effect.asVoid),
       unreact: (chatId, messageId) => Queue.offer(reactions, { chatId, messageId, emoji: "" }).pipe(Effect.asVoid),
       setTyping: (chatId, composing) => Ref.update(typing, (t) => [...t, { chatId, composing }]),
@@ -151,6 +177,8 @@ export const FakeWhatsAppLive = Layer.effectContext(
     const control = FakeWhatsApp.of({
       deliver: (m) => Queue.offer(inbound, m).pipe(Effect.asVoid),
       sent,
+      sentMedia,
+      order,
       sending,
       reactions,
       typing,
@@ -213,8 +241,9 @@ export const EngineTestLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
   const Events = EventsLive.pipe(Layer.provide(Health))
   const Registry = TurnRegistryLive
   const Media = MediaStoreLive.pipe(Layer.provide([Config, FakeWhatsAppLive, NodeServices.layer]))
+  const Outbound = OutboundLive.pipe(Layer.provide([Config, NodeServices.layer]))
   const Engine = TurnEngineLive.pipe(Layer.provide([Config, FakeWhatsAppLive, Events, Registry, TestResponderLive, Media]))
-  return Layer.mergeAll(Config, Health, Events, FakeWhatsAppLive, Registry, TestResponderLive, Media, Engine)
+  return Layer.mergeAll(Config, Health, Events, FakeWhatsAppLive, Registry, TestResponderLive, Media, Outbound, Engine)
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +274,13 @@ export const message = (
     ...(options.mimetype === undefined ? {} : { mimetype: options.mimetype }),
   })
 }
+
+/** A small PNG-ish payload to send outbound; the fake transport never inspects it. */
+export const png = (bytes = 32): OutboundMedia => ({
+  kind: "image",
+  bytes: new Uint8Array(bytes).map((_, i) => (i * 7) % 256),
+  mimetype: "image/png",
+})
 
 export const jpeg = (bytes = 64): DownloadedMedia => ({
   bytes: new Uint8Array(bytes).map((_, i) => i % 256),

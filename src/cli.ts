@@ -5,6 +5,7 @@ import { HttpClientError } from "effect/unstable/http"
 import { AmbientLive, EnvLive, coreLayer, daemonLayer, linkLayer } from "./app.ts"
 import { bridgeUrl } from "./config.ts"
 import { MessageId, TurnId, toChatId } from "./domain/ids.ts"
+import { OutboundKind, type OutboundMediaPayload } from "./domain/outbound.ts"
 import { Events } from "./engine/Events.ts"
 import { bridgeClient } from "./http/Client.ts"
 import { VERSION } from "./version.ts"
@@ -21,6 +22,14 @@ class DaemonUnreachable extends Schema.TaggedError<DaemonUnreachable>()("DaemonU
 }
 
 class ConfirmationRequired extends Schema.TaggedError<ConfirmationRequired>()("ConfirmationRequired", {
+  hint: Schema.String,
+}) {
+  override get message() {
+    return this.hint
+  }
+}
+
+class NothingToSend extends Schema.TaggedError<NothingToSend>()("NothingToSend", {
   hint: Schema.String,
 }) {
   override get message() {
@@ -137,15 +146,38 @@ const health = Command.make("health", {}, () =>
   ),
 ).pipe(Command.withDescription("Print the daemon's status as JSON; exit code 0 only when the state is ok"))
 
+const fileFlags = {
+  file: Flag.string("file").pipe(Flag.optional, Flag.withDescription("Path of an image, video, audio or document to send")),
+  caption: Flag.string("caption").pipe(Flag.optional, Flag.withDescription("Caption under the file (image, video, document)")),
+  as: Flag.choice("as", OutboundKind.literals).pipe(
+    Flag.optional,
+    Flag.withDescription("Force how WhatsApp shows the file (default: from the file type)"),
+  ),
+}
+
+const attachment = (file: string, caption: Option.Option<string>, as: Option.Option<OutboundKind>): OutboundMediaPayload => ({
+  path: file,
+  ...(Option.isSome(caption) ? { caption: caption.value } : {}),
+  ...(Option.isSome(as) ? { kind: as.value } : {}),
+})
+
 const send = Command.make(
   "send",
   {
     to: Flag.string("to").pipe(Flag.withDescription("Chat jid or phone number with country code")),
-    text: Flag.string("text"),
+    text: Flag.string("text").pipe(Flag.optional, Flag.withDescription("The message; with --file, use --caption instead")),
+    ...fileFlags,
   },
-  ({ to, text }) =>
-    withClient((client) => client.chats.send({ params: { chatId: toChatId(to) }, payload: { text } })).pipe(Effect.flatMap(json)),
-).pipe(Command.withDescription("Send a text message to a chat"))
+  ({ to, text, file, caption, as }) =>
+    Effect.gen(function* () {
+      const chatId = toChatId(to)
+      if (Option.isSome(file)) {
+        return yield* withClient((client) => client.chats.sendMedia({ params: { chatId }, payload: attachment(file.value, caption, as) }))
+      }
+      if (Option.isSome(text)) return yield* withClient((client) => client.chats.send({ params: { chatId }, payload: { text: text.value } }))
+      return yield* new NothingToSend({ hint: "pass --text or --file" })
+    }).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Send a text message or a file to a chat"))
 
 const react = Command.make(
   "react",
@@ -187,10 +219,21 @@ const turns = Command.make("turns", {}, () => withClient((client) => client.turn
 
 const reply = Command.make(
   "reply",
-  { turn: Flag.string("turn"), text: Flag.string("text") },
-  ({ turn, text }) =>
-    withClient((client) => client.turns.reply({ params: { turnId: TurnId.make(turn) }, payload: { text } })).pipe(Effect.flatMap(json)),
-).pipe(Command.withDescription("Answer an open turn (manual responder mode)"))
+  {
+    turn: Flag.string("turn"),
+    text: Flag.string("text").pipe(Flag.optional, Flag.withDescription("The reply text; omit it to answer with just the file")),
+    ...fileFlags,
+  },
+  ({ turn, text, file, caption, as }) =>
+    Effect.gen(function* () {
+      if (Option.isNone(text) && Option.isNone(file)) return yield* new NothingToSend({ hint: "pass --text and/or --file" })
+      const payload = {
+        ...(Option.isSome(text) ? { text: text.value } : {}),
+        ...(Option.isSome(file) ? { attachments: [attachment(file.value, caption, as)] } : {}),
+      }
+      return yield* withClient((client) => client.turns.reply({ params: { turnId: TurnId.make(turn) }, payload }))
+    }).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Answer an open turn (manual responder mode) with text, a file, or both"))
 
 const unlink = Command.make(
   "unlink",

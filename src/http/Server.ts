@@ -8,6 +8,8 @@ import { BridgeConfig } from "../config.ts"
 import { Events } from "../engine/Events.ts"
 import { Health } from "../engine/Health.ts"
 import { MediaStore, MediaStoreError } from "../engine/Media.ts"
+import { Outbound } from "../engine/Outbound.ts"
+import type { Outgoing } from "../domain/outbound.ts"
 import { TurnRegistry } from "../engine/Turns.ts"
 import { WhatsApp } from "../whatsapp/WhatsApp.ts"
 import { EVENT_SCHEMA_VERSION, type BridgeEvent } from "../domain/events.ts"
@@ -65,6 +67,15 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
         return { chatId: params.chatId, messageId }
       }),
     )
+    .handle("sendMedia", ({ params, payload }) =>
+      Effect.gen(function* () {
+        const outbound = yield* Outbound
+        const whatsapp = yield* WhatsApp
+        const media = yield* outbound.load(payload)
+        const messageId = yield* whatsapp.sendMedia(params.chatId, media)
+        return { chatId: params.chatId, messageId }
+      }),
+    )
     .handle("react", ({ params, payload }) => WhatsApp.use((w) => w.react(params.chatId, params.messageId, payload.emoji)))
     .handle("unreact", ({ params }) => WhatsApp.use((w) => w.unreact(params.chatId, params.messageId)))
     .handle("typing", ({ params, payload }) => WhatsApp.use((w) => w.setTyping(params.chatId, payload.composing)))
@@ -87,7 +98,11 @@ export const TurnsGroupLive = HttpApiBuilder.group(BridgeApi, "turns", (handlers
     .handle("reply", ({ params, payload }) =>
       Effect.gen(function* () {
         const registry = yield* TurnRegistry
-        const replies = [...(payload.replies ?? []), ...(payload.text ? [payload.text] : [])]
+        const outbound = yield* Outbound
+        // Files are read and checked before the turn is touched, so a bad path is a 4xx and the turn stays open.
+        yield* registry.get(params.turnId)
+        const files = yield* Effect.forEach(payload.attachments ?? [], outbound.load)
+        const replies: ReadonlyArray<Outgoing> = [...(payload.replies ?? []), ...(payload.text ? [payload.text] : []), ...files]
         const sentMessageIds = yield* registry.reply(params.turnId, replies)
         return { turnId: params.turnId, sentMessageIds }
       }),

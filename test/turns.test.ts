@@ -6,7 +6,7 @@ import { Events } from "../src/engine/Events.ts"
 import { HandlerFailed } from "../src/engine/Responder.ts"
 import { MediaStore } from "../src/engine/Media.ts"
 import { TurnRegistry } from "../src/engine/Turns.ts"
-import { EngineTestLayer, FakeWhatsApp, TestResponder, chat, external, jpeg, message, replies, settle, takeSoon } from "./support/fakes.ts"
+import { EngineTestLayer, FakeWhatsApp, TestResponder, chat, external, jpeg, message, png, replies, settle, takeSoon } from "./support/fakes.ts"
 
 /** Collect the next `n` events without missing any published before we subscribe. */
 const collectEvents = (n: number) =>
@@ -242,6 +242,33 @@ describe("TurnEngine", () => {
       expect(again._tag).toBe("TurnNotAwaitingReply")
       const missing = yield* registry.reply(call.turnId.replace("turn_", "turn_x") as typeof call.turnId, ["?"]).pipe(Effect.flip)
       expect(missing._tag).toBe("TurnNotFound")
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("sends a responder's files after its text, in order, and clears 👀 once", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      const chart = png()
+      yield* Ref.set(responder.behaviour, () => Effect.succeed({ _tag: "Replies", replies: ["here is the chart", chart, "and a note"] } as const))
+
+      const m1 = message("chart please")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+
+      expect((yield* takeSoon(wa.sent)).text).toBe("here is the chart")
+      const file = yield* takeSoon(wa.sentMedia)
+      expect(file.media).toBe(chart)
+      expect(file.chatId).toBe(chat)
+      expect((yield* takeSoon(wa.sent)).text).toBe("and a note")
+      expect((yield* takeSoon(wa.reactions)).emoji).toBe("")
+      yield* settle
+      const turn = yield* registry.get(call.turnId)
+      expect(turn.state).toBe("committed")
+      expect(turn.sentMessageIds?.length).toBe(3)
+      expect(turn.sentMessageIds?.[1]).toBe(file.messageId)
     }).pipe(Effect.provide(EngineTestLayer())),
   )
 

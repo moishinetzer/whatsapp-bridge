@@ -10,6 +10,9 @@ import { TurnId } from "../src/domain/ids.ts"
 import { BridgeApi } from "../src/http/Api.ts"
 import { ApiLive, bearerAuth } from "../src/http/Server.ts"
 import { EngineTestLayer, FakeWhatsApp, TestResponder, chat, external, jpeg, message, settle, takeSoon } from "./support/fakes.ts"
+import { mkdtempSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 const TOKEN = "s3cret"
 
@@ -191,6 +194,70 @@ describe("HTTP API media", () => {
 
       const missing = yield* api.chats.media({ params: { chatId: chat, messageId: message("x").messageId } }).pipe(Effect.flip)
       expect(missing._tag).toBe("MediaUnavailable")
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+})
+
+describe("HTTP API outbound media", () => {
+  it.effect("sends a file from raw bytes or a path, and reports what it could not send", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+
+      const fromBytes = yield* api.chats.sendMedia({
+        params: { chatId: chat },
+        payload: { data: new Uint8Array([1, 2, 3, 4]), mimetype: "image/png", caption: "a chart" },
+      })
+      const sentBytes = yield* takeSoon(wa.sentMedia)
+      expect(sentBytes.messageId).toBe(fromBytes.messageId)
+      expect(sentBytes.media).toMatchObject({ kind: "image", mimetype: "image/png", caption: "a chart" })
+      expect(Array.from(sentBytes.media.bytes)).toEqual([1, 2, 3, 4])
+
+      const dir = mkdtempSync(join(tmpdir(), "bridge-api-"))
+      const file = join(dir, "notes.pdf")
+      writeFileSync(file, new Uint8Array(16))
+      yield* api.chats.sendMedia({ params: { chatId: chat }, payload: { path: file } })
+      const sentFile = yield* takeSoon(wa.sentMedia)
+      expect(sentFile.media).toMatchObject({ kind: "document", mimetype: "application/pdf", fileName: "notes.pdf" })
+
+      const missing = yield* api.chats.sendMedia({ params: { chatId: chat }, payload: { path: join(dir, "gone.png") } }).pipe(Effect.flip)
+      expect(missing._tag).toBe("OutboundFileUnreadable")
+      const noType = yield* api.chats.sendMedia({ params: { chatId: chat }, payload: { data: new Uint8Array([1]) } }).pipe(Effect.flip)
+      expect(noType._tag).toBe("OutboundInvalid")
+      yield* Ref.set(wa.failNextSends, 1)
+      const failed = yield* api.chats.sendMedia({ params: { chatId: chat }, payload: { data: new Uint8Array([1]), mimetype: "image/png" } }).pipe(Effect.flip)
+      expect(failed._tag).toBe("SendFailed")
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+
+  it.effect("a reply can carry attachments, sent after the text and before 👀 clears", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+
+      yield* wa.deliver(message("send me the chart"))
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+
+      const bad = yield* api.turns
+        .reply({ params: { turnId: call.turnId }, payload: { text: "here", attachments: [{ path: "/nowhere/chart.png" }] } })
+        .pipe(Effect.flip)
+      expect(bad._tag).toBe("OutboundFileUnreadable")
+      expect((yield* api.turns.get({ params: { turnId: call.turnId } })).state).toBe("awaiting")
+
+      const result = yield* api.turns.reply({
+        params: { turnId: call.turnId },
+        payload: { text: "here you go", attachments: [{ data: new Uint8Array([9, 9]), mimetype: "image/jpeg", caption: "Q3" }] },
+      })
+      expect(result.sentMessageIds.length).toBe(2)
+      expect((yield* takeSoon(wa.sent)).text).toBe("here you go")
+      const file = yield* takeSoon(wa.sentMedia)
+      expect(file.media).toMatchObject({ kind: "image", mimetype: "image/jpeg", caption: "Q3" })
+      expect(file.messageId).toBe(result.sentMessageIds[1])
+      expect((yield* takeSoon(wa.reactions)).emoji).toBe("")
     }).pipe(Effect.provide(ServerTestLayer)),
   )
 })

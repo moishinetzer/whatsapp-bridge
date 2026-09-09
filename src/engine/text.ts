@@ -1,3 +1,5 @@
+import { isMedia, type Outgoing } from "../domain/outbound.ts"
+
 /** WhatsApp accepts far more, but long walls of text read badly on a phone and some clients choke past this. */
 export const MAX_MESSAGE_CHARS = 4_000
 
@@ -32,3 +34,7 @@ export const splitText = (text: string, limit: number = MAX_MESSAGE_CHARS): Read
 /** Drops empty replies and splits long ones, in order. */
 export const prepareReplies = (replies: ReadonlyArray<string>, limit: number = MAX_MESSAGE_CHARS): ReadonlyArray<string> =>
   replies.flatMap((r) => splitText(r, limit))
+
+/** The same for a mixed reply: text bubbles are cleaned and split, files pass through in place. */
+export const prepareOutgoing = (items: ReadonlyArray<Outgoing>, limit: number = MAX_MESSAGE_CHARS): ReadonlyArray<Outgoing> =>
+  items.flatMap((item): ReadonlyArray<Outgoing> => (isMedia(item) ? [item] : splitText(item, limit)))

@@ -1,6 +1,7 @@
 import { Context, Effect, Schema, Stream } from "effect"
 import { ChatId, MessageId } from "../domain/ids.ts"
 import type { InboundMessage, MessageKind } from "../domain/message.ts"
+import type { OutboundMedia } from "../domain/outbound.ts"
 import { BridgeState, LinkedIdentity } from "../domain/status.ts"
 
 /** No live socket. Retry later; `state` says whether waiting will help. */
@@ -84,6 +85,8 @@ export interface WhatsAppShape {
   /** A fresh outbound message id in WhatsApp's format. */
   readonly newOutboundId: Effect.Effect<MessageId>
   readonly sendText: (chatId: ChatId, text: string, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError>
+  /** Send a file (image, video, audio or document) with the bytes already in memory; see `Outbound.load`. */
+  readonly sendMedia: (chatId: ChatId, media: OutboundMedia, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError>
   readonly react: (chatId: ChatId, messageId: MessageId, emoji: string) => Effect.Effect<void, WhatsAppError>
   readonly unreact: (chatId: ChatId, messageId: MessageId) => Effect.Effect<void, WhatsAppError>
   readonly setTyping: (chatId: ChatId, composing: boolean) => Effect.Effect<void, WhatsAppError>

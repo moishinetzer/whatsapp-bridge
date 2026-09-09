@@ -6,6 +6,8 @@ import { ChatId, MessageId, TurnId } from "../domain/ids.ts"
 import { MediaFile } from "../domain/message.ts"
 import { BridgeStatus } from "../domain/status.ts"
 import { MediaStoreError } from "../engine/Media.ts"
+import { OutboundFileUnreadable, OutboundInvalid, OutboundTooLarge } from "../engine/Outbound.ts"
+import { OutboundMediaPayload } from "../domain/outbound.ts"
 import { TurnFailedError, TurnNotAwaitingReply, TurnNotFound, TurnSummary, TurnSuperseded } from "../engine/Turns.ts"
 import { MediaDownloadFailed, MediaTooLarge, MediaUnavailable, NotConnected, SendFailed } from "../whatsapp/WhatsApp.ts"
 
@@ -23,6 +25,8 @@ export const TypingPayload = Schema.Struct({ composing: Schema.Boolean })
 export const ReplyPayload = Schema.Struct({
   text: Schema.optionalKey(Schema.String),
   replies: Schema.optionalKey(Schema.Array(Schema.String)),
+  /** Files to send after the text bubbles, in order. */
+  attachments: Schema.optionalKey(Schema.Array(OutboundMediaPayload)),
 })
 export const ReplyResult = Schema.Struct({ turnId: TurnId, sentMessageIds: Schema.Array(MessageId) })
 
@@ -54,6 +58,12 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
     payload: SendTextPayload,
     success: SentMessage,
     error: [NotConnected, SendFailed],
+  }),
+  HttpApiEndpoint.post("sendMedia", "/chats/:chatId/media", {
+    params: chatParams,
+    payload: OutboundMediaPayload,
+    success: SentMessage,
+    error: [NotConnected, SendFailed, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge],
   }),
   HttpApiEndpoint.post("react", "/chats/:chatId/messages/:messageId/reactions", {
     params: messageParams,
@@ -88,7 +98,7 @@ export const TurnsGroup = HttpApiGroup.make("turns").add(
     params: turnParams,
     payload: ReplyPayload,
     success: ReplyResult,
-    error: [TurnNotFound, TurnSuperseded, TurnNotAwaitingReply, TurnFailedError],
+    error: [TurnNotFound, TurnSuperseded, TurnNotAwaitingReply, TurnFailedError, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge],
   }),
 )
 

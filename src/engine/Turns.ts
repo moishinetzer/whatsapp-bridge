@@ -20,11 +20,12 @@ import {
 import { BridgeConfig } from "../config.ts"
 import { ChatId, MessageId, TurnId, newTurnId } from "../domain/ids.ts"
 import { InboundMessage, type MediaFile } from "../domain/message.ts"
+import { isMedia, type Outgoing } from "../domain/outbound.ts"
 import { WhatsApp, type WhatsAppError } from "../whatsapp/WhatsApp.ts"
 import { Events } from "./Events.ts"
 import { MediaStore, type MediaError } from "./Media.ts"
 import { Responder, type TurnPayload } from "./Responder.ts"
-import { prepareReplies } from "./text.ts"
+import { prepareOutgoing } from "./text.ts"
 
 // ---------------------------------------------------------------------------
 // Turn model
@@ -136,7 +137,7 @@ const byRef = <T extends object>(value: T): T => Equal.byReferenceUnsafe(value)
 interface TurnRecord {
   readonly summary: TurnSummary
   /** Present while an external reply is awaited (manual mode / `async` handlers). */
-  readonly awaiting: Option.Option<Deferred.Deferred<ReadonlyArray<string>>>
+  readonly awaiting: Option.Option<Deferred.Deferred<ReadonlyArray<Outgoing>>>
   /** Resolves when the reply is on the wire, so `reply` callers learn the outcome. */
   readonly done: Deferred.Deferred<ReadonlyArray<MessageId>, TurnFailedError>
   /** Bumped on every write; see `ChatState.generation` for why structural equality bites here. */
@@ -153,13 +154,13 @@ export interface TurnRegistryShape {
    * with the ids of the sent messages. 409 when the turn was superseded (the
    * error names the current turn) or is not waiting for an external reply.
    */
-  readonly reply: (turnId: TurnId, replies: ReadonlyArray<string>) => Effect.Effect<ReadonlyArray<MessageId>, ReplyError>
+  readonly reply: (turnId: TurnId, replies: ReadonlyArray<Outgoing>) => Effect.Effect<ReadonlyArray<MessageId>, ReplyError>
 
   // Engine side.
   readonly open: (summary: TurnSummary) => Effect.Effect<void>
   readonly setState: (turnId: TurnId, state: TurnState) => Effect.Effect<void>
   /** Marks the turn `awaiting` and waits for `reply`. Interruptible. */
-  readonly await: (turnId: TurnId) => Effect.Effect<ReadonlyArray<string>>
+  readonly await: (turnId: TurnId) => Effect.Effect<ReadonlyArray<Outgoing>>
   readonly complete: (turnId: TurnId, sent: ReadonlyArray<MessageId>) => Effect.Effect<void>
   readonly supersede: (turnId: TurnId, by: TurnId) => Effect.Effect<void>
   readonly fail: (turnId: TurnId, reason: string) => Effect.Effect<void>
@@ -222,7 +223,7 @@ export const TurnRegistryLive = Layer.effect(
     const setState = (turnId: TurnId, state: TurnState) => patch(turnId, { state })
 
     const awaitReply = Effect.fn("TurnRegistry.await")(function* (turnId: TurnId) {
-      const deferred = yield* Deferred.make<ReadonlyArray<string>>()
+      const deferred = yield* Deferred.make<ReadonlyArray<Outgoing>>()
       yield* update(turnId, (r) => ({ ...r, awaiting: Option.some(deferred), summary: { ...r.summary, state: "awaiting" } }))
       return yield* Deferred.await(deferred)
     })
@@ -247,7 +248,7 @@ export const TurnRegistryLive = Layer.effect(
       if (Option.isSome(record)) yield* Deferred.fail(record.value.done, new TurnFailedError({ turnId, reason }))
     })
 
-    const reply = Effect.fn("TurnRegistry.reply")(function* (turnId: TurnId, replies: ReadonlyArray<string>) {
+    const reply = Effect.fn("TurnRegistry.reply")(function* (turnId: TurnId, replies: ReadonlyArray<Outgoing>) {
       const record = yield* getRecord(turnId)
       const { summary } = record
       if (summary.state === "superseded" && summary.supersededBy !== undefined) {
@@ -516,11 +517,14 @@ export const TurnEngineLive = Layer.effectDiscard(
                   )
             // From here on nothing interrupts us: the reply goes out and the 👀 come off.
             yield* Ref.set(phase, "committed")
-            const sent = yield* Effect.forEach(prepareReplies(replies), (text) =>
+            const sent = yield* Effect.forEach(prepareOutgoing(replies), (item) =>
               Effect.gen(function* () {
-                // One id per chunk, fixed before the retries, so a timed-out send that went through is not sent twice.
+                // One id per item, fixed before the retries, so a timed-out send that went through is not sent twice.
                 const messageId = yield* whatsapp.newOutboundId
-                return yield* whatsapp.sendText(turn.chatId, text, { messageId }).pipe(retrySend)
+                return yield* (isMedia(item)
+                  ? whatsapp.sendMedia(turn.chatId, item, { messageId })
+                  : whatsapp.sendText(turn.chatId, item, { messageId })
+                ).pipe(retrySend)
               }),
             )
             yield* clearSeen(turn.chatId, pending)

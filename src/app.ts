@@ -5,6 +5,7 @@ import { BridgeConfig, BridgeConfigLive, DotEnvLive, type BridgeConfigShape } fr
 import { EventsLive } from "./engine/Events.ts"
 import { HealthLive } from "./engine/Health.ts"
 import { MediaStoreLive } from "./engine/Media.ts"
+import { OutboundLive } from "./engine/Outbound.ts"
 import { ResponderLive } from "./engine/Responder.ts"
 import { TurnEngineLive, TurnRegistryLive } from "./engine/Turns.ts"
 import { HttpServerLive } from "./http/Server.ts"
@@ -97,11 +98,12 @@ export const daemonLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
   const Core = coreLayer({ mode: "serve" }, overrides)
   const Registry = TurnRegistryLive
   const Media = MediaStoreLive.pipe(Layer.provide([Core, NodeServices.layer]))
-  const Responder = ResponderLive.pipe(Layer.provide([Core, FetchHttpClient.layer]))
+  const Outbound = OutboundLive.pipe(Layer.provide([Core, NodeServices.layer]))
+  const Responder = ResponderLive.pipe(Layer.provide([Core, Outbound, FetchHttpClient.layer]))
   const Engine = TurnEngineLive.pipe(Layer.provide([Core, Registry, Responder, Media]))
-  const Server = HttpServerLive.pipe(Layer.provide([Core, Registry, Media]))
+  const Server = HttpServerLive.pipe(Layer.provide([Core, Registry, Media, Outbound]))
   const Startup = StartupLogLive.pipe(Layer.provide(Core))
-  return Layer.mergeAll(Core, Registry, Media, Responder, Engine, Server, Startup, ProcessGuardsLive).pipe(Layer.provideMerge(AmbientLive))
+  return Layer.mergeAll(Core, Registry, Media, Outbound, Responder, Engine, Server, Startup, ProcessGuardsLive).pipe(Layer.provideMerge(AmbientLive))
 }
 
 /** `bridge link`: the transport in link mode, nothing else. */

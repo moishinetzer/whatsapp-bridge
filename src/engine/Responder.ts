@@ -3,6 +3,8 @@ import { HttpClient, HttpClientRequest, HttpClientResponse, HttpIncomingMessage 
 import { BridgeConfig } from "../config.ts"
 import { ChatId, TurnId } from "../domain/ids.ts"
 import { InboundMessage } from "../domain/message.ts"
+import { OutboundMediaPayload, type Outgoing } from "../domain/outbound.ts"
+import { Outbound } from "./Outbound.ts"
 import type { ResponderKind } from "../domain/status.ts"
 
 /**
@@ -22,18 +24,20 @@ export type TurnPayload = typeof TurnPayload.Type
 
 /**
  * What an HTTP handler may answer. `text` and `replies` are both accepted;
- * `async: true` means "I will answer through POST /turns/{id}/reply".
- * An empty answer completes the turn without sending anything.
+ * `attachments` are files sent after the text; `async: true` means "I will
+ * answer through POST /turns/{id}/reply". An empty answer completes the turn
+ * without sending anything.
  */
 export const HandlerResponse = Schema.Struct({
   text: Schema.optionalKey(Schema.NullOr(Schema.String)),
   replies: Schema.optionalKey(Schema.Array(Schema.String)),
+  attachments: Schema.optionalKey(Schema.Array(OutboundMediaPayload)),
   async: Schema.optionalKey(Schema.Boolean),
 })
 export type HandlerResponse = typeof HandlerResponse.Type
 
 export type ResponderReply =
-  | { readonly _tag: "Replies"; readonly replies: ReadonlyArray<string> }
+  | { readonly _tag: "Replies"; readonly replies: ReadonlyArray<Outgoing> }
   /** The reply will arrive later via the registry (`POST /turns/{id}/reply`). */
   | { readonly _tag: "External" }
 
@@ -89,6 +93,7 @@ export const HttpResponderLive = Layer.effect(
   Responder,
   Effect.gen(function* () {
     const config = yield* BridgeConfig
+    const outbound = yield* Outbound
     const url = yield* Option.match(config.handlerUrl, {
       onNone: () => Config.string("INTRO_HANDLER_URL"),
       onSome: Effect.succeed,
@@ -104,7 +109,8 @@ export const HttpResponderLive = Layer.effect(
         const ok = yield* HttpClientResponse.filterStatusOk(response)
         const body = yield* HttpIncomingMessage.schemaBodyJson(HandlerResponse)(ok)
         if (body.async === true) return { _tag: "External" } as const
-        const replies = [...(body.replies ?? []), ...(body.text ? [body.text] : [])]
+        const files = yield* Effect.forEach(body.attachments ?? [], outbound.load)
+        const replies: ReadonlyArray<Outgoing> = [...(body.replies ?? []), ...(body.text ? [body.text] : []), ...files]
         return { _tag: "Replies", replies } as const
       },
       (effect, turn) =>
