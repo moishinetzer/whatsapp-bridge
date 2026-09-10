@@ -37,6 +37,8 @@ export const BridgeEvent = Schema.TaggedUnion({
     messages: Schema.Array(InboundMessage),
     /** Set when this turn replaces one that was interrupted by newer messages. */
     supersedes: Schema.optionalKey(TurnId),
+    /** Groups: the last messages in the chat before this turn, oldest first, so the agent sees what was being discussed. */
+    context: Schema.optionalKey(Schema.Array(InboundMessage)),
   },
   /** Newer messages arrived mid-turn. Stop working on `turnId`; `by` carries everything. */
   TurnSuperseded: { ...envelope, turnId: TurnId, chatId: ChatId, by: TurnId },
@@ -70,6 +72,15 @@ export const BridgeEvent = Schema.TaggedUnion({
   ScheduledSkipped: { ...envelope, scheduledId: Schema.String, chatId: ChatId, reason: Schema.String },
   /** A scheduled send failed at the transport; the item is kept as `failed` with the reason. */
   ScheduledFailed: { ...envelope, scheduledId: Schema.String, chatId: ChatId, reason: Schema.String },
+  /** Someone voted on a poll the bridge sent. `selected` is the full current selection of that voter. */
+  PollVote: { ...envelope, chatId: ChatId, pollMessageId: MessageId, voterId: Schema.String, selected: Schema.Array(Schema.String) },
+  /** Presence changed in a chat the agent asked about through `GET /chats/{id}/presence`. */
+  PresenceChanged: {
+    ...envelope,
+    chatId: ChatId,
+    state: Schema.Literals(["available", "unavailable", "composing", "recording", "paused", "unknown"]),
+    lastSeenAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
+  },
   /** Connection state changed; mirrors `GET /health`. */
   ConnectionChanged: { ...envelope, state: BridgeState, detail: Schema.optionalKey(Schema.String) },
 })

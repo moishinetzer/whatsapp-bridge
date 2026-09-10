@@ -20,7 +20,7 @@ import {
 import { BridgeConfig } from "../config.ts"
 import { ChatId, MessageId, TurnId, newTurnId } from "../domain/ids.ts"
 import { InboundMessage, type MediaFile } from "../domain/message.ts"
-import { isMedia, outgoing, type Outgoing } from "../domain/outbound.ts"
+import { isMedia, outgoing, type OutboundMedia, type Outgoing } from "../domain/outbound.ts"
 import { WhatsApp, type InboundUpdate, type MessageError, type WhatsAppError } from "../whatsapp/WhatsApp.ts"
 import { Events } from "./Events.ts"
 import { MediaStore, type MediaError } from "./Media.ts"
@@ -55,8 +55,13 @@ export const TurnSummary = Schema.Struct({
   openedAt: Schema.DateTimeUtcFromString,
   sentMessageIds: Schema.optionalKey(Schema.Array(MessageId)),
   failure: Schema.optionalKey(Schema.String),
+  /** Groups: what was said in the chat just before this turn, oldest first. */
+  context: Schema.optionalKey(Schema.Array(InboundMessage)),
 })
 export type TurnSummary = typeof TurnSummary.Type
+
+/** How many earlier group messages a turn carries as context. */
+const CONTEXT_SIZE = 10
 
 export const isOpenState = (state: TurnState): boolean =>
   state === "batching" || state === "responding" || state === "awaiting"
@@ -163,6 +168,8 @@ export interface ReplyRequest {
   readonly items: ReadonlyArray<Outgoing>
   /** Edit the last progress bubble into the first text bubble instead of sending a new message. */
   readonly replaceProgress: boolean
+  /** Adjacent images and videos go out as one album. */
+  readonly album: boolean
 }
 
 export interface AbandonRequest {
@@ -211,7 +218,7 @@ export interface TurnRegistryShape {
   readonly reply: (
     turnId: TurnId,
     replies: ReadonlyArray<string | Outgoing>,
-    options?: { readonly replaceProgress?: boolean | undefined },
+    options?: { readonly replaceProgress?: boolean | undefined; readonly album?: boolean | undefined },
   ) => Effect.Effect<ReadonlyArray<MessageId>, ReplyError>
   /** "Still working": extends the deadline (capped), re-arms typing, records the interim bubble. */
   readonly progress: (
@@ -419,7 +426,7 @@ export const TurnRegistryLive = Layer.effect(
     const reply = Effect.fn("TurnRegistry.reply")(function* (
       turnId: TurnId,
       replies: ReadonlyArray<string | Outgoing>,
-      options?: { readonly replaceProgress?: boolean | undefined },
+      options?: { readonly replaceProgress?: boolean | undefined; readonly album?: boolean | undefined },
     ) {
       const record = yield* getRecord(turnId)
       const { summary } = record
@@ -429,7 +436,7 @@ export const TurnRegistryLive = Layer.effect(
       if (summary.state !== "awaiting" || Option.isNone(record.awaiting)) {
         return yield* new TurnNotAwaitingReply({ turnId, state: summary.state })
       }
-      const request: ReplyRequest = { items: outgoing(replies), replaceProgress: options?.replaceProgress === true }
+      const request: ReplyRequest = { items: outgoing(replies), replaceProgress: options?.replaceProgress === true, album: options?.album === true }
       const accepted = yield* Deferred.succeed(record.awaiting.value, request)
       if (!accepted) return yield* new TurnNotAwaitingReply({ turnId, state: summary.state })
       return yield* Deferred.await(record.done).pipe(
@@ -508,6 +515,8 @@ const idleChat = (): ChatState => byRef({ pending: [], worker: "idle", eyed: Opt
 
 /** The typing presence expires after a few seconds; re-send it this often while a turn is open. */
 const TYPING_EVERY = Duration.seconds(8)
+/** A "typing" report older than this no longer holds the batch window open. */
+const TYPING_FRESH = Duration.seconds(6)
 
 const describeFailure = (cause: Cause.Cause<unknown>): string => {
   const error = Cause.findErrorOption(cause)
@@ -555,6 +564,37 @@ export const TurnEngineLive = Layer.effectDiscard(
     const store = yield* Store
     const scope = yield* Effect.scope
     const chats = yield* Ref.make(HashMap.empty<ChatId, ChatState>())
+    // Groups: the last few messages per chat, handled or not, so a turn can say what was being discussed.
+    const rings = yield* Ref.make(HashMap.empty<ChatId, ReadonlyArray<InboundMessage>>())
+    // When each chat was last seen typing, from presence reports; the batch window stretches while they type.
+    const typingSeen = yield* Ref.make(HashMap.empty<ChatId, DateTime.Utc>())
+
+    const remember = (m: InboundMessage) =>
+      m.isGroup
+        ? Ref.update(rings, (map) => {
+            const current = Option.getOrElse(HashMap.get(map, m.chatId), (): ReadonlyArray<InboundMessage> => [])
+            const next = [...current.filter((x) => x.messageId !== m.messageId), m].slice(-CONTEXT_SIZE * 2)
+            return HashMap.set(map, m.chatId, byRef(next))
+          })
+        : Effect.void
+
+    /** The last messages in a group before the turn's own, oldest first. */
+    const contextFor = (chatId: ChatId, turnMessages: ReadonlyArray<InboundMessage>) =>
+      Effect.map(Ref.get(rings), (map) => {
+        const own = new Set(turnMessages.map((m) => m.messageId))
+        return Option.getOrElse(HashMap.get(map, chatId), (): ReadonlyArray<InboundMessage> => [])
+          .filter((m) => !own.has(m.messageId))
+          .slice(-CONTEXT_SIZE)
+      })
+
+    /** True when a presence report said "typing" within the last few seconds. */
+    const recentlyTyping = (chatId: ChatId) =>
+      Effect.gen(function* () {
+        const seen = HashMap.get(yield* Ref.get(typingSeen), chatId)
+        if (Option.isNone(seen)) return false
+        const now = yield* DateTime.now
+        return DateTime.toEpochMillis(now) - DateTime.toEpochMillis(seen.value) <= Duration.toMillis(TYPING_FRESH)
+      })
     // Defence in depth: the transport dedupes too, but one 👀 and one turn per message is this engine's promise.
     const handled = yield* Cache.make<string, true>({ capacity: 20_000, lookup: () => Effect.succeed(true) })
 
@@ -687,6 +727,7 @@ export const TurnEngineLive = Layer.effectDiscard(
       isGroup: turn.isGroup,
       messages: turn.messages,
       ...(turn.supersedes === undefined ? {} : { supersedes: turn.supersedes }),
+      ...(turn.context === undefined ? {} : { context: turn.context }),
     })
 
     /**
@@ -694,14 +735,16 @@ export const TurnEngineLive = Layer.effectDiscard(
      * is about to hit `batchMaxWait`, so a steady trickle of messages can never
      * postpone a reply forever.
      */
-    const batchDelay = (pending: ReadonlyArray<PendingMessage>) =>
+    const batchDelay = (pending: ReadonlyArray<PendingMessage>, typing: boolean) =>
       Effect.map(DateTime.now, (now) => {
         const oldest = pending.reduce(
           (min, p) => Math.min(min, DateTime.toEpochMillis(p.acceptedAt)),
           Number.POSITIVE_INFINITY,
         )
         const waited = Duration.millis(Math.max(0, DateTime.toEpochMillis(now) - oldest))
-        const remaining = Duration.subtract(config.batchMaxWait, waited)
+        // Someone still typing gets the longer cap; a steady trickle without typing does not.
+        const cap = typing ? Duration.max(config.batchMaxWait, config.batchTypingWait) : config.batchMaxWait
+        const remaining = Duration.subtract(cap, waited)
         return Duration.min(config.batchWindow, Duration.isNegative(remaining) ? Duration.zero : remaining)
       })
 
@@ -730,9 +773,16 @@ export const TurnEngineLive = Layer.effectDiscard(
     /** One attempt at answering a turn. Interruptible until the reply is committed. */
     const runTurn = (opened: TurnSummary, pending: ReadonlyArray<PendingMessage>, phase: Ref.Ref<Phase>) =>
       Effect.gen(function* () {
-        const delay = yield* batchDelay(pending)
-        if (!Duration.isZero(delay)) yield* Effect.sleep(delay)
-        const turn: TurnSummary = { ...opened, messages: yield* withMedia(pending) }
+        // The window restarts with each message (a wake restarts the whole turn); typing keeps it open a little longer.
+        while (true) {
+          const delay = yield* batchDelay(pending, yield* recentlyTyping(opened.chatId))
+          if (Duration.isZero(delay)) break
+          yield* Effect.sleep(delay)
+          if (!(yield* recentlyTyping(opened.chatId))) break
+        }
+        const messages = yield* withMedia(pending)
+        const context = opened.isGroup ? yield* contextFor(opened.chatId, messages) : []
+        const turn: TurnSummary = { ...opened, messages, ...(context.length === 0 ? {} : { context }) }
         yield* Ref.set(phase, "responding")
         yield* registry.open(turn)
         yield* registry.setState(turn.turnId, "responding")
@@ -743,6 +793,7 @@ export const TurnEngineLive = Layer.effectDiscard(
           isGroup: turn.isGroup,
           messages: turn.messages,
           ...(turn.supersedes === undefined ? {} : { supersedes: turn.supersedes }),
+          ...(turn.context === undefined ? {} : { context: turn.context }),
         })
         yield* store.setTurn(turn.chatId, turn.messages.map((m) => m.messageId), turn.turnId).pipe(Effect.ignore)
         const typingFiber = yield* keepTyping(turn.turnId, turn.chatId)
@@ -760,11 +811,13 @@ export const TurnEngineLive = Layer.effectDiscard(
               ),
             )
             const reply: ReplyRequest =
-              answer._tag === "Replies" ? { items: answer.replies, replaceProgress: false } : yield* restore(registry.await(turn.turnId))
+              answer._tag === "Replies"
+                ? { items: answer.replies, replaceProgress: false, album: answer.album === true }
+                : yield* restore(registry.await(turn.turnId))
             // From here on nothing interrupts us: the reply goes out and the eye comes off.
             yield* Ref.set(phase, "committed")
             const progressId = yield* registry.progressMessage(turn.turnId)
-            const sent = yield* Effect.forEach(prepareOutgoing(reply.items), (item, index) =>
+            const sendItem = (item: Outgoing, index: number) =>
               Effect.gen(function* () {
                 if (index === 0 && reply.replaceProgress && Option.isSome(progressId) && !isMedia(item)) {
                   yield* whatsapp.editText(turn.chatId, progressId.value, item.text).pipe(retrySend)
@@ -786,8 +839,32 @@ export const TurnEngineLive = Layer.effectDiscard(
                   ),
                   retrySend,
                 )
-              }),
-            )
+              })
+            const sent: Array<MessageId> = []
+            const prepared = prepareOutgoing(reply.items)
+            for (let index = 0; index < prepared.length; index++) {
+              const item = prepared[index]
+              if (item === undefined) continue
+              // With `album`, a run of adjacent images and videos becomes one album.
+              if (reply.album && isMedia(item) && (item.kind === "image" || item.kind === "video")) {
+                const run: Array<OutboundMedia> = []
+                while (index < prepared.length) {
+                  const next = prepared[index]
+                  if (next === undefined || !isMedia(next) || (next.kind !== "image" && next.kind !== "video")) break
+                  run.push(next)
+                  index++
+                }
+                index--
+                if (run.length > 1) {
+                  const ids = yield* whatsapp.sendAlbum(turn.chatId, run, { turnId: turn.turnId }).pipe(retrySend)
+                  sent.push(...ids)
+                  continue
+                }
+                sent.push(yield* sendItem(run[0] ?? item, index))
+                continue
+              }
+              sent.push(yield* sendItem(item, index))
+            }
             yield* releaseSeen(turn.chatId, pending)
             yield* dropPending(turn.chatId, pending)
             yield* registry.complete(turn.turnId, sent)
@@ -955,6 +1032,7 @@ export const TurnEngineLive = Layer.effectDiscard(
         return
       }
       yield* Cache.set(handled, key, true)
+      yield* remember(message)
       const acceptedAt = yield* DateTime.now
       const previous = yield* Ref.modify(chats, (map) => {
         const current = Option.getOrElse(HashMap.get(map, message.chatId), idleChat)
@@ -991,11 +1069,18 @@ export const TurnEngineLive = Layer.effectDiscard(
         return [{ start: current.worker === "idle", wake: current.wake }, HashMap.set(map, message.chatId, next)] as const
       })
       if (start) {
+        // The first message of a chat subscribes to its presence, so typing can hold the batch window.
+        yield* whatsapp.presence(message.chatId).pipe(Effect.ignore, Effect.forkIn(scope))
         yield* runWorker(message.chatId).pipe(Effect.forkIn(scope))
       } else {
         yield* Deferred.succeed(wake, undefined)
       }
     })
+
+    const onPresence = (info: { readonly chatId: ChatId; readonly state: string; readonly at?: DateTime.Utc | undefined }) =>
+      info.state === "composing" || info.state === "recording"
+        ? Effect.flatMap(DateTime.now, (now) => Ref.update(typingSeen, (map) => HashMap.set(map, info.chatId, info.at ?? now)))
+        : Ref.update(typingSeen, (map) => HashMap.remove(map, info.chatId))
 
     /** Edits and deletes of pending messages change the turn; reactions are only reported. */
     const onUpdate = Effect.fn("TurnEngine.onUpdate")(function* (u: InboundUpdate) {
@@ -1069,6 +1154,8 @@ export const TurnEngineLive = Layer.effectDiscard(
       ),
       Effect.forkScoped,
     )
+    yield* whatsapp.observed.pipe(Stream.runForEach(remember), Effect.forkScoped)
+    yield* whatsapp.presenceUpdates.pipe(Stream.runForEach(onPresence), Effect.forkScoped)
     yield* Effect.logInfo("turn engine ready").pipe(
       Effect.annotateLogs({
         responder: responder.kind,

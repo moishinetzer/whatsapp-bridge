@@ -166,6 +166,28 @@ export interface SendOptions {
   readonly quoteMessageId?: MessageId | undefined
   /** The turn this send answers, for the history. */
   readonly turnId?: TurnId | undefined
+  /** Jids to @-mention; the text must contain `@<digits>` for each to render as a mention. */
+  readonly mentions?: ReadonlyArray<string> | undefined
+}
+
+export interface LocationInput {
+  readonly latitude: number
+  readonly longitude: number
+  readonly name?: string | undefined
+  readonly address?: string | undefined
+}
+
+export interface ContactInput {
+  readonly name: string
+  /** Digits with country code. */
+  readonly phone: string
+}
+
+export interface PollInput {
+  readonly question: string
+  readonly options: ReadonlyArray<string>
+  /** Several options may be picked. */
+  readonly multiple: boolean
 }
 
 export interface WhatsAppShape {
@@ -190,6 +212,17 @@ export interface WhatsAppShape {
   readonly groupInfo: (chatId: ChatId) => Effect.Effect<GroupInfo, NotConnected | LookupFailed>
   /** Subscribes to the chat's presence (once) and returns the last known state. */
   readonly presence: (chatId: ChatId) => Effect.Effect<PresenceInfo, NotConnected>
+  /** Like `presence`, and from now on `PresenceChanged` events flow for this chat. */
+  readonly watchPresence: (chatId: ChatId) => Effect.Effect<PresenceInfo, NotConnected>
+  /** Every presence report for subscribed chats, as it arrives. */
+  readonly presenceUpdates: Stream.Stream<PresenceInfo>
+  /** Group messages seen but not handled (nobody mentioned or quoted the bridge). Context for the engine, never a turn. */
+  readonly observed: Stream.Stream<InboundMessage>
+  readonly sendLocation: (chatId: ChatId, location: LocationInput, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError | MessageUnknown>
+  readonly sendContacts: (chatId: ChatId, contacts: ReadonlyArray<ContactInput>, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError | MessageUnknown>
+  readonly sendPoll: (chatId: ChatId, poll: PollInput, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError | MessageUnknown>
+  /** Several images and videos as one album. Returns the media message ids, in order. */
+  readonly sendAlbum: (chatId: ChatId, items: ReadonlyArray<OutboundMedia>, options?: SendOptions) => Effect.Effect<ReadonlyArray<MessageId>, WhatsAppError | MessageUnknown>
   /** Edits, deletes and reactions on messages in handled chats, after the bridge accepted them. */
   readonly updates: Stream.Stream<InboundUpdate>
   readonly react: (chatId: ChatId, messageId: MessageId, emoji: string) => Effect.Effect<void, WhatsAppError>

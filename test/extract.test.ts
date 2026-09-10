@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { DateTime, Option } from "effect"
 import type { WAMessage } from "@whiskeysockets/baileys"
-import { extractInbound } from "../src/whatsapp/extract.ts"
+import { extractInbound, phoneOfVcard } from "../src/whatsapp/extract.ts"
 
 const now = DateTime.makeUnsafe(1_700_000_000_000)
 
@@ -90,5 +90,73 @@ describe("extractInbound", () => {
     expect(Option.isSome(result)).toBe(true)
     if (Option.isNone(result)) return
     expect(DateTime.toEpochMillis(result.value.message.timestamp)).toBe(DateTime.toEpochMillis(now))
+  })
+
+  it("carries who a message mentions", () => {
+    const result = extractInbound(
+      dm({
+        key: { remoteJid: "120363000000000000@g.us", fromMe: false, id: "G2", participant: "447700900999@s.whatsapp.net" },
+        message: { extendedTextMessage: { text: "@bridge can you?", contextInfo: { mentionedJid: ["bridge@s.whatsapp.net"] } } },
+      }),
+      now,
+    )
+    expect(Option.isSome(result)).toBe(true)
+    if (Option.isNone(result)) return
+    expect(result.value.message.mentionedIds).toEqual(["bridge@s.whatsapp.net"])
+  })
+
+  it("decodes a pin and a live location", () => {
+    const pin = extractInbound(
+      dm({ message: { locationMessage: { degreesLatitude: 51.5, degreesLongitude: -0.12, name: "Office", address: "1 Main St", url: "https://maps.example/x" } } }),
+      now,
+    )
+    expect(Option.isSome(pin)).toBe(true)
+    if (Option.isNone(pin)) return
+    expect(pin.value.message.kind).toBe("location")
+    expect(pin.value.message.location).toEqual({ latitude: 51.5, longitude: -0.12, name: "Office", address: "1 Main St", url: "https://maps.example/x" })
+
+    const live = extractInbound(dm({ message: { liveLocationMessage: { degreesLatitude: 1, degreesLongitude: 2 } } }), now)
+    expect(Option.isSome(live)).toBe(true)
+    if (Option.isNone(live)) return
+    expect(live.value.message.location).toEqual({ latitude: 1, longitude: 2, live: true })
+  })
+
+  it("decodes shared contacts from their vCards", () => {
+    const one = extractInbound(
+      dm({ message: { contactMessage: { displayName: "Dana", vcard: "BEGIN:VCARD\nFN:Dana\nTEL;type=CELL;waid=447700900555:+44 7700 900555\nEND:VCARD" } } }),
+      now,
+    )
+    expect(Option.isSome(one)).toBe(true)
+    if (Option.isNone(one)) return
+    expect(one.value.message.kind).toBe("contact")
+    expect(one.value.message.contacts).toMatchObject([{ name: "Dana", phone: "447700900555" }])
+
+    const many = extractInbound(
+      dm({
+        message: {
+          contactsArrayMessage: {
+            contacts: [
+              { vcard: "BEGIN:VCARD\nFN:Ari\nTEL:+1 (555) 010-0001\nEND:VCARD" },
+              { displayName: "No Number", vcard: "BEGIN:VCARD\nFN:No Number\nEND:VCARD" },
+            ],
+          },
+        },
+      }),
+      now,
+    )
+    expect(Option.isSome(many)).toBe(true)
+    if (Option.isNone(many)) return
+    expect(many.value.message.contacts?.map((c) => [c.name, c.phone])).toEqual([
+      ["Ari", "15550100001"],
+      ["No Number", undefined],
+    ])
+  })
+})
+
+describe("phoneOfVcard", () => {
+  it("prefers waid, falls back to TEL digits, and gives up cleanly", () => {
+    expect(phoneOfVcard("TEL;waid=447700900555:+44 7700 900555")).toBe("447700900555")
+    expect(phoneOfVcard("TEL;type=HOME:+44 (0)7700-900555")).toBe("4407700900555")
+    expect(phoneOfVcard("FN:Nobody")).toBeUndefined()
   })
 })

@@ -448,3 +448,80 @@ describe("HTTP API v0.5", () => {
     }).pipe(Effect.provide(ServerTestLayer)),
   )
 })
+
+describe("HTTP API v0.6", () => {
+  it.effect("sends locations, contacts, polls and albums; refuses what WhatsApp cannot carry", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+      const raw = yield* HttpClient.HttpClient
+
+      const pin = yield* api.chats.sendLocation({ params: { chatId: chat }, payload: { latitude: 51.5, longitude: -0.12, name: "Office" } })
+      expect(yield* takeSoon(wa.locations)).toEqual({ chatId: chat, location: { latitude: 51.5, longitude: -0.12, name: "Office" }, messageId: pin.messageId })
+
+      const card = yield* api.chats.sendContacts({ params: { chatId: chat }, payload: { contacts: [{ name: "Dana", phone: "447700900555" }] } })
+      expect(yield* takeSoon(wa.contactsSent)).toEqual({ chatId: chat, contacts: [{ name: "Dana", phone: "447700900555" }], messageId: card.messageId })
+
+      const poll = yield* api.chats.sendPoll({ params: { chatId: chat }, payload: { question: "Lunch?", options: ["Pizza", "Sushi", "Salad"], multiple: true } })
+      expect(yield* takeSoon(wa.polls)).toEqual({ chatId: chat, poll: { question: "Lunch?", options: ["Pizza", "Sushi", "Salad"], multiple: true }, messageId: poll.messageId })
+      const onlyOne = yield* raw.post(`/chats/${chat}/polls`, {
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: HttpBody.jsonUnsafe({ question: "Lunch?", options: ["Pizza"] }),
+      })
+      expect(onlyOne.status).toBe(400)
+
+      const album = yield* api.chats.sendAlbum({
+        params: { chatId: chat },
+        payload: { items: [{ data: new Uint8Array([1]), mimetype: "image/png" }, { data: new Uint8Array([2]), mimetype: "video/mp4", caption: "clip" }] },
+      })
+      expect(album.messageIds.length).toBe(2)
+      const sentAlbum = yield* takeSoon(wa.albums)
+      expect(sentAlbum.items.map((i) => i.kind)).toEqual(["image", "video"])
+      expect(sentAlbum.messageIds).toEqual(album.messageIds)
+      const mixed = yield* api.chats
+        .sendAlbum({
+          params: { chatId: chat },
+          payload: { items: [{ data: new Uint8Array([1]), mimetype: "image/png" }, { data: new Uint8Array([2]), mimetype: "application/pdf", fileName: "a.pdf" }] },
+        })
+        .pipe(Effect.flip)
+      expect(mixed._tag).toBe("OutboundInvalid")
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.albums))).toBe(true)
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+
+  it.effect("mentions ride along with a text; presence subscribes the chat; a reply can send an album", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const other = ChatId.make("447700900456@s.whatsapp.net")
+
+      const sent = asSent(yield* api.chats.send({ params: { chatId: chat }, payload: { text: "@447700900456 over to you", mentions: [other] } }))
+      yield* takeSoon(wa.sent)
+      expect((yield* Ref.get(wa.mentions)).get(sent.messageId)).toEqual([other])
+
+      yield* Ref.set(wa.presences, new Map([[chat, "available" as const]]))
+      const presence = yield* api.chats.presence({ params: { chatId: chat } })
+      expect(presence).toMatchObject({ chatId: chat, state: "available" })
+      expect((yield* Ref.get(wa.presenceWatches)).has(chat)).toBe(true)
+
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      yield* wa.deliver(message("both charts please"))
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      const result = yield* api.turns.reply({
+        params: { turnId: call.turnId },
+        payload: {
+          text: "here",
+          attachments: [{ data: new Uint8Array([1]), mimetype: "image/png" }, { data: new Uint8Array([2]), mimetype: "image/png" }],
+          album: true,
+        },
+      })
+      expect(result.sentMessageIds.length).toBe(3)
+      expect((yield* takeSoon(wa.sent)).text).toBe("here")
+      expect((yield* takeSoon(wa.albums)).messageIds).toEqual(result.sentMessageIds.slice(1))
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+})

@@ -38,6 +38,10 @@ export interface BridgeConfigShape {
   /** The typing indicator is re-sent every few seconds while a turn is open, for at most this long (re-armed by progress). */
   readonly typingMax: Duration.Duration
   readonly groups: boolean
+  /** `mention`: a group turn opens only when the bridge is mentioned or quoted. `always`: every group message. */
+  readonly groupTrigger: "mention" | "always"
+  /** While the sender is typing, the batch window keeps extending, up to this long after the oldest message. */
+  readonly batchTypingWait: Duration.Duration
   /** Normalized to digits (for numbers) or full jids. Empty means everyone. */
   readonly allowedSenders: ReadonlyArray<string>
   readonly offlineWindow: Duration.Duration
@@ -107,6 +111,8 @@ const knobs = {
   ),
   typingMax: knob("BRIDGE_TYPING_MAX", Config.duration("BRIDGE_TYPING_MAX").pipe(Config.withDefault(Duration.minutes(3)))),
   groups: knob("BRIDGE_GROUPS", Config.boolean("BRIDGE_GROUPS").pipe(Config.withDefault(false))),
+  groupTrigger: knob("BRIDGE_GROUP_TRIGGER", Config.literals(["mention", "always"], "BRIDGE_GROUP_TRIGGER").pipe(Config.withDefault("mention"))),
+  batchTypingWait: knob("BRIDGE_BATCH_TYPING_WAIT", Config.duration("BRIDGE_BATCH_TYPING_WAIT").pipe(Config.withDefault(Duration.seconds(15)))),
   allowedSenders: knob("BRIDGE_ALLOWED_SENDERS", Config.string("BRIDGE_ALLOWED_SENDERS").pipe(Config.map(list), Config.withDefault([]))),
   offlineWindow: knob("BRIDGE_OFFLINE_WINDOW", Config.duration("BRIDGE_OFFLINE_WINDOW").pipe(Config.withDefault(Duration.zero))),
   typing: knob("BRIDGE_TYPING", Config.boolean("BRIDGE_TYPING").pipe(Config.withDefault(true))),

@@ -23,9 +23,13 @@ import {
   SendFailed,
   WhatsApp,
   type ContactInfo,
+  type ContactInput,
   type DownloadedMedia,
   type GroupInfo,
   type InboundUpdate,
+  type LocationInput,
+  type PollInput,
+  type PresenceInfo,
   type PresenceState,
 } from "../../src/whatsapp/WhatsApp.ts"
 
@@ -63,6 +67,8 @@ export const testConfig = (overrides: Partial<BridgeConfigShape> = {}): BridgeCo
   failureText: Option.some("Something went wrong."),
   typingMax: Duration.minutes(3),
   groups: false,
+  groupTrigger: "mention",
+  batchTypingWait: Duration.seconds(15),
   allowedSenders: [],
   offlineWindow: Duration.zero,
   typing: true,
@@ -134,6 +140,18 @@ export interface FakeWhatsAppShape {
   readonly presences: Ref.Ref<ReadonlyMap<ChatId, PresenceState>>
   /** Chats the bridge asked presence for, in order. */
   readonly presenceAsks: Queue.Queue<ChatId>
+  /** Chats the agent asked to watch. */
+  readonly presenceWatches: Ref.Ref<ReadonlySet<ChatId>>
+  /** Push a presence report into the bridge as if WhatsApp sent it. */
+  readonly reportPresence: (info: PresenceInfo) => Effect.Effect<void>
+  /** Hand the engine a group message that was seen but not addressed to the bridge. */
+  readonly observe: (message: InboundMessage) => Effect.Effect<void>
+  readonly locations: Queue.Queue<{ readonly chatId: ChatId; readonly location: LocationInput; readonly messageId: MessageId }>
+  readonly contactsSent: Queue.Queue<{ readonly chatId: ChatId; readonly contacts: ReadonlyArray<ContactInput>; readonly messageId: MessageId }>
+  readonly polls: Queue.Queue<{ readonly chatId: ChatId; readonly poll: PollInput; readonly messageId: MessageId }>
+  readonly albums: Queue.Queue<{ readonly chatId: ChatId; readonly items: ReadonlyArray<OutboundMedia>; readonly messageIds: ReadonlyArray<MessageId> }>
+  /** Mentions passed with text sends, by message id. */
+  readonly mentions: Ref.Ref<ReadonlyMap<MessageId, ReadonlyArray<string>>>
   /** Announced right before a send waits on `sendGate` (when one is set). */
   readonly sending: Queue.Queue<Outbound>
   readonly typing: Ref.Ref<ReadonlyArray<{ readonly chatId: ChatId; readonly composing: boolean }>>
@@ -169,6 +187,14 @@ export const FakeWhatsAppLive = Layer.effectContext(
     const groups = yield* Ref.make<ReadonlyMap<ChatId, GroupInfo>>(new Map())
     const presences = yield* Ref.make<ReadonlyMap<ChatId, PresenceState>>(new Map())
     const presenceAsks = yield* Queue.unbounded<ChatId>()
+    const presenceWatches = yield* Ref.make<ReadonlySet<ChatId>>(new Set())
+    const presenceUpdates = yield* Queue.unbounded<PresenceInfo>()
+    const observed = yield* Queue.unbounded<InboundMessage>()
+    const locations = yield* Queue.unbounded<{ readonly chatId: ChatId; readonly location: LocationInput; readonly messageId: MessageId }>()
+    const contactsSent = yield* Queue.unbounded<{ readonly chatId: ChatId; readonly contacts: ReadonlyArray<ContactInput>; readonly messageId: MessageId }>()
+    const polls = yield* Queue.unbounded<{ readonly chatId: ChatId; readonly poll: PollInput; readonly messageId: MessageId }>()
+    const albums = yield* Queue.unbounded<{ readonly chatId: ChatId; readonly items: ReadonlyArray<OutboundMedia>; readonly messageIds: ReadonlyArray<MessageId> }>()
+    const mentions = yield* Ref.make<ReadonlyMap<MessageId, ReadonlyArray<string>>>(new Map())
     const typing = yield* Ref.make<ReadonlyArray<{ readonly chatId: ChatId; readonly composing: boolean }>>([])
     const failNextSends = yield* Ref.make(0)
     const sendGate = yield* Ref.make<Option.Option<Latch.Latch>>(Option.none())
@@ -200,12 +226,17 @@ export const FakeWhatsAppLive = Layer.effectContext(
         }
       })
 
-    const sendText = (chatId: ChatId, text: string, options?: { readonly messageId?: MessageId | undefined; readonly quoteMessageId?: MessageId | undefined }) =>
+    const sendText = (
+      chatId: ChatId,
+      text: string,
+      options?: { readonly messageId?: MessageId | undefined; readonly quoteMessageId?: MessageId | undefined; readonly mentions?: ReadonlyArray<string> | undefined },
+    ) =>
       Effect.gen(function* () {
         yield* checkQuote(chatId, options?.quoteMessageId)
         const failing = yield* Ref.modify(failNextSends, (n) => [n > 0, Math.max(0, n - 1)] as const)
         if (failing) return yield* new SendFailed({ operation: "sendText", chatId, detail: "simulated failure" })
         const messageId = options?.messageId ?? (yield* newOutboundId)
+        if (options?.mentions !== undefined) yield* Ref.update(mentions, (m) => new Map(m).set(messageId, options.mentions ?? []))
         const out: Outbound = { chatId, text, messageId, quoteMessageId: options?.quoteMessageId }
         const gate = yield* Ref.get(sendGate)
         if (Option.isSome(gate)) {
@@ -257,6 +288,44 @@ export const FakeWhatsAppLive = Layer.effectContext(
           const state = (yield* Ref.get(presences)).get(chatId) ?? "unknown"
           return { chatId, state }
         }),
+      watchPresence: (chatId) =>
+        Effect.gen(function* () {
+          yield* Ref.update(presenceWatches, (s) => new Set(s).add(chatId))
+          const state = (yield* Ref.get(presences)).get(chatId) ?? "unknown"
+          return { chatId, state }
+        }),
+      presenceUpdates: Stream.fromQueue(presenceUpdates),
+      observed: Stream.fromQueue(observed),
+      sendLocation: (chatId, location, options) =>
+        Effect.gen(function* () {
+          yield* checkQuote(chatId, options?.quoteMessageId)
+          const messageId = options?.messageId ?? (yield* newOutboundId)
+          yield* Queue.offer(locations, { chatId, location, messageId })
+          return messageId
+        }),
+      sendContacts: (chatId, contacts, options) =>
+        Effect.gen(function* () {
+          yield* checkQuote(chatId, options?.quoteMessageId)
+          const messageId = options?.messageId ?? (yield* newOutboundId)
+          yield* Queue.offer(contactsSent, { chatId, contacts, messageId })
+          return messageId
+        }),
+      sendPoll: (chatId, poll, options) =>
+        Effect.gen(function* () {
+          yield* checkQuote(chatId, options?.quoteMessageId)
+          const messageId = options?.messageId ?? (yield* newOutboundId)
+          yield* Queue.offer(polls, { chatId, poll, messageId })
+          return messageId
+        }),
+      sendAlbum: (chatId, items, options) =>
+        Effect.gen(function* () {
+          yield* checkQuote(chatId, options?.quoteMessageId)
+          const messageIds: Array<MessageId> = []
+          for (const _ of items) messageIds.push(yield* newOutboundId)
+          yield* Queue.offer(albums, { chatId, items, messageIds })
+          yield* Queue.offer(order, "media")
+          return messageIds
+        }),
       updates: Stream.fromQueue(updates),
       react: (chatId, messageId, emoji) => Queue.offer(reactions, { chatId, messageId, emoji }).pipe(Effect.asVoid),
       unreact: (chatId, messageId) => Queue.offer(reactions, { chatId, messageId, emoji: "" }).pipe(Effect.asVoid),
@@ -281,6 +350,14 @@ export const FakeWhatsAppLive = Layer.effectContext(
       groups,
       presences,
       presenceAsks,
+      presenceWatches,
+      reportPresence: (info) => Queue.offer(presenceUpdates, info).pipe(Effect.asVoid),
+      observe: (m) => Queue.offer(observed, m).pipe(Effect.asVoid),
+      locations,
+      contactsSent,
+      polls,
+      albums,
+      mentions,
       typing,
       failNextSends,
       sendGate,

@@ -26,6 +26,28 @@ export const MediaFile = Schema.Struct({
 })
 export type MediaFile = typeof MediaFile.Type
 
+/** Where a `location` message points. */
+export const Location = Schema.Struct({
+  latitude: Schema.Number,
+  longitude: Schema.Number,
+  name: Schema.optionalKey(Schema.String),
+  address: Schema.optionalKey(Schema.String),
+  url: Schema.optionalKey(Schema.String),
+  /** A live location shares the sender's position for a while; this is the first point. */
+  live: Schema.optionalKey(Schema.Boolean),
+})
+export type Location = typeof Location.Type
+
+/** One card of a `contact` message. */
+export const SharedContact = Schema.Struct({
+  name: Schema.String,
+  /** Digits of the first phone number on the card, when there is one. */
+  phone: Schema.optionalKey(Schema.String),
+  /** The card as WhatsApp sent it. */
+  vcard: Schema.String,
+})
+export type SharedContact = typeof SharedContact.Type
+
 /**
  * One inbound WhatsApp message as Intro sees it. This is the versioned wire
  * shape (see `BridgeEvent` for the envelope). `hasMedia` / `mimetype` say
@@ -53,5 +75,13 @@ export const InboundMessage = Schema.Struct({
   quotedMessageId: Schema.optionalKey(MessageId),
   /** Present on `TurnOpened` when the attachment was downloaded in time; otherwise fetch it via the media endpoint. */
   media: Schema.optionalKey(MediaFile),
+  /** Jids @-mentioned in the text. */
+  mentionedIds: Schema.optionalKey(Schema.Array(Schema.String)),
+  /** True when the bridge's own number was mentioned. In groups this is what opens a turn. */
+  mentionsMe: Schema.optionalKey(Schema.Boolean),
+  /** True when the message quotes one the bridge sent. In groups this also opens a turn. */
+  quotesMe: Schema.optionalKey(Schema.Boolean),
+  location: Schema.optionalKey(Location),
+  contacts: Schema.optionalKey(Schema.Array(SharedContact)),
 })
 export type InboundMessage = typeof InboundMessage.Type

@@ -8,7 +8,7 @@ import { BridgeConfig } from "../config.ts"
 import { Events } from "../engine/Events.ts"
 import { Health } from "../engine/Health.ts"
 import { MediaStore, MediaStoreError } from "../engine/Media.ts"
-import { Outbound } from "../engine/Outbound.ts"
+import { Outbound, OutboundInvalid } from "../engine/Outbound.ts"
 import type { Outgoing } from "../domain/outbound.ts"
 import type { MessageId } from "../domain/ids.ts"
 import { TurnNotOpen, TurnRegistry } from "../engine/Turns.ts"
@@ -78,10 +78,48 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
           )
           return { scheduledId: held.scheduledId, sendAt: held.sendAt, deliverWhenOnline: held.deliverWhenOnline }
         }
-        const messageId = yield* whatsapp.sendText(params.chatId, payload.text, { quoteMessageId: payload.quoteMessageId })
+        const messageId = yield* whatsapp.sendText(params.chatId, payload.text, { quoteMessageId: payload.quoteMessageId, mentions: payload.mentions })
         return { chatId: params.chatId, messageId }
       }),
     )
+    .handle("sendLocation", ({ params, payload }) =>
+      Effect.gen(function* () {
+        const whatsapp = yield* WhatsApp
+        const { quoteMessageId, ...location } = payload
+        const messageId = yield* whatsapp.sendLocation(params.chatId, location, { quoteMessageId })
+        return { chatId: params.chatId, messageId }
+      }),
+    )
+    .handle("sendContacts", ({ params, payload }) =>
+      Effect.gen(function* () {
+        const whatsapp = yield* WhatsApp
+        const messageId = yield* whatsapp.sendContacts(params.chatId, payload.contacts, { quoteMessageId: payload.quoteMessageId })
+        return { chatId: params.chatId, messageId }
+      }),
+    )
+    .handle("sendPoll", ({ params, payload }) =>
+      Effect.gen(function* () {
+        const whatsapp = yield* WhatsApp
+        const messageId = yield* whatsapp.sendPoll(
+          params.chatId,
+          { question: payload.question, options: payload.options, multiple: payload.multiple === true },
+          { quoteMessageId: payload.quoteMessageId },
+        )
+        return { chatId: params.chatId, messageId }
+      }),
+    )
+    .handle("sendAlbum", ({ params, payload }) =>
+      Effect.gen(function* () {
+        const whatsapp = yield* WhatsApp
+        const outbound = yield* Outbound
+        const items = yield* Effect.forEach(payload.items, outbound.load)
+        const odd = items.find((i) => i.kind !== "image" && i.kind !== "video")
+        if (odd !== undefined) return yield* new OutboundInvalid({ detail: `an album takes images and videos only, not ${odd.kind}` })
+        const messageIds = yield* whatsapp.sendAlbum(params.chatId, items, { quoteMessageId: payload.quoteMessageId })
+        return { chatId: params.chatId, messageIds }
+      }),
+    )
+    .handle("presence", ({ params }) => WhatsApp.use((w) => w.watchPresence(params.chatId)))
     .handle("forward", ({ params, payload }) =>
       Effect.gen(function* () {
         const whatsapp = yield* WhatsApp
@@ -198,7 +236,10 @@ export const TurnsGroupLive = HttpApiBuilder.group(BridgeApi, "turns", (handlers
         if (payload.quoteMessageId !== undefined && first !== undefined && !("bytes" in first) && first.quoteMessageId === undefined) {
           bubbles[0] = { ...first, quoteMessageId: payload.quoteMessageId }
         }
-        const sentMessageIds = yield* registry.reply(params.turnId, [...bubbles, ...files], { replaceProgress: payload.replaceProgress })
+        const sentMessageIds = yield* registry.reply(params.turnId, [...bubbles, ...files], {
+          replaceProgress: payload.replaceProgress,
+          album: payload.album,
+        })
         return { turnId: params.turnId, sentMessageIds }
       }),
     )

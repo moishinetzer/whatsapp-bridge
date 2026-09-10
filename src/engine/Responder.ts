@@ -19,6 +19,8 @@ export const TurnPayload = Schema.Struct({
   messages: Schema.Array(InboundMessage),
   /** The turn this one replaces because newer messages interrupted it. */
   supersedes: Schema.optionalKey(TurnId),
+  /** Groups: the last messages in the chat before this turn, oldest first. */
+  context: Schema.optionalKey(Schema.Array(InboundMessage)),
 })
 export type TurnPayload = typeof TurnPayload.Type
 
@@ -32,12 +34,14 @@ export const HandlerResponse = Schema.Struct({
   text: Schema.optionalKey(Schema.NullOr(Schema.String)),
   replies: Schema.optionalKey(Schema.Array(Schema.String)),
   attachments: Schema.optionalKey(Schema.Array(OutboundMediaPayload)),
+  /** Adjacent images and videos in `attachments` go out as one album. */
+  album: Schema.optionalKey(Schema.Boolean),
   async: Schema.optionalKey(Schema.Boolean),
 })
 export type HandlerResponse = typeof HandlerResponse.Type
 
 export type ResponderReply =
-  | { readonly _tag: "Replies"; readonly replies: ReadonlyArray<Outgoing> }
+  | { readonly _tag: "Replies"; readonly replies: ReadonlyArray<Outgoing>; readonly album?: boolean | undefined }
   /** The reply will arrive later via the registry (`POST /turns/{id}/reply`). */
   | { readonly _tag: "External" }
 
@@ -111,7 +115,7 @@ export const HttpResponderLive = Layer.effect(
         if (body.async === true) return { _tag: "External" } as const
         const files = yield* Effect.forEach(body.attachments ?? [], outbound.load)
         const replies: ReadonlyArray<Outgoing> = [...outgoing(body.replies ?? []), ...outgoing(body.text ? [body.text] : []), ...files]
-        return { _tag: "Replies", replies } as const
+        return { _tag: "Replies", replies, album: body.album === true } as const
       },
       (effect, turn) =>
         effect.pipe(

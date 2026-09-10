@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here. Intro pins on a tag.
 
+## v0.6.0 — 2026-09-10
+
+The long tail: the third and last push from `docs/spec/agent-surface.md`.
+
+- Groups, properly. With `BRIDGE_GROUPS=true` a turn opens only when the bridge is @-mentioned or one of its messages is quoted (`BRIDGE_GROUP_TRIGGER=mention`; `always` for every message). Other group messages are stored with history on, emit no event, and feed a per-group ring: every group `TurnOpened`, `TurnSummary` and `TurnPayload` carries `context`, the last 10 messages before the trigger, oldest first. Inbound messages gain `mentionedIds`, `mentionsMe` and `quotesMe`; `mentions` on `POST /chats/{id}/messages` makes an outbound @-mention real.
+- Typing holds the batch. Presence reports keep the batch window open while the sender types, up to `BRIDGE_BATCH_TYPING_WAIT` (15 seconds) from the oldest message, a separate cap from `BRIDGE_BATCH_MAX_WAIT`. The bridge subscribes to a chat's presence on its first message.
+- `GET /chats/{id}/presence` returns the last known state (`available`, `unavailable`, `composing`, `recording`, `paused`, `unknown`, with `lastSeenAt` when WhatsApp shares it) and subscribes the chat to `PresenceChanged` events; nothing else emits them.
+- Locations and contacts: `location` and `contacts` decoded on inbound messages (pins, live locations, vCards with the first phone number); `POST /chats/{id}/location` and `POST /chats/{id}/contacts` to send them.
+- Polls: `POST /chats/{id}/polls {question, options, multiple}`; every vote arrives as a `PollVote` event with the voter's whole current selection, decrypted by the bridge (the library leaves votes encrypted). Votes on a poll sent before a restart need history on.
+- Albums: `POST /chats/{id}/album` sends two or more images and videos as one album; `album: true` on `POST /turns/{id}/reply` and in a `HandlerResponse` groups each run of adjacent image and video attachments, documents and audio staying separate. An album item that is not an image or video is `400 OutboundInvalid`.
+- CLI: `location`, `poll`, `presence`.
+- Tests: mention, location and contact extraction; the group context ring and its cap; typing-aware batching under the test clock, both the hold and the cap; album grouping in the engine and through the API; the new endpoints and their refusals. 99 in total.
+- Event schema stays v1; everything new is additive.
+
 ## v0.5.0 — 2026-09-10
 
 Memory: the second of three pushes from `docs/spec/agent-surface.md`.

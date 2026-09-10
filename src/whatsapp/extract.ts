@@ -10,7 +10,7 @@ import {
 } from "@whiskeysockets/baileys"
 import { DateTime, Option } from "effect"
 import { ChatId, MessageId, phoneOfJid } from "../domain/ids.ts"
-import { InboundMessage, type MessageKind } from "../domain/message.ts"
+import { InboundMessage, type Location, type MessageKind, type SharedContact } from "../domain/message.ts"
 
 export interface Extracted {
   readonly message: InboundMessage
@@ -71,6 +71,48 @@ export const textOf = (content: proto.IMessage): string | undefined =>
   content.documentMessage?.caption ??
   undefined
 
+/** The `contextInfo` of whichever content the message carries (quotes, mentions). */
+export const contextInfoOf = (content: proto.IMessage): proto.IContextInfo | undefined => {
+  const type = getContentType(content)
+  if (!type) return undefined
+  const inner = content[type as keyof proto.IMessage] as { contextInfo?: proto.IContextInfo | null } | null | undefined
+  return inner && typeof inner === "object" ? (inner.contextInfo ?? undefined) : undefined
+}
+
+const locationOf = (content: proto.IMessage): Location | undefined => {
+  const loc = content.locationMessage ?? content.liveLocationMessage
+  if (!loc || loc.degreesLatitude === null || loc.degreesLatitude === undefined || loc.degreesLongitude === null || loc.degreesLongitude === undefined) return undefined
+  const named = content.locationMessage
+  return {
+    latitude: loc.degreesLatitude,
+    longitude: loc.degreesLongitude,
+    ...(named?.name ? { name: named.name } : {}),
+    ...(named?.address ? { address: named.address } : {}),
+    ...(named?.url ? { url: named.url } : {}),
+    ...(content.liveLocationMessage ? { live: true } : {}),
+  }
+}
+
+/** The first phone number on a vCard: WhatsApp's `waid` when present, else the TEL digits. */
+export const phoneOfVcard = (vcard: string): string | undefined => {
+  const waid = /waid=(\d+)/i.exec(vcard)?.[1]
+  if (waid) return waid
+  const tel = /^TEL[^:]*:(.+)$/im.exec(vcard)?.[1]
+  const digits = tel?.replace(/[^0-9]/g, "")
+  return digits && digits.length > 0 ? digits : undefined
+}
+
+const contactsOf = (content: proto.IMessage): ReadonlyArray<SharedContact> | undefined => {
+  const cards = content.contactMessage ? [content.contactMessage] : (content.contactsArrayMessage?.contacts ?? undefined)
+  if (!cards || cards.length === 0) return undefined
+  return cards.flatMap((c): Array<SharedContact> => {
+    const vcard = c.vcard ?? ""
+    const name = c.displayName ?? /^FN:(.+)$/m.exec(vcard)?.[1] ?? "contact"
+    const phone = phoneOfVcard(vcard)
+    return [{ name, ...(phone === undefined ? {} : { phone }), vcard }]
+  })
+}
+
 /**
  * Turns a raw WhatsApp message into the bridge's `InboundMessage`, or `None`
  * when it is not something Intro should ever see: our own sends (echoes),
@@ -110,7 +152,11 @@ export const extractInbound = (msg: WAMessage, now: DateTime.Utc): Option.Option
     ? (phoneOfJid(participant) ?? phoneOfJid(key.participantAlt))
     : (phoneOfJid(remoteJid) ?? phoneOfJid(key.remoteJidAlt))
 
-  const quoted = content.extendedTextMessage?.contextInfo?.stanzaId ?? undefined
+  const contextInfo = contextInfoOf(content)
+  const quoted = contextInfo?.stanzaId ?? undefined
+  const mentionedIds = contextInfo?.mentionedJid ?? undefined
+  const location = locationOf(content)
+  const contacts = contactsOf(content)
   const millis = toMillis(msg.messageTimestamp)
   const timestamp = millis === undefined ? now : DateTime.makeUnsafe(millis)
 
@@ -127,6 +173,9 @@ export const extractInbound = (msg: WAMessage, now: DateTime.Utc): Option.Option
     hasMedia,
     ...(mimetype ? { mimetype } : {}),
     ...(quoted ? { quotedMessageId: MessageId.make(quoted) } : {}),
+    ...(mentionedIds && mentionedIds.length > 0 ? { mentionedIds } : {}),
+    ...(location === undefined ? {} : { location }),
+    ...(contacts === undefined ? {} : { contacts }),
   })
 
   return Option.some({ message, key })

@@ -8,6 +8,7 @@ import { Events } from "../src/engine/Events.ts"
 import { HandlerFailed } from "../src/engine/Responder.ts"
 import { MediaStore } from "../src/engine/Media.ts"
 import { TurnRegistry } from "../src/engine/Turns.ts"
+import { ChatId } from "../src/domain/ids.ts"
 import { EngineTestLayer, FakeWhatsApp, TestResponder, chat, external, jpeg, message, png, replies, settle, takeSoon } from "./support/fakes.ts"
 
 /** Collect the next `n` events without missing any published before we subscribe. */
@@ -777,6 +778,139 @@ describe("TurnEngine: progress, abandon, quoting", () => {
       expect(second.text).toBe("not that")
       expect(second.quoteMessageId).toBeUndefined()
       expect(ids.length).toBe(2)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+})
+
+describe("TurnEngine: groups, typing, albums", () => {
+  const group = ChatId.make("120363000000000000@g.us")
+
+  it.effect("a group turn carries the last ten messages the bridge saw but did not answer", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const earlier: Array<ReturnType<typeof message>> = []
+      for (let i = 0; i < 12; i++) {
+        const m = message(`chatter ${i}`, { chatId: group, isGroup: true })
+        earlier.push(m)
+        yield* wa.observe(m)
+      }
+      yield* settle
+      const asked = message("@bridge which one?", { chatId: group, isGroup: true })
+      yield* wa.deliver(asked)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      expect(call.isGroup).toBe(true)
+      expect(call.messages.map((m) => m.messageId)).toEqual([asked.messageId])
+      expect(call.context?.map((m) => m.text)).toEqual(earlier.slice(-10).map((m) => m.text))
+      yield* takeSoon(wa.sent)
+
+      // Answered messages join the ring too, so the next turn sees what was just asked.
+      const again = message("and this?", { chatId: group, isGroup: true })
+      yield* wa.deliver(again)
+      const second = yield* takeSoon(responder.calls)
+      expect(second.context?.at(-1)?.messageId).toBe(asked.messageId)
+      expect(second.context?.length).toBe(10)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("a DM turn carries no context", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      yield* wa.observe(message("noise"))
+      yield* settle
+      yield* wa.deliver(message("hi"))
+      const call = yield* takeSoon(responder.calls)
+      expect(call.context).toBeUndefined()
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  const typingConfig = { batchWindow: Duration.seconds(2), batchMaxWait: Duration.seconds(5), batchTypingWait: Duration.seconds(15) }
+
+  it.effect("someone still typing holds the batch window past the max wait; the turn opens when they stop", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const m1 = message("so")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      yield* wa.reportPresence({ chatId: chat, state: "composing" })
+      yield* settle
+      const noCall = () => Effect.map(Queue.poll(responder.calls), Option.isNone)
+
+      yield* TestClock.adjust("2 seconds")
+      yield* settle
+      expect(yield* noCall()).toBe(true)
+      yield* TestClock.adjust("2 seconds")
+      yield* wa.reportPresence({ chatId: chat, state: "composing" })
+      yield* settle
+      yield* TestClock.adjust("2 seconds")
+      yield* settle
+      // Six seconds in, past batchMaxWait, and still waiting because they type.
+      expect(yield* noCall()).toBe(true)
+
+      yield* wa.reportPresence({ chatId: chat, state: "paused" })
+      yield* settle
+      yield* TestClock.adjust("2 seconds")
+      const call = yield* takeSoon(responder.calls)
+      expect(call.messages.map((m) => m.messageId)).toEqual([m1.messageId])
+    }).pipe(Effect.provide(EngineTestLayer(typingConfig))),
+  )
+
+  it.effect("typing cannot hold the window past the typing wait", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      yield* wa.deliver(message("so"))
+      yield* takeSoon(wa.reactions)
+      for (let i = 0; i < 8; i++) {
+        yield* wa.reportPresence({ chatId: chat, state: "composing" })
+        yield* settle
+        yield* TestClock.adjust("2 seconds")
+        yield* settle
+      }
+      expect(Option.isSome(yield* Queue.poll(responder.calls))).toBe(true)
+    }).pipe(Effect.provide(EngineTestLayer(typingConfig))),
+  )
+
+  it.effect("with album, adjacent images go out as one album and the rest as they are", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      yield* wa.deliver(message("photos please"))
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      const ids = yield* registry.reply(call.turnId, [text("here"), png(), png(), text("and one more"), png()], { album: true })
+      expect(ids.length).toBe(5)
+      expect((yield* takeSoon(wa.sent)).text).toBe("here")
+      const album = yield* takeSoon(wa.albums)
+      expect(album.items.length).toBe(2)
+      expect(album.messageIds).toEqual(ids.slice(1, 3))
+      expect((yield* takeSoon(wa.sent)).text).toBe("and one more")
+      expect((yield* takeSoon(wa.sentMedia)).messageId).toBe(ids[4])
+      expect(Option.isNone(yield* Queue.poll(wa.albums))).toBe(true)
+      expect((yield* takeSoon(wa.reactions)).emoji).toBe("")
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("without album, images go out one by one", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      yield* wa.deliver(message("photos please"))
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      yield* registry.reply(call.turnId, [png(), png()])
+      yield* takeSoon(wa.sentMedia)
+      yield* takeSoon(wa.sentMedia)
+      expect(Option.isNone(yield* Queue.poll(wa.albums))).toBe(true)
     }).pipe(Effect.provide(EngineTestLayer())),
   )
 })

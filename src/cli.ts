@@ -220,6 +220,42 @@ const contact = Command.make(
   ({ jid }) => withClient((client) => client.history.contact({ params: { jid: jid.includes("@") ? jid : toChatId(jid) } })).pipe(Effect.flatMap(json)),
 ).pipe(Command.withDescription("Look a contact up: push name, phone, picture URL, whether the number is on WhatsApp"))
 
+const presence = Command.make("presence", { chat: Flag.string("chat") }, ({ chat }) =>
+  withClient((client) => client.chats.presence({ params: { chatId: toChatId(chat) } })).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Subscribe to a chat's presence and print the last known state; PresenceChanged events follow"))
+
+const poll = Command.make(
+  "poll",
+  {
+    to: Flag.string("to"),
+    question: Flag.string("question"),
+    option: Flag.string("option").pipe(Flag.between(2, 12), Flag.withDescription("An option; give two to twelve")),
+    multiple: Flag.boolean("multiple").pipe(Flag.withDescription("Allow picking several options")),
+  },
+  ({ to, question, option, multiple }) =>
+    withClient((client) =>
+      client.chats.sendPoll({ params: { chatId: toChatId(to) }, payload: { question, options: option, ...(multiple ? { multiple: true } : {}) } }),
+    ).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Send a poll"))
+
+const location = Command.make(
+  "location",
+  {
+    to: Flag.string("to"),
+    lat: Flag.float("lat"),
+    lng: Flag.float("lng"),
+    name: Flag.string("name").pipe(Flag.optional),
+    address: Flag.string("address").pipe(Flag.optional),
+  },
+  ({ to, lat, lng, name, address }) =>
+    withClient((client) =>
+      client.chats.sendLocation({
+        params: { chatId: toChatId(to) },
+        payload: { latitude: lat, longitude: lng, ...(Option.isSome(name) ? { name: name.value } : {}), ...(Option.isSome(address) ? { address: address.value } : {}) },
+      }),
+    ).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Send a location pin"))
+
 const chats = Command.make("chats", {}, () => withClient((client) => client.history.chats()).pipe(Effect.flatMap(json))).pipe(
   Command.withDescription("List the chats in the history (needs BRIDGE_HISTORY)"),
 )
@@ -431,7 +467,7 @@ const unlink = Command.make(
 
 const bridge = Command.make("bridge").pipe(
   Command.withDescription("WhatsApp ↔ Intro bridge on a dedicated number"),
-  Command.withSubcommands([link, run, harness, health, send, forward, edit, del, react, unreact, media, contact, chats, messages, search, scheduled, unschedule, turns, reply, progress, abandon, history, unlink]),
+  Command.withSubcommands([link, run, harness, health, send, forward, poll, location, edit, del, react, unreact, media, contact, presence, chats, messages, search, scheduled, unschedule, turns, reply, progress, abandon, history, unlink]),
 )
 
 /** The whole CLI, needing only the Node platform services. */

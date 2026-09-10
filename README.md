@@ -91,7 +91,8 @@ inbound message ──▶ 👀 within seconds ──▶ batch window (1.5 s) ─
 ```
 
 - **Seen acknowledgment.** Every accepted inbound message is marked read (blue ticks, `BRIDGE_READ_RECEIPTS`) and gets the 👀 reaction within seconds, retried with backoff. One message per chat carries the eye: when the next message arrives, the eye comes off the previous one and goes onto the new one. If the reaction cannot be applied after retries, a warning is logged; set `BRIDGE_SEEN_FALLBACK_TEXT` to send a short text instead.
-- **Batching.** Messages from the same chat that arrive within `BRIDGE_BATCH_WINDOW` of each other are one turn. A message that arrives during the window restarts it, but a turn always opens within `BRIDGE_BATCH_MAX_WAIT` of its oldest message, so a steady trickle cannot postpone a reply forever.
+- **Batching.** Messages from the same chat that arrive within `BRIDGE_BATCH_WINDOW` of each other are one turn. A message that arrives during the window restarts it, but a turn always opens within `BRIDGE_BATCH_MAX_WAIT` of its oldest message, so a steady trickle cannot postpone a reply forever. While the sender is still typing (WhatsApp's presence says so) the window keeps stretching, up to `BRIDGE_BATCH_TYPING_WAIT` (15 seconds) from the oldest message, so "wait, and also…" lands in the same turn.
+- **Groups.** With `BRIDGE_GROUPS=true`, a group message opens a turn only when it @-mentions the bridge's number or quotes one of its messages (`BRIDGE_GROUP_TRIGGER=mention`; `always` treats every message as a DM would). Other group messages are stored with history on, emit no event, and feed a per-group ring of the last messages: every group `TurnOpened` carries `context`, the last 10 messages before the trigger, so the agent sees what was being discussed. Reading a group message marks it read; only turn messages get the eye.
 - **Interrupts.** If a message arrives while the responder is working (or while Intro is composing a reply in manual mode), the turn is *superseded*: the responder call is interrupted (an HTTP handler sees its request aborted), a `TurnSuperseded` event names the replacement, and a new `TurnOpened` carries every unanswered message. A reply posted for the old turn is refused with 409 so a stale answer is never sent. An edit of a pending message does the same with the corrected text; a delete drops the message, and a turn with nothing left is `cancelled`.
 - **Commit is atomic.** Once the responder has answered, the send-and-clear step cannot be interrupted: the reply goes out, the 👀 come off, then any newer message starts a fresh turn of its own.
 - **Idempotency.** Each WhatsApp message id is handled once per daemon run: one 👀, one turn. Echoes of the bridge's own messages are ignored (no reply loops).
@@ -119,7 +120,7 @@ Set `BRIDGE_RESPONDER=http` and `INTRO_HANDLER_URL=http://127.0.0.1:9000/turn`. 
 
 ### Proactive messages and escalation
 
-Any time, in either mode, Intro can `POST /chats/{chatId}/messages` to say something unprompted, or `POST /chats/{chatId}/media` to send a file. That is how it asks Moishi to open the Grok Bot app: *"This needs the app: open Grok Bot → approve the Link spend for X."* The bridge never pretends an app-side action happened; that is Intro's rule to keep (see `docs/intro-integration.md` for all product rules Intro follows on this line).
+Any time, in either mode, Intro can `POST /chats/{chatId}/messages` to say something unprompted, `POST /chats/{chatId}/media` to send a file, `.../album` for several pictures at once, `.../location`, `.../contacts` and `.../polls` for a pin, a card or a vote. That is how it asks Moishi to open the Grok Bot app: *"This needs the app: open Grok Bot → approve the Link spend for X."* The bridge never pretends an app-side action happened; that is Intro's rule to keep (see `docs/intro-integration.md` for all product rules Intro follows on this line).
 
 ### Chat ids
 
@@ -165,6 +166,8 @@ curl -X POST http://127.0.0.1:8787/chats/447700900123@s.whatsapp.net/media -H 'c
 
 Or from a shell: `npm run bridge -- send --to 447700900123 --file /tmp/q3.png --caption "Revenue by month"`. A consumer on another machine sends the bytes instead of a path: `{"data": "<base64>", "mimetype": "image/png"}`. Images, videos, audio (voice notes included) and any document work; WhatsApp decides the presentation from the `kind`, which the bridge infers from the file type. The full contract is [`POST /chats/{chatId}/media`](#post-chatschatidmedia) and [`OutboundMediaPayload`](#outboundmediapayload).
 
+Several pictures at once go as one **album**, the grid WhatsApp shows for a batch of photos: `POST /chats/{chatId}/album {"items": [...]}` with two or more images or videos, or `"album": true` on a turn reply, which groups each run of adjacent image and video attachments and leaves documents and audio as separate bubbles.
+
 ## History
 
 Off by default. When on, the bridge records every message in both directions in its SQLite file, and the agent gets memory across restarts: `GET /chats`, `GET /chats/{chatId}/messages`, full-text search with `GET /messages?q=`, and quoting or forwarding anything ever seen.
@@ -204,6 +207,9 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | Own messages | The bridge can edit (`PATCH`) or delete (`DELETE`) a message it sent, within WhatsApp's windows: 15 minutes to edit, about 2 days to delete. Past that: `409 MessageTooOld`. Sent messages are remembered in the database, so this survives a restart; a message the bridge never sent is `404 MessageUnknown`. |
 | Scheduling | Any text or file send takes `sendAt` (ISO-8601) and answers `202 {scheduledId, sendAt, deliverWhenOnline}` instead of sending. `deliverWhenOnline: true` also waits for the recipient to be online, at most 24 hours. Scheduled sends survive restarts; one missed by more than an hour of downtime is dropped with a `ScheduledSkipped` event. |
 | History | Endpoints under [History](#history) answer `409 HistoryDisabled` until history is enabled. |
+| Groups | Off unless `BRIDGE_GROUPS=true`. A turn opens for a group message only when it mentions the bridge or quotes one of its messages; every group turn carries `context`, the last 10 messages seen in that group. Answer `{}` when the mention needs nothing. `mentions` on a text send makes an @-mention real (WhatsApp only links a mention when the jid is listed). |
+| Albums | `POST /chats/{chatId}/album` and `album: true` on a reply send adjacent images and videos as one album. Documents and audio never group. |
+| Presence | The bridge subscribes to a chat's presence the first time it messages the line, to hold the batch window while they type. `PresenceChanged` events flow only for chats asked about through `GET /chats/{chatId}/presence`. |
 | Schema version | Every event carries `v: 1`. The version only changes on an incompatible change; new optional fields do not bump it. |
 
 ### Endpoints
@@ -218,6 +224,11 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | DELETE | [`/chats/{chatId}/messages/{messageId}`](#delete-chatschatidmessagesmessageid) | Delete for everyone a message the bridge sent |
 | POST | [`/chats/{chatId}/media`](#post-chatschatidmedia) | Send an image, video, audio or document |
 | POST | [`/chats/{chatId}/forward`](#post-chatschatidforward) | Forward a message the bridge saw or sent |
+| POST | [`/chats/{chatId}/album`](#post-chatschatidalbum) | Send several images or videos as one album |
+| POST | [`/chats/{chatId}/location`](#post-chatschatidlocation) | Send a location pin |
+| POST | [`/chats/{chatId}/contacts`](#post-chatschatidcontacts) | Send one or more contact cards |
+| POST | [`/chats/{chatId}/polls`](#post-chatschatidpolls) | Send a poll; votes arrive as `PollVote` events |
+| GET | [`/chats/{chatId}/presence`](#get-chatschatidpresence) | Last known presence; subscribes the chat to `PresenceChanged` events |
 | GET | [`/chats`](#get-chats) | Chats in the history |
 | GET | [`/chats/{chatId}`](#get-chatschatid) | One chat: history summary, group subject and members |
 | GET | [`/chats/{chatId}/messages`](#get-chatschatidmessages) | A chat's history, or a search within it |
@@ -312,6 +323,7 @@ Content-Type: application/json
 |---|---|---|
 | `text` | string | non-empty, else `400 InvalidRequest` |
 | `quoteMessageId` | string, optional | Send as a reply to that message. `404 MessageUnknown` if the bridge never saw or sent it. |
+| `mentions` | string[], optional | Jids to @-mention. Write `@<digits>` in the text and list `<digits>@s.whatsapp.net` here; WhatsApp turns it into a tappable mention that notifies the person, which matters in groups. |
 | `sendAt` | ISO-8601, optional | Hold the send until then. The answer is `202 {scheduledId, sendAt, deliverWhenOnline}` and nothing is sent now. |
 | `deliverWhenOnline` | boolean, optional | With `sendAt`: also wait until the recipient is online, up to 24 hours after `sendAt`, then send anyway. |
 
@@ -384,6 +396,68 @@ Content-Type: application/json
 | 502 | `SendFailed` | The upload or the send was rejected or took too long. Not retried; retry yourself. |
 
 What WhatsApp shows depends on `kind`: `image` and `video` get an inline preview with the caption under it (WhatsApp recompresses them); `audio` is a playable clip, or a voice-note bubble with `voiceNote: true` (which needs `audio/ogg; codecs=opus`); `document` is a file card with `fileName`, full quality, for anything else or for an image you want delivered untouched (`"kind": "document"`).
+
+#### `POST /chats/{chatId}/album`
+
+Send two or more images and videos as one album (WhatsApp shows a grid with the first caption under it).
+
+```http
+POST /chats/447700900123@s.whatsapp.net/album
+Content-Type: application/json
+
+{"items": [{"path": "/tmp/front.jpg", "caption": "The house"}, {"path": "/tmp/back.jpg"}, {"path": "/tmp/tour.mp4"}]}
+```
+
+`200 {"chatId", "messageIds": []}`, one id per item, in order. `items` are [`OutboundMediaPayload`](#outboundmediapayload)s with the same file checks as `POST .../media`; at least two, else `400 InvalidRequest`. An item that is not an image or video is `400 OutboundInvalid` and nothing goes out. `quoteMessageId` quotes a message with the album. Not schedulable. Errors: `400 InvalidRequest`, `400 OutboundInvalid`, `404 OutboundFileUnreadable`, `413 OutboundTooLarge`, `404 MessageUnknown`, `503 NotConnected`, `502 SendFailed`.
+
+#### `POST /chats/{chatId}/location`
+
+Send a location pin.
+
+```http
+POST /chats/447700900123@s.whatsapp.net/location
+Content-Type: application/json
+
+{"latitude": 51.5007, "longitude": -0.1246, "name": "Big Ben", "address": "London SW1A 0AA"}
+```
+
+`200 {"chatId", "messageId"}`. `name` and `address` are optional labels on the pin; `quoteMessageId` works as everywhere. Errors: `404 MessageUnknown`, `503 NotConnected`, `502 SendFailed`.
+
+#### `POST /chats/{chatId}/contacts`
+
+Send one or more contact cards. The bridge builds the vCard.
+
+```http
+POST /chats/447700900123@s.whatsapp.net/contacts
+Content-Type: application/json
+
+{"contacts": [{"name": "Dana Levi", "phone": "447700900555"}]}
+```
+
+`200 {"chatId", "messageId"}` (several cards are one message). `phone` is digits with the country code; WhatsApp links the card to that account when it exists. At least one contact, non-empty `name` and `phone`, else `400 InvalidRequest`. Errors: `404 MessageUnknown`, `503 NotConnected`, `502 SendFailed`.
+
+#### `POST /chats/{chatId}/polls`
+
+Send a poll.
+
+```http
+POST /chats/447700900123@s.whatsapp.net/polls
+Content-Type: application/json
+
+{"question": "Lunch?", "options": ["Pizza", "Sushi", "Salad"], "multiple": false}
+```
+
+`200 {"chatId", "messageId"}`. Two to twelve non-empty `options`; `multiple: true` lets a voter pick several. Every vote (and every change of vote) arrives as a [`PollVote`](#events) event carrying the poll's `messageId` and the voter's current selection. Votes on a poll sent before a daemon restart can only be read with history on; without it the vote is logged and dropped. Errors: `404 MessageUnknown`, `503 NotConnected`, `502 SendFailed`.
+
+#### `GET /chats/{chatId}/presence`
+
+The last known presence of a chat, and from now on `PresenceChanged` events for it.
+
+```json
+200 {"chatId":"447700900123@s.whatsapp.net","state":"composing","at":"2026-09-10T10:15:30.000Z"}
+```
+
+`state` is `available`, `unavailable`, `composing`, `recording`, `paused` or `unknown` (nothing heard yet: the subscription was just made, or the person hides presence). `at` is when the bridge heard it; `lastSeenAt` appears when WhatsApp shares it, which most privacy settings prevent. Calling it again is harmless. Errors: `503 NotConnected`.
 
 #### `POST /chats/{chatId}/messages/{messageId}/reactions`
 
@@ -539,6 +613,7 @@ Content-Type: application/json
 | `attachments` | [`OutboundMediaPayload`](#outboundmediapayload)[], optional | Files, sent after the text bubbles, in order. Each may carry its own `caption` and `quoteMessageId`. |
 | `quoteMessageId` | string, optional | Quote this message with the first bubble, unless that bubble carries its own. Unknown ids are dropped with a warning, never a failure. |
 | `replaceProgress` | boolean, optional | Edit the last interim bubble sent through `progress` into the first text bubble instead of sending a new message. Ignored when there is no interim bubble. |
+| `album` | boolean, optional | Send each run of adjacent image and video attachments as one album. Documents and audio still go one by one. `sentMessageIds` keeps one id per item. |
 
 Everything may be omitted: `{}` completes the turn **without sending anything** (the 👀 still clear, `sentMessageIds` is `[]`). Use that when the messages need no answer. Whitespace-only strings are dropped; strings over 4000 characters are split. `sentMessageIds` has one id per bubble and per file, in the order they went out.
 
@@ -600,7 +675,7 @@ Every event is a JSON object with the envelope `{"_tag", "v": 1, "seq", "at"}` p
 | `Ready` | | First frame on every `GET /events` connection; `seq` is the latest real seq. |
 | `Heartbeat` | | Every 25 seconds of silence; `seq` is the latest real seq. |
 | `MessageReceived` | `message` | A message passed the filters and was accepted; 👀 is being applied. Informational: do not answer it, wait for the turn. |
-| `TurnOpened` | `turnId`, `chatId`, `isGroup`, `messages[]`, `supersedes?` | The batch window closed; these messages want one reply. |
+| `TurnOpened` | `turnId`, `chatId`, `isGroup`, `messages[]`, `supersedes?`, `context?` | The batch window closed; these messages want one reply. In groups, `context` is the last 10 messages seen in the chat before these, oldest first, handled or not. |
 | `TurnSuperseded` | `turnId`, `chatId`, `by` | Newer messages arrived mid-turn; stop working on `turnId`. The `TurnOpened` for `by` follows and carries everything. |
 | `TurnCompleted` | `turnId`, `chatId`, `sentMessageIds[]` | The reply went out and the 👀 were cleared. Empty `sentMessageIds` means the turn was completed with nothing to send. |
 | `TurnFailed` | `turnId`, `chatId`, `reason` | No reply could be sent, or the agent abandoned the turn; the eye came off and the failure text went out. |
@@ -613,6 +688,8 @@ Every event is a JSON object with the envelope `{"_tag", "v": 1, "seq", "at"}` p
 | `ScheduledSent` | `scheduledId`, `chatId`, `messageId` | A scheduled send went out. |
 | `ScheduledSkipped` | `scheduledId`, `chatId`, `reason` | A scheduled send was dropped: over an hour late after downtime, or the recipient never came online within 24 hours. |
 | `ScheduledFailed` | `scheduledId`, `chatId`, `reason` | A scheduled send failed at the transport. |
+| `PollVote` | `chatId`, `pollMessageId`, `voterId`, `selected[]` | Someone voted on a poll the bridge sent, or changed their vote. `selected` is the voter's whole current choice (option texts), empty when they retracted. |
+| `PresenceChanged` | `chatId`, `state`, `lastSeenAt?` | Presence changed in a chat asked about through `GET /chats/{chatId}/presence`. `state` as on that endpoint. |
 | `ConnectionChanged` | `state`, `detail?` | The WhatsApp connection changed state; same values as `/health`. |
 
 ```json
@@ -652,6 +729,19 @@ Every event is a JSON object with the envelope `{"_tag", "v": 1, "seq", "at"}` p
 
 {"_tag":"TurnCancelled","v":1,"seq":50,"at":"2026-09-10T10:34:00.000Z","turnId":"turn_0a1b2c3d4e5f60718293",
  "chatId":"447700900123@s.whatsapp.net","reason":"every message was deleted by its sender"}
+
+{"_tag":"PollVote","v":1,"seq":51,"at":"2026-09-10T10:40:00.000Z","chatId":"447700900123@s.whatsapp.net",
+ "pollMessageId":"3EB0D4E5F6A7B8C9D0E1","voterId":"447700900123@s.whatsapp.net","selected":["Sushi"]}
+
+{"_tag":"PresenceChanged","v":1,"seq":52,"at":"2026-09-10T10:41:00.000Z","chatId":"447700900123@s.whatsapp.net","state":"composing"}
+
+{"_tag":"TurnOpened","v":1,"seq":53,"at":"2026-09-10T10:42:00.000Z","turnId":"turn_5e4d3c2b1a0f9e8d7c6b",
+ "chatId":"120363012345678901@g.us","isGroup":true,
+ "context":[{"...":"the ten group messages before the one below, oldest first"}],
+ "messages":[{"chatId":"120363012345678901@g.us","messageId":"3EB0F0E1D2C3B4A59687","senderId":"447700900456@s.whatsapp.net",
+              "senderNumber":"447700900456","senderName":"Sam","isGroup":true,"timestamp":"2026-09-10T10:41:58.000Z",
+              "kind":"text","text":"@447700900999 which one is closer?","hasMedia":false,
+              "mentionedIds":["447700900999@s.whatsapp.net"],"mentionsMe":true}]}
 ```
 
 `TurnFailed.reason` is one of `responder failed: <detail>`, `no reply within <duration>`, `abandoned: <reason>`, `sending failed: <detail>`, `not connected: <detail>`, `crashed: <detail>`.
@@ -678,9 +768,26 @@ One WhatsApp message as Intro sees it, inside `MessageReceived.message`, `TurnOp
 | `hasMedia` | boolean | always | True for `image`, `video`, `audio`, `document`, `sticker`. |
 | `mimetype` | string | when `hasMedia` | As declared by WhatsApp, e.g. `image/jpeg`, `audio/ogg; codecs=opus`, `application/pdf`. |
 | `quotedMessageId` | string | when quoting | The message this one replies to. |
+| `mentionedIds` | string[] | when it @-mentions anyone | Jids mentioned in the text. |
+| `mentionsMe` | boolean | when true | The bridge's own number was mentioned. In groups this is what opened the turn. |
+| `quotesMe` | boolean | when true | The message quotes one the bridge sent. In groups this also opens a turn. |
+| `location` | [`Location`](#location) | when `kind` is `location` | The pin, or the first point of a live location. |
+| `contacts` | [`SharedContact`](#sharedcontact)[] | when `kind` is `contact` | The cards. |
 | `media` | [`MediaFile`](#mediafile) | when downloaded in time | The local file. Present on `TurnOpened` for automatically downloaded kinds whose download finished within `BRIDGE_MEDIA_WAIT`; never on `MessageReceived`. Otherwise fetch it via the media endpoint. |
 
-Messages that never reach Intro: the bridge's own sends, status and broadcast traffic, newsletters, reactions, protocol bookkeeping, group messages when `BRIDGE_GROUPS=false`, senders outside `BRIDGE_ALLOWED_SENDERS`, and messages replayed after downtime that are older than `BRIDGE_OFFLINE_WINDOW`.
+Messages that never reach Intro: the bridge's own sends, status and broadcast traffic, newsletters, reactions, protocol bookkeeping, group messages when `BRIDGE_GROUPS=false`, senders outside `BRIDGE_ALLOWED_SENDERS`, and messages replayed after downtime that are older than `BRIDGE_OFFLINE_WINDOW`. Group messages that neither mention nor quote the bridge reach it only as `context` on a later turn (and in the history).
+
+#### `Location`
+
+`{latitude, longitude, name?, address?, url?, live?}`. `name`, `address` and `url` are the labels WhatsApp attached to a pin; `live: true` marks a live-location share, of which the bridge reports the first point only.
+
+#### `SharedContact`
+
+`{name, phone?, vcard}`. `phone` is the first number on the card, digits only, when there is one; `vcard` is the card as WhatsApp sent it, for anything else on it.
+
+#### `PresenceInfo`
+
+`{chatId, state, at?, lastSeenAt?}`, the body of [`GET /chats/{chatId}/presence`](#get-chatschatidpresence).
 
 #### `MediaFile`
 
@@ -703,6 +810,7 @@ What `GET /turns` and `GET /turns/{turnId}` return.
 | `isGroup` | boolean | always | |
 | `state` | see below | always | |
 | `messages` | `InboundMessage[]` | always | The batch, oldest first. |
+| `context` | `InboundMessage[]` | groups, when there is any | The last 10 messages seen in the group before `messages`, oldest first. |
 | `supersedes` | string | when it replaced a turn | |
 | `supersededBy` | string | when `state` is `superseded` | The turn to answer instead. |
 | `openedAt` | ISO-8601 | always | |
@@ -723,7 +831,7 @@ Transitions: `batching` → `responding` → (`awaiting`) → `committed`, with 
 
 #### `TurnPayload`
 
-What the `http` responder POSTs to `INTRO_HANDLER_URL`. Same fields as `TurnOpened` minus the envelope: `{"v": 1, "turnId", "chatId", "isGroup", "messages": [InboundMessage], "supersedes"?}`.
+What the `http` responder POSTs to `INTRO_HANDLER_URL`. Same fields as `TurnOpened` minus the envelope: `{"v": 1, "turnId", "chatId", "isGroup", "messages": [InboundMessage], "supersedes"?, "context"?}`.
 
 #### `HandlerResponse`
 
@@ -734,6 +842,7 @@ What an `http` handler answers with. All fields optional.
 | `text` | string or null | One bubble. |
 | `replies` | string[] | Several bubbles, in order; sent before `text` when both are present. |
 | `attachments` | [`OutboundMediaPayload`](#outboundmediapayload)[] | Files, sent after the text. An attachment that cannot be read fails the turn (`responder failed: OutboundFileUnreadable: ...`). |
+| `album` | boolean | Adjacent image and video attachments go out as one album. |
 | `async` | boolean | `true`: "I will answer through `POST /turns/{turnId}/reply`"; the turn moves to `awaiting`. |
 
 `{}` completes the turn without sending anything.
@@ -823,7 +932,7 @@ Every error body is `{"_tag": "...", ...fields}`. The status code is fixed per t
 | 500 | `StoreError` | `operation`, `detail` | The database misbehaved. | Check disk space and the log. |
 | 404 | `MediaUnavailable` | `chatId`, `messageId`, `reason` | No media on that message, or not seen this run and nothing on disk. | Say so in the reply rather than pretending the attachment was seen. |
 | 404 | `OutboundFileUnreadable` | `path`, `detail` | The file to send does not exist, is a directory, or is not readable by the daemon. | Check the path (absolute, on the bridge machine). |
-| 400 | `OutboundInvalid` | `detail` | Raw `data` without a `mimetype`, or an empty file. | Fix the payload. |
+| 400 | `OutboundInvalid` | `detail` | Raw `data` without a `mimetype`, an empty file, or an album item that is not an image or video. | Fix the payload. |
 | 413 | `OutboundTooLarge` | `size`, `maxBytes` | The file to send is over `BRIDGE_MEDIA_MAX_BYTES`. | Shrink it, or raise the limit. |
 | 409 | `TurnSuperseded` | `turnId`, `chatId`, `currentTurnId` | The turn was replaced by newer messages. | Answer `currentTurnId`. |
 | 409 | `TurnNotAwaitingReply` | `turnId`, `state` | The turn is not waiting for a reply (`responding`, `committed`, `failed`, `batching`). | Nothing to send. |
@@ -860,7 +969,7 @@ Every error body is `{"_tag": "...", ...fields}`. The status code is fixed per t
 
 `npm run bridge -- <command> [flags]` from the checkout, or `bridge <command>` after `npm run build`. `npm run link`, `npm start`, `npm run harness` and `npm run health` are shortcuts for `link`, `run`, `harness` and `health`. Every command prints `--help`. Global flags: `--log-level <all|trace|debug|info|warn|error|fatal|none>`, `--version`.
 
-The client commands (`health`, `send`, `react`, `unreact`, `media`, `turns`, `reply`) talk to a running daemon at `BRIDGE_URL` (default `http://$BRIDGE_HOST:$BRIDGE_PORT`) and send `BRIDGE_API_TOKEN` when it is set. They print the daemon's JSON answer on stdout, or the error's message on stderr with a non-zero exit code. When the daemon is not listening they fail with `daemon not reachable at <url>: <detail>`.
+The client commands (everything but `link`, `run`, `harness`, `history enable`, `history purge` and `unlink`) talk to a running daemon at `BRIDGE_URL` (default `http://$BRIDGE_HOST:$BRIDGE_PORT`) and send `BRIDGE_API_TOKEN` when it is set. They print the daemon's JSON answer on stdout, or the error's message on stderr with a non-zero exit code. When the daemon is not listening they fail with `daemon not reachable at <url>: <detail>`.
 
 | Command | Flags | Does | Prints |
 |---|---|---|---|
@@ -870,6 +979,9 @@ The client commands (`health`, `send`, `react`, `unreact`, `media`, `turns`, `re
 | `health` | | `GET /status` | The `BridgeStatus`; **exit code 0 only when `state` is `ok`**, 1 otherwise. Unreachable daemon: `{"state":"stopped","detail":"daemon not reachable at ..."}` and exit 1. |
 | `send` | `--to <jid or phone>`, then `--text <text>` or `--file <path>` (with `--caption`, `--as <image\|video\|audio\|document>`), `--quote <messageId>`, `--at <ISO-8601>` with `--when-online` | `POST /chats/{chatId}/messages` or `POST /chats/{chatId}/media`. A phone number in any format is converted to a jid. | `{"chatId","messageId"}`, or the scheduled record |
 | `forward` | `--from <chat>`, `--message <id>`, `--to <chat>` | `POST /chats/{chatId}/forward` | `{"chatId","messageId"}` |
+| `location` | `--to`, `--lat`, `--lng`, `--name`, `--address` | `POST /chats/{chatId}/location` | `{"chatId","messageId"}` |
+| `poll` | `--to`, `--question`, `--option <text>` (repeat, two to twelve), `--multiple` | `POST /chats/{chatId}/polls` | `{"chatId","messageId"}` |
+| `presence` | `--chat` | `GET /chats/{chatId}/presence` | `PresenceInfo` |
 | `contact` | `--jid <jid or phone>` | `GET /contacts/{jid}` | `ContactInfo` |
 | `chats` | | `GET /chats` | `ChatSummary[]` |
 | `messages` | `--chat`, `--q`, `--before`, `--limit` | `GET /chats/{chatId}/messages` | `HistoryRow[]` |
@@ -933,7 +1045,13 @@ Durations on the CLI use the same format as the configuration: `"15 seconds"`, `
 
 **Deduplicate across surfaces.** Every message has `chatId` + `messageId`, every turn has `turnId`; key your own dedupe on them so an ask answered in the app is not answered again on WhatsApp.
 
-**Group chats.** Only when `BRIDGE_GROUPS=true`. `isGroup` is true, `chatId` ends in `@g.us`, `senderId` is the participant. One turn per group chat, same as DMs.
+**Group chats.** Only when `BRIDGE_GROUPS=true`. `isGroup` is true, `chatId` ends in `@g.us`, `senderId` is the participant, `senderName` their push name. A turn opens only when someone @-mentions the bridge (`mentionsMe`) or quotes one of its messages (`quotesMe`); read `context` for what the group was discussing before that, and `GET /chats/{chatId}` for who is in it. If the mention needs no answer, `POST /turns/{turnId}/reply {}`. To address one member in a reply, write `@<digits>` and list their jid in `mentions`. Quote the triggering message (`quoteMessageId`) so the answer reads as a reply in a busy chat.
+
+**Send a place, a card, a vote.** `POST /chats/{chatId}/location {"latitude", "longitude", "name"?}` for a pin; `POST /chats/{chatId}/contacts {"contacts": [{"name", "phone"}]}` for a card the user can save; `POST /chats/{chatId}/polls {"question", "options": [...]}` to ask a multiple-choice question and read the answer from `PollVote` events (`selected` is the voter's current choice, so the last event per voter wins). Inbound, `kind: "location"` and `kind: "contact"` messages carry `location` and `contacts`.
+
+**Several photos.** Put them all in `attachments` and set `"album": true` on the reply, or `POST /chats/{chatId}/album {"items": [...]}`; the user sees one grid instead of a column of bubbles. Mix in a PDF and it goes out as its own bubble.
+
+**Is the user around?** `GET /chats/{chatId}/presence` once; from then on `PresenceChanged` events say when they come online or start typing. Use it to time a nudge, not to answer faster: the bridge already holds the batch window while they type.
 
 ## Configuration
 
@@ -951,6 +1069,7 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 | `INTRO_HANDLER_TIMEOUT` | `120 seconds` | Per handler call |
 | `BRIDGE_BATCH_WINDOW` | `1500 millis` | Batch window per chat |
 | `BRIDGE_BATCH_MAX_WAIT` | `5 seconds` | Upper bound on batching per turn |
+| `BRIDGE_BATCH_TYPING_WAIT` | `15 seconds` | Upper bound on batching while the sender is still typing |
 | `BRIDGE_TURN_TIMEOUT` | `10 minutes` | How long a turn waits for `POST /turns/{id}/reply` |
 | `BRIDGE_SEEN_EMOJI` | `👀` | The seen reaction |
 | `BRIDGE_SEEN_FALLBACK_TEXT` | unset | Text ack if the reaction fails |
@@ -958,6 +1077,7 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 | `BRIDGE_FAILURE_TEXT` | `Something went wrong.` | Quoted reply sent when a turn fails or is abandoned; empty disables |
 | `BRIDGE_TYPING_MAX` | `3 minutes` | How long "typing…" is kept alive per turn, re-armed by progress |
 | `BRIDGE_GROUPS` | `false` | Handle group chats |
+| `BRIDGE_GROUP_TRIGGER` | `mention` | What opens a group turn: `mention` (mentioned or quoted) or `always` (every message) |
 | `BRIDGE_ALLOWED_SENDERS` | unset (anyone) | Comma-separated numbers/jids allowed to talk to the line |
 | `BRIDGE_OFFLINE_WINDOW` | `0 seconds` | Handle messages replayed after downtime that are younger than this |
 | `BRIDGE_TYPING` | `true` | Typing indicator while answering |
@@ -1040,6 +1160,7 @@ The bridge is built so that every failure is either recovered automatically or r
 - Sending by `path` reads any file the daemon's user can read and hands it to WhatsApp. That is the point on Intro's own machine; it is one more reason to keep the API on loopback or behind the token, and to run the daemon as a user with nothing to leak.
 - The bridge makes no calls to OpenAI, xAI or any model provider. Its only outbound connections are WhatsApp's servers, the WhatsApp Web version lookup at startup, and `INTRO_HANDLER_URL` if you configure one.
 - `markOnlineOnConnect` is off so the phone keeps receiving notifications.
+- Presence subscriptions are per chat and only for chats that message the line or that the agent asks about; the bridge reports presence to nobody but the agent.
 
 ## Development
 

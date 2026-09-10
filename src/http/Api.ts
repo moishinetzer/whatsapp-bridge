@@ -16,6 +16,7 @@ import {
   ContactInfo,
   GroupInfo,
   LookupFailed,
+  PresenceInfo,
   MediaDownloadFailed,
   MediaTooLarge,
   MediaUnavailable,
@@ -42,8 +43,37 @@ export const SendTextPayload = Schema.Struct({
   text: Schema.String.pipe(Schema.check(Schema.isNonEmpty())),
   /** Send as a reply to this message (one the bridge saw or sent this run). */
   quoteMessageId: Schema.optionalKey(MessageId),
+  /** Jids to @-mention (groups); write `@<digits>` in the text for each. */
+  mentions: Schema.optionalKey(Schema.Array(Schema.String)),
   ...scheduling,
 })
+export const LocationPayload = Schema.Struct({
+  latitude: Schema.Number,
+  longitude: Schema.Number,
+  name: Schema.optionalKey(Schema.String),
+  address: Schema.optionalKey(Schema.String),
+  quoteMessageId: Schema.optionalKey(MessageId),
+})
+export const ContactsPayload = Schema.Struct({
+  contacts: Schema.Array(Schema.Struct({ name: Schema.String.pipe(Schema.check(Schema.isNonEmpty())), phone: Schema.String.pipe(Schema.check(Schema.isNonEmpty())) })).pipe(
+    Schema.check(Schema.isMinLength(1)),
+  ),
+  quoteMessageId: Schema.optionalKey(MessageId),
+})
+export const PollPayload = Schema.Struct({
+  question: Schema.String.pipe(Schema.check(Schema.isNonEmpty())),
+  /** Two to twelve, as WhatsApp allows. */
+  options: Schema.Array(Schema.String.pipe(Schema.check(Schema.isNonEmpty()))).pipe(Schema.check(Schema.isMinLength(2), Schema.isMaxLength(12))),
+  /** Several options may be picked. Default: one. */
+  multiple: Schema.optionalKey(Schema.Boolean),
+  quoteMessageId: Schema.optionalKey(MessageId),
+})
+export const AlbumPayload = Schema.Struct({
+  /** Images and videos only; anything else is refused. */
+  items: Schema.Array(OutboundMediaPayload).pipe(Schema.check(Schema.isMinLength(2))),
+  quoteMessageId: Schema.optionalKey(MessageId),
+})
+export const SentAlbum = Schema.Struct({ chatId: ChatId, messageIds: Schema.Array(MessageId) })
 export const SendMediaPayload = Schema.Struct({ ...OutboundMediaPayload.fields, ...scheduling }).check(exactlyOneSource)
 export const ForwardPayload = Schema.Struct({ fromChatId: ChatId, messageId: MessageId })
 
@@ -95,6 +125,8 @@ export const ReplyPayload = Schema.Struct({
   quoteMessageId: Schema.optionalKey(MessageId),
   /** Edit the last progress bubble into the first text bubble instead of sending a new message. */
   replaceProgress: Schema.optionalKey(Schema.Boolean),
+  /** Adjacent images and videos in `attachments` go out as one album. */
+  album: Schema.optionalKey(Schema.Boolean),
 })
 export const ReplyResult = Schema.Struct({ turnId: TurnId, sentMessageIds: Schema.Array(MessageId) })
 
@@ -145,6 +177,31 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
     success: SendOutcome,
     error: [NotConnected, SendFailed, MessageUnknown, StoreError],
   }),
+  HttpApiEndpoint.post("sendLocation", "/chats/:chatId/location", {
+    params: chatParams,
+    payload: LocationPayload,
+    success: SentMessage,
+    error: [NotConnected, SendFailed, MessageUnknown],
+  }),
+  HttpApiEndpoint.post("sendContacts", "/chats/:chatId/contacts", {
+    params: chatParams,
+    payload: ContactsPayload,
+    success: SentMessage,
+    error: [NotConnected, SendFailed, MessageUnknown],
+  }),
+  HttpApiEndpoint.post("sendPoll", "/chats/:chatId/polls", {
+    params: chatParams,
+    payload: PollPayload,
+    success: SentMessage,
+    error: [NotConnected, SendFailed, MessageUnknown],
+  }),
+  HttpApiEndpoint.post("sendAlbum", "/chats/:chatId/album", {
+    params: chatParams,
+    payload: AlbumPayload,
+    success: SentAlbum,
+    error: [NotConnected, SendFailed, MessageUnknown, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge],
+  }),
+  HttpApiEndpoint.get("presence", "/chats/:chatId/presence", { params: chatParams, success: PresenceInfo, error: NotConnected }),
   HttpApiEndpoint.post("forward", "/chats/:chatId/forward", {
     params: chatParams,
     payload: ForwardPayload,

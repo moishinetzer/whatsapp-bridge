@@ -2,7 +2,11 @@ import makeWASocket, {
   type AnyMessageContent,
   Browsers,
   DisconnectReason,
+  decryptPollVote,
   downloadMediaMessage,
+  getAggregateVotesInPollMessage,
+  getKeyAuthor,
+  jidNormalizedUser,
   extensionForMediaMessage,
   fetchLatestBaileysVersion,
   generateMessageIDV2,
@@ -49,9 +53,12 @@ import {
   SendFailed,
   WhatsApp,
   type ContactInfo,
+  type ContactInput,
   type DownloadedMedia,
   type GroupInfo,
   type InboundUpdate,
+  type LocationInput,
+  type PollInput,
   type PresenceInfo,
   type PresenceState,
   type SendOptions,
@@ -221,6 +228,11 @@ export const BaileysLive = (options: BaileysOptions) =>
       const receiptSeen = yield* Cache.make<string, true>({ capacity: 20_000, lookup: () => Effect.succeed(true) })
       const presences = yield* Ref.make(new Map<string, PresenceInfo>())
       const presenceSubscribed = yield* Ref.make(new Set<string>())
+      const presenceWatched = yield* Ref.make(new Set<string>())
+      const presenceUpdates = yield* Queue.unbounded<PresenceInfo>()
+      const observed = yield* Queue.unbounded<InboundMessage>()
+      /** Our own jids (phone and lid forms), normalised, to spot mentions of the bridge. */
+      const meJids = yield* Ref.make(new Set<string>())
       const groupCache = yield* Cache.make<string, GroupInfo, LookupFailed | NotConnected>({
         capacity: 500,
         timeToLive: "5 minutes",
@@ -259,12 +271,66 @@ export const BaileysLive = (options: BaileysOptions) =>
           ),
         )
 
+      /** A vote on a poll the bridge sent: decrypted with the poll's secret, reported as the voter's full selection. */
+      const acceptPollVote = (raw: WAMessage, update: proto.Message.IPollUpdateMessage) =>
+        Effect.gen(function* () {
+          const creationKey = update.pollCreationMessageKey ?? undefined
+          const pollId = creationKey?.id ?? undefined
+          const chat = raw.key.remoteJid ?? undefined
+          if (!creationKey || !pollId || !chat || !update.vote) return
+          const chatId = ChatId.make(chat)
+          const poll = yield* rawFor(chatId, MessageId.make(pollId)).pipe(Effect.option)
+          if (Option.isNone(poll)) return yield* Effect.logDebug("vote on a poll the bridge does not know").pipe(Effect.annotateLogs({ chatId, pollId }))
+          const pollEncKey = poll.value.message?.messageContextInfo?.messageSecret ?? undefined
+          const sock = yield* Ref.get(socket)
+          if (!pollEncKey || Option.isNone(sock)) return
+          const meId = jidNormalizedUser(sock.value.user?.id)
+          const pollCreatorJid = getKeyAuthor(creationKey, meId)
+          const voterJid = getKeyAuthor(raw.key, meId)
+          const decoded = yield* Effect.try({
+            try: () => decryptPollVote(update.vote as proto.Message.IPollEncValue, { pollCreatorJid, pollMsgId: pollId, pollEncKey, voterJid }),
+            catch: (e) => e,
+          }).pipe(Effect.option)
+          if (Option.isNone(decoded)) return yield* Effect.logWarning("could not decrypt a poll vote").pipe(Effect.annotateLogs({ chatId, pollId }))
+          const senderTimestampMs = toNumber(update.senderTimestampMs) ?? Date.now()
+          const aggregate = getAggregateVotesInPollMessage(
+            {
+              ...(poll.value.message ? { message: poll.value.message } : {}),
+              pollUpdates: [{ pollUpdateMessageKey: raw.key, vote: decoded.value, senderTimestampMs }],
+            },
+            meId,
+          )
+          const selected = aggregate.filter((a) => a.voters.includes(voterJid)).map((a) => a.name)
+          yield* Effect.logInfo("poll vote").pipe(Effect.annotateLogs({ chatId, pollId, voter: voterJid, selected: selected.length }))
+          yield* events.publish({ _tag: "PollVote", chatId, pollMessageId: MessageId.make(pollId), voterId: voterJid, selected })
+        })
+
+      const mentionsMe = (mentioned: ReadonlyArray<string> | undefined) =>
+        Effect.map(Ref.get(meJids), (me) => (mentioned ?? []).some((jid) => me.has(jidNormalizedUser(jid))))
+
+      const quotesMe = (chatId: ChatId, quoted: MessageId | undefined) =>
+        quoted === undefined
+          ? Effect.succeed(false)
+          : Effect.gen(function* () {
+              const cached = yield* Cache.getOption(outbox, quoted)
+              if (Option.isSome(cached)) return true
+              const persisted = yield* store.sent(quoted).pipe(Effect.orElseSucceed(() => Option.none<SentEntry>()))
+              return Option.isSome(persisted) && persisted.value.chatId === chatId
+            })
+
       const acceptMessage = (raw: WAMessage, type: "append" | "notify") =>
         Effect.gen(function* () {
           const now = yield* DateTime.now
+          const pollUpdate = raw.key.fromMe ? undefined : normalizeMessageContent(raw.message)?.pollUpdateMessage
+          if (pollUpdate) return yield* acceptPollVote(raw, pollUpdate)
           const extracted = yield* decode(raw, now)
           if (Option.isNone(extracted)) return
-          const { message } = extracted.value
+          const base = extracted.value.message
+          const message: InboundMessage = {
+            ...base,
+            ...((yield* mentionsMe(base.mentionedIds)) ? { mentionsMe: true } : {}),
+            ...((yield* quotesMe(base.chatId, base.quotedMessageId)) ? { quotesMe: true } : {}),
+          }
           const log = Effect.annotateLogs({ chatId: message.chatId, messageId: message.messageId, type })
 
           if (type === "append") {
@@ -292,6 +358,12 @@ export const BaileysLive = (options: BaileysOptions) =>
           if (message.hasMedia) yield* Cache.set(rawMedia, id, { raw, message })
           if (raw.pushName) yield* Cache.set(pushNames, message.senderId, raw.pushName)
           yield* store.recordInbound(message, encodeRaw(raw)).pipe(Effect.catch((e) => Effect.logWarning("history write failed").pipe(Effect.annotateLogs({ reason: e.message }))))
+          // Group messages that neither mention nor quote the bridge are context, not work.
+          if (message.isGroup && config.groupTrigger === "mention" && message.mentionsMe !== true && message.quotesMe !== true) {
+            yield* Effect.logDebug("group message observed, not addressed to the bridge").pipe(log)
+            yield* Queue.offer(observed, message)
+            return
+          }
           yield* health.touch("inbound")
           yield* Effect.logInfo("inbound message").pipe(log, Effect.annotateLogs({ kind: message.kind, isGroup: message.isGroup }))
           if (config.logBodies) yield* Effect.logDebug("inbound body").pipe(log, Effect.annotateLogs({ text: message.text }))
@@ -397,6 +469,10 @@ export const BaileysLive = (options: BaileysOptions) =>
             }
             // DMs report the contact under its own jid; groups report participants, the latest wins for the chat.
             yield* Ref.update(presences, (m) => new Map(m).set(id, info))
+            yield* Queue.offer(presenceUpdates, info)
+            if ((yield* Ref.get(presenceWatched)).has(id)) {
+              yield* events.publish({ _tag: "PresenceChanged", chatId, state, ...(info.lastSeenAt === undefined ? {} : { lastSeenAt: info.lastSeenAt }) })
+            }
             yield* Effect.logDebug("presence").pipe(Effect.annotateLogs({ chatId, participant, state }))
           }
         })
@@ -517,6 +593,7 @@ export const BaileysLive = (options: BaileysOptions) =>
                 jid: me?.id ?? "unknown",
                 ...(me?.name ? { name: me.name } : {}),
               }
+              yield* Ref.set(meJids, new Set([me?.id, me?.lid].filter((j): j is string => typeof j === "string").map(jidNormalizedUser)))
               yield* health.setLinked(identity)
               yield* health.setState("ok")
               yield* events.publish({ _tag: "ConnectionChanged", state: "ok" })
@@ -765,7 +842,11 @@ export const BaileysLive = (options: BaileysOptions) =>
       const sendText = Effect.fn("WhatsApp.sendText")(function* (chatId: ChatId, text: string, options?: SendOptions) {
         const quote = yield* quoteFor(chatId, options)
         const sent = yield* withSocket("sendText", chatId, (s) =>
-          s.sendMessage(chatId, { text }, { ...quote, ...(options?.messageId === undefined ? {} : { messageId: options.messageId }) }),
+          s.sendMessage(
+            chatId,
+            { text, ...(options?.mentions && options.mentions.length > 0 ? { mentions: [...options.mentions] } : {}) },
+            { ...quote, ...(options?.messageId === undefined ? {} : { messageId: options.messageId }) },
+          ),
         )
         const id = sent?.key?.id
         if (!id) return yield* new SendFailed({ operation: "sendText", chatId, detail: "WhatsApp returned no message id" })
@@ -941,6 +1022,98 @@ export const BaileysLive = (options: BaileysOptions) =>
         return known ?? { chatId, state: "unknown" as const }
       })
 
+      const vcardOf = (c: ContactInput): string => {
+        const digits = c.phone.replace(/[^0-9]/g, "")
+        return `BEGIN:VCARD\nVERSION:3.0\nFN:${c.name}\nTEL;type=CELL;type=VOICE;waid=${digits}:+${digits}\nEND:VCARD`
+      }
+
+      /** Shared tail of the simple senders: remember, record, log. */
+      const finishSend = (
+        sent: WAMessage | undefined,
+        chatId: ChatId,
+        operation: string,
+        details: { readonly kind: "text" | "image" | "video" | "audio" | "document" | "other"; readonly text?: string | undefined; readonly mimetype?: string | undefined },
+        options: SendOptions | undefined,
+      ) =>
+        Effect.gen(function* () {
+          const id = sent?.key?.id
+          if (!sent || !id) return yield* new SendFailed({ operation, chatId, detail: "WhatsApp returned no message id" })
+          yield* remember(sent, options?.turnId)
+          yield* recordOutbound(sent, details, options)
+          yield* health.touch("outbound")
+          yield* Effect.logInfo(`sent ${operation}`).pipe(Effect.annotateLogs({ chatId, messageId: id }))
+          return id as MessageId
+        })
+
+      const sendLocation = Effect.fn("WhatsApp.sendLocation")(function* (chatId: ChatId, location: LocationInput, options?: SendOptions) {
+        const quote = yield* quoteFor(chatId, options)
+        const sent = yield* withSocket("location", chatId, (s) =>
+          s.sendMessage(
+            chatId,
+            {
+              location: {
+                degreesLatitude: location.latitude,
+                degreesLongitude: location.longitude,
+                ...(location.name ? { name: location.name } : {}),
+                ...(location.address ? { address: location.address } : {}),
+              },
+            },
+            { ...quote, ...(options?.messageId === undefined ? {} : { messageId: options.messageId }) },
+          ),
+        )
+        return yield* finishSend(sent, chatId, "location", { kind: "other", text: location.name ?? location.address }, options)
+      })
+
+      const sendContacts = Effect.fn("WhatsApp.sendContacts")(function* (chatId: ChatId, contacts: ReadonlyArray<ContactInput>, options?: SendOptions) {
+        const quote = yield* quoteFor(chatId, options)
+        const sent = yield* withSocket("contacts", chatId, (s) =>
+          s.sendMessage(
+            chatId,
+            { contacts: { displayName: contacts.map((c) => c.name).join(", "), contacts: contacts.map((c) => ({ displayName: c.name, vcard: vcardOf(c) })) } },
+            { ...quote, ...(options?.messageId === undefined ? {} : { messageId: options.messageId }) },
+          ),
+        )
+        return yield* finishSend(sent, chatId, "contacts", { kind: "other", text: contacts.map((c) => c.name).join(", ") }, options)
+      })
+
+      const sendPoll = Effect.fn("WhatsApp.sendPoll")(function* (chatId: ChatId, poll: PollInput, options?: SendOptions) {
+        const quote = yield* quoteFor(chatId, options)
+        const sent = yield* withSocket("poll", chatId, (s) =>
+          s.sendMessage(
+            chatId,
+            { poll: { name: poll.question, values: [...poll.options], selectableCount: poll.multiple ? 0 : 1 } },
+            { ...quote, ...(options?.messageId === undefined ? {} : { messageId: options.messageId }) },
+          ),
+        )
+        return yield* finishSend(sent, chatId, "poll", { kind: "other", text: poll.question }, options)
+      })
+
+      const sendAlbum = Effect.fn("WhatsApp.sendAlbum")(function* (chatId: ChatId, items: ReadonlyArray<OutboundMedia>, options?: SendOptions) {
+        const quote = yield* quoteFor(chatId, options)
+        const images = items.filter((i) => i.kind === "image").length
+        const videos = items.filter((i) => i.kind === "video").length
+        const parent = yield* withSocket("album", chatId, (s) =>
+          s.sendMessage(chatId, { album: { expectedImageCount: images, expectedVideoCount: videos } }, quote),
+        )
+        if (!parent?.key) return yield* new SendFailed({ operation: "album", chatId, detail: "WhatsApp returned no album" })
+        const ids: Array<MessageId> = []
+        for (const item of items) {
+          const sent = yield* withSocket(
+            `album ${item.kind}`,
+            chatId,
+            (s) => s.sendMessage(chatId, { ...mediaContent(item), albumParentKey: parent.key }, { mediaUploadTimeoutMs: Duration.toMillis(MEDIA_SEND_TIMEOUT) }),
+            MEDIA_SEND_TIMEOUT,
+          )
+          ids.push(yield* finishSend(sent, chatId, `album ${item.kind}`, { kind: item.kind, text: item.caption, mimetype: item.mimetype }, options))
+        }
+        return ids
+      })
+
+      const watchPresence = Effect.fn("WhatsApp.watchPresence")(function* (chatId: ChatId) {
+        yield* Ref.update(presenceWatched, (s) => new Set(s).add(chatId))
+        return yield* presence(chatId)
+      })
+
       const markRead = Effect.fn("WhatsApp.markRead")(function* (chatId: ChatId, messageIds: ReadonlyArray<MessageId>) {
         const keys: Array<WAMessageKey> = []
         for (const messageId of messageIds) {
@@ -1014,6 +1187,13 @@ export const BaileysLive = (options: BaileysOptions) =>
         contact,
         groupInfo,
         presence,
+        watchPresence,
+        presenceUpdates: Stream.fromQueue(presenceUpdates),
+        observed: Stream.fromQueue(observed),
+        sendLocation,
+        sendContacts,
+        sendPoll,
+        sendAlbum,
         react,
         unreact,
         setTyping,
