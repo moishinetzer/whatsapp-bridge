@@ -15,6 +15,10 @@ export class ConfigInvalid extends Schema.TaggedError<ConfigInvalid>()("ConfigIn
 export interface BridgeConfigShape {
   readonly dataDir: string
   readonly authDir: string
+  /** The one SQLite file: bridge state always, message history when enabled. `:memory:` in tests. */
+  readonly databasePath: string
+  /** Record every message in and out (opt-in, needs `bridge history enable`). */
+  readonly history: boolean
   readonly host: string
   readonly port: number
   readonly apiToken: Option.Option<Redacted.Redacted<string>>
@@ -48,8 +52,10 @@ export interface BridgeConfigShape {
   readonly mediaMaxBytes: number
   /** How long a turn waits for an automatic download before opening without it. */
   readonly mediaWait: Duration.Duration
-  /** Downloaded files older than this are deleted by the sweep. */
-  readonly mediaRetention: Duration.Duration
+  /** Disk budget for downloaded files; least recently used are evicted past it. */
+  readonly mediaMaxDisk: number
+  /** Optional maximum age for downloaded files, on top of the budget. */
+  readonly mediaRetention: Option.Option<Duration.Duration>
   /** How often the retention sweep runs. */
   readonly mediaSweepEvery: Duration.Duration
   /** Harness only: how long the pong responder pretends to think. */
@@ -75,6 +81,8 @@ const knob = <A>(variable: string, config: Config.Config<A>): Knob<A> => ({ vari
 /** Every knob with the environment variable it reads, so a failure can be blamed on a name. */
 const knobs = {
   dataDir: knob("BRIDGE_DATA_DIR", Config.string("BRIDGE_DATA_DIR").pipe(Config.withDefault("./data"))),
+  databasePath: knob("BRIDGE_DATABASE_PATH", Config.option(Config.string("BRIDGE_DATABASE_PATH"))),
+  history: knob("BRIDGE_HISTORY", Config.boolean("BRIDGE_HISTORY").pipe(Config.withDefault(false))),
   host: knob("BRIDGE_HOST", Config.string("BRIDGE_HOST").pipe(Config.withDefault("127.0.0.1"))),
   port: knob("BRIDGE_PORT", Config.port("BRIDGE_PORT").pipe(Config.withDefault(8787))),
   apiToken: knob("BRIDGE_API_TOKEN", Config.option(Config.redacted("BRIDGE_API_TOKEN"))),
@@ -112,7 +120,8 @@ const knobs = {
   mediaAuto: knob("BRIDGE_MEDIA_AUTO", Config.literals(["images", "all", "none"], "BRIDGE_MEDIA_AUTO").pipe(Config.withDefault("images"))),
   mediaMaxBytes: knob("BRIDGE_MEDIA_MAX_BYTES", Config.int("BRIDGE_MEDIA_MAX_BYTES").pipe(Config.withDefault(25 * 1024 * 1024))),
   mediaWait: knob("BRIDGE_MEDIA_WAIT", Config.duration("BRIDGE_MEDIA_WAIT").pipe(Config.withDefault(Duration.seconds(8)))),
-  mediaRetention: knob("BRIDGE_MEDIA_RETENTION", Config.duration("BRIDGE_MEDIA_RETENTION").pipe(Config.withDefault(Duration.days(7)))),
+  mediaMaxDisk: knob("BRIDGE_MEDIA_MAX_DISK", Config.int("BRIDGE_MEDIA_MAX_DISK").pipe(Config.withDefault(1024 * 1024 * 1024))),
+  mediaRetention: knob("BRIDGE_MEDIA_RETENTION", Config.option(Config.duration("BRIDGE_MEDIA_RETENTION"))),
   mediaSweepEvery: knob("BRIDGE_MEDIA_SWEEP_EVERY", Config.duration("BRIDGE_MEDIA_SWEEP_EVERY").pipe(Config.withDefault(Duration.hours(1)))),
   harnessSlow: knob("BRIDGE_HARNESS_SLOW", Config.duration("BRIDGE_HARNESS_SLOW").pipe(Config.withDefault(Duration.zero))),
 }
@@ -129,6 +138,7 @@ export const bridgeConfig: Config.Config<BridgeConfigShape> = Config.all(configs
     return {
       ...c,
       authDir: `${dataDir}/auth`,
+      databasePath: Option.getOrElse(c.databasePath, () => `${dataDir}/bridge.db`),
       mediaDir: Option.getOrElse(c.mediaDir, () => `${dataDir}/media`),
     }
   }),

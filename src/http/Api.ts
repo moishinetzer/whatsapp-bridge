@@ -7,9 +7,23 @@ import { MediaFile } from "../domain/message.ts"
 import { BridgeStatus } from "../domain/status.ts"
 import { MediaStoreError } from "../engine/Media.ts"
 import { OutboundFileUnreadable, OutboundInvalid, OutboundTooLarge } from "../engine/Outbound.ts"
-import { OutboundMediaPayload, ReplyItem } from "../domain/outbound.ts"
+import { OutboundMediaPayload, ReplyItem, exactlyOneSource } from "../domain/outbound.ts"
+import { ChatSummary, HistoryRow } from "../domain/history.ts"
+import { HistoryDisabled, StoreError } from "../store/Store.ts"
+import { ScheduledNotFound, ScheduledSend } from "../store/Scheduled.ts"
 import { TurnFailedError, TurnNotAwaitingReply, TurnNotFound, TurnNotOpen, TurnSummary, TurnSuperseded } from "../engine/Turns.ts"
-import { MediaDownloadFailed, MediaTooLarge, MediaUnavailable, MessageTooOld, MessageUnknown, NotConnected, SendFailed } from "../whatsapp/WhatsApp.ts"
+import {
+  ContactInfo,
+  GroupInfo,
+  LookupFailed,
+  MediaDownloadFailed,
+  MediaTooLarge,
+  MediaUnavailable,
+  MessageTooOld,
+  MessageUnknown,
+  NotConnected,
+  SendFailed,
+} from "../whatsapp/WhatsApp.ts"
 
 /** `GET /health` answers 503 with the same body when the bridge is not `ok`. */
 export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", { status: BridgeStatus }, { httpApiStatus: 503 }) {
@@ -18,13 +32,57 @@ export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", { st
   }
 }
 
+/** Hold the send until this instant; with `deliverWhenOnline`, until the recipient is online too (24 hours at most). */
+const scheduling = {
+  sendAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
+  deliverWhenOnline: Schema.optionalKey(Schema.Boolean),
+}
+
 export const SendTextPayload = Schema.Struct({
   text: Schema.String.pipe(Schema.check(Schema.isNonEmpty())),
   /** Send as a reply to this message (one the bridge saw or sent this run). */
   quoteMessageId: Schema.optionalKey(MessageId),
+  ...scheduling,
+})
+export const SendMediaPayload = Schema.Struct({ ...OutboundMediaPayload.fields, ...scheduling }).check(exactlyOneSource)
+export const ForwardPayload = Schema.Struct({ fromChatId: ChatId, messageId: MessageId })
+
+/** A send the bridge is holding; answered instead of `SentMessage` when `sendAt` was given. */
+export const ScheduledAccepted = Schema.Struct({
+  scheduledId: Schema.String,
+  sendAt: Schema.DateTimeUtcFromString,
+  deliverWhenOnline: Schema.Boolean,
+}).annotate({ httpApiStatus: 202 })
+
+export const HistoryQuery = Schema.Struct({
+  /** Only messages older than this one. */
+  before: Schema.optionalKey(MessageId),
+  /** Only messages newer than this instant. */
+  since: Schema.optionalKey(Schema.DateTimeUtcFromString),
+  /** Page size, 50 by default, 500 at most. */
+  limit: Schema.optionalKey(Schema.NumberFromString.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1)))),
+  /** Full-text search: words become prefix terms, a quoted string one phrase. */
+  q: Schema.optionalKey(Schema.String),
+})
+export const SearchQuery = Schema.Struct({
+  q: Schema.String.pipe(Schema.check(Schema.isNonEmpty())),
+  before: Schema.optionalKey(MessageId),
+  limit: Schema.optionalKey(Schema.NumberFromString.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1)))),
+})
+
+/** `GET /chats/{chatId}`: what the bridge knows about one chat. */
+export const ChatInfo = Schema.Struct({
+  chatId: ChatId,
+  isGroup: Schema.Boolean,
+  name: Schema.optionalKey(Schema.String),
+  lastMessageAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
+  messageCount: Schema.optionalKey(Schema.Number),
+  group: Schema.optionalKey(GroupInfo),
 })
 export const EditPayload = Schema.Struct({ text: Schema.String.pipe(Schema.check(Schema.isNonEmpty())) })
 export const SentMessage = Schema.Struct({ chatId: ChatId, messageId: MessageId })
+/** Two answers: `200 SentMessage` now, or `202 ScheduledAccepted` when `sendAt` was given. */
+export const SendOutcome = [SentMessage, ScheduledAccepted] as const
 export const ReactionPayload = Schema.Struct({ emoji: Schema.String.pipe(Schema.check(Schema.isNonEmpty())) })
 export const TypingPayload = Schema.Struct({ composing: Schema.Boolean })
 export const ReplyPayload = Schema.Struct({
@@ -84,6 +142,12 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
   HttpApiEndpoint.post("send", "/chats/:chatId/messages", {
     params: chatParams,
     payload: SendTextPayload,
+    success: SendOutcome,
+    error: [NotConnected, SendFailed, MessageUnknown, StoreError],
+  }),
+  HttpApiEndpoint.post("forward", "/chats/:chatId/forward", {
+    params: chatParams,
+    payload: ForwardPayload,
     success: SentMessage,
     error: [NotConnected, SendFailed, MessageUnknown],
   }),
@@ -98,9 +162,9 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
   }),
   HttpApiEndpoint.post("sendMedia", "/chats/:chatId/media", {
     params: chatParams,
-    payload: OutboundMediaPayload,
-    success: SentMessage,
-    error: [NotConnected, SendFailed, MessageUnknown, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge],
+    payload: SendMediaPayload,
+    success: SendOutcome,
+    error: [NotConnected, SendFailed, MessageUnknown, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge, StoreError],
   }),
   HttpApiEndpoint.post("react", "/chats/:chatId/messages/:messageId/reactions", {
     params: messageParams,
@@ -126,6 +190,24 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
     success: HttpApiSchema.StreamUint8Array({ contentType: "application/octet-stream" }),
     error: [MediaUnavailable, MediaTooLarge, MediaDownloadFailed, MediaStoreError],
   }),
+)
+
+export const HistoryGroup = HttpApiGroup.make("history").add(
+  HttpApiEndpoint.get("chats", "/chats", { success: Schema.Array(ChatSummary), error: [HistoryDisabled, StoreError] }),
+  HttpApiEndpoint.get("chat", "/chats/:chatId", { params: chatParams, success: ChatInfo, error: [StoreError, NotConnected, LookupFailed] }),
+  HttpApiEndpoint.get("chatMessages", "/chats/:chatId/messages", {
+    params: chatParams,
+    query: HistoryQuery,
+    success: Schema.Array(HistoryRow),
+    error: [HistoryDisabled, StoreError],
+  }),
+  HttpApiEndpoint.get("search", "/messages", { query: SearchQuery, success: Schema.Array(HistoryRow), error: [HistoryDisabled, StoreError] }),
+  HttpApiEndpoint.get("contact", "/contacts/:jid", { params: { jid: Schema.String }, success: ContactInfo, error: [NotConnected, LookupFailed] }),
+)
+
+export const ScheduledGroup = HttpApiGroup.make("scheduled").add(
+  HttpApiEndpoint.get("list", "/scheduled", { success: Schema.Array(ScheduledSend), error: StoreError }),
+  HttpApiEndpoint.delete("cancel", "/scheduled/:scheduledId", { params: { scheduledId: Schema.String }, error: [ScheduledNotFound, StoreError] }),
 )
 
 export const TurnsGroup = HttpApiGroup.make("turns").add(
@@ -156,7 +238,7 @@ export const TurnsGroup = HttpApiGroup.make("turns").add(
  * `/docs` are generated from the same definition.
  */
 export const BridgeApi = HttpApi.make("whatsapp-bridge")
-  .add(HealthGroup, EventsGroup, ChatsGroup, TurnsGroup)
+  .add(HealthGroup, EventsGroup, ChatsGroup, HistoryGroup, ScheduledGroup, TurnsGroup)
   .annotateMerge(
     OpenApi.annotations({
       title: "whatsapp-bridge",

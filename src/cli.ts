@@ -1,10 +1,11 @@
 import { NodeServices } from "@effect/platform-node"
-import { Console, Context, Duration, Effect, Layer, Option, Schema, Stream } from "effect"
-import { Command, Flag } from "effect/unstable/cli"
+import { Console, Context, DateTime, Duration, Effect, FileSystem, Layer, Option, Path, Schema, Stream } from "effect"
+import { Command, Flag, Prompt } from "effect/unstable/cli"
 import { HttpClientError } from "effect/unstable/http"
-import { AmbientLive, EnvLive, coreLayer, daemonLayer, linkLayer } from "./app.ts"
-import { bridgeUrl } from "./config.ts"
+import { AmbientLive, EnvLive, acceptanceFile, coreLayer, daemonLayer, linkLayer } from "./app.ts"
+import { BridgeConfig, BridgeConfigLive, bridgeUrl } from "./config.ts"
 import { MessageId, TurnId, toChatId } from "./domain/ids.ts"
+import { Store, StoreWithDatabaseLive } from "./store/Store.ts"
 import { OutboundKind, type OutboundMediaPayload } from "./domain/outbound.ts"
 import { Events } from "./engine/Events.ts"
 import { bridgeClient } from "./http/Client.ts"
@@ -176,20 +177,134 @@ const send = Command.make(
     text: Flag.string("text").pipe(Flag.optional, Flag.withDescription("The message; with --file, use --caption instead")),
     ...fileFlags,
     quote: quoteFlag,
+    at: Flag.string("at").pipe(
+      Flag.withSchema(Schema.DateTimeUtcFromString),
+      Flag.optional,
+      Flag.withDescription("Hold the send until this instant (ISO-8601), e.g. 2026-09-11T08:00:00Z"),
+    ),
+    whenOnline: Flag.boolean("when-online").pipe(Flag.withDescription("With --at: also wait until the recipient is online (24 hours at most)")),
   },
-  ({ to, text, file, caption, as, quote }) =>
+  ({ to, text, file, caption, as, quote, at, whenOnline }) =>
     Effect.gen(function* () {
       const chatId = toChatId(to)
+      const scheduling = Option.isSome(at) ? { sendAt: at.value, deliverWhenOnline: whenOnline } : {}
       if (Option.isSome(file)) {
-        return yield* withClient((client) => client.chats.sendMedia({ params: { chatId }, payload: attachment(file.value, caption, as, quote) }))
+        return yield* withClient((client) =>
+          client.chats.sendMedia({ params: { chatId }, payload: { ...attachment(file.value, caption, as, quote), ...scheduling } }),
+        )
       }
       if (Option.isSome(text)) {
-        const payload = { text: text.value, ...(Option.isSome(quote) ? { quoteMessageId: MessageId.make(quote.value) } : {}) }
+        const payload = { text: text.value, ...(Option.isSome(quote) ? { quoteMessageId: MessageId.make(quote.value) } : {}), ...scheduling }
         return yield* withClient((client) => client.chats.send({ params: { chatId }, payload }))
       }
       return yield* new NothingToSend({ hint: "pass --text or --file" })
     }).pipe(Effect.flatMap(json)),
-).pipe(Command.withDescription("Send a text message or a file to a chat"))
+).pipe(Command.withDescription("Send a text message or a file to a chat, now or at a given time"))
+
+const forward = Command.make(
+  "forward",
+  {
+    from: Flag.string("from").pipe(Flag.withDescription("Chat the message is in")),
+    message: Flag.string("message").pipe(Flag.withDescription("The message id")),
+    to: Flag.string("to").pipe(Flag.withDescription("Chat jid or phone number to forward to")),
+  },
+  ({ from, message, to }) =>
+    withClient((client) =>
+      client.chats.forward({ params: { chatId: toChatId(to) }, payload: { fromChatId: toChatId(from), messageId: MessageId.make(message) } }),
+    ).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Forward a message the bridge saw or sent to another chat"))
+
+const contact = Command.make(
+  "contact",
+  { jid: Flag.string("jid").pipe(Flag.withDescription("A jid or a phone number with country code")) },
+  ({ jid }) => withClient((client) => client.history.contact({ params: { jid: jid.includes("@") ? jid : toChatId(jid) } })).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Look a contact up: push name, phone, picture URL, whether the number is on WhatsApp"))
+
+const chats = Command.make("chats", {}, () => withClient((client) => client.history.chats()).pipe(Effect.flatMap(json))).pipe(
+  Command.withDescription("List the chats in the history (needs BRIDGE_HISTORY)"),
+)
+
+const messages = Command.make(
+  "messages",
+  {
+    chat: Flag.string("chat"),
+    q: Flag.string("q").pipe(Flag.optional, Flag.withDescription("Full-text search within the chat")),
+    before: Flag.string("before").pipe(Flag.optional, Flag.withDescription("Page back from this message id")),
+    limit: Flag.integer("limit").pipe(Flag.withDefault(50)),
+  },
+  ({ chat, q, before, limit }) =>
+    withClient((client) =>
+      client.history.chatMessages({
+        params: { chatId: toChatId(chat) },
+        query: { limit, ...(Option.isSome(q) ? { q: q.value } : {}), ...(Option.isSome(before) ? { before: MessageId.make(before.value) } : {}) },
+      }),
+    ).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Show a chat's history, newest first (needs BRIDGE_HISTORY)"))
+
+const search = Command.make(
+  "search",
+  { q: Flag.string("q"), limit: Flag.integer("limit").pipe(Flag.withDefault(50)) },
+  ({ q, limit }) => withClient((client) => client.history.search({ query: { q, limit } })).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Full-text search across every chat (needs BRIDGE_HISTORY)"))
+
+const scheduled = Command.make("scheduled", {}, () => withClient((client) => client.scheduled.list()).pipe(Effect.flatMap(json))).pipe(
+  Command.withDescription("List scheduled sends: pending ones and those closed in the last day"),
+)
+
+const unschedule = Command.make("unschedule", { id: Flag.string("id") }, ({ id }) =>
+  withClient((client) => client.scheduled.cancel({ params: { scheduledId: id } })).pipe(Effect.andThen(json({ ok: true }))),
+).pipe(Command.withDescription("Cancel a pending scheduled send"))
+
+const ACCEPTANCE = `History records every message this number sends and receives, in both directions:
+the text, captions, edits, deletions (as tombstones), reactions, delivery state, the path of
+downloaded attachments, and the raw message so replies and forwards work after a restart.
+It is kept indefinitely, in plain text, in the bridge's SQLite file, and searchable by anyone
+who can read that file or reach the API. Delete with \`bridge history purge\`.`
+
+const historyEnable = Command.make(
+  "enable",
+  { yes: Flag.boolean("yes").pipe(Flag.withDescription("Accept without the prompt (for scripts)")) },
+  ({ yes }) =>
+    Effect.gen(function* () {
+      const config = yield* BridgeConfig
+      const fs = yield* FileSystem.FileSystem
+      const path = yield* Path.Path
+      const file = path.resolve(acceptanceFile(config.dataDir))
+      yield* Console.log(ACCEPTANCE)
+      const accepted = yes ? true : yield* Prompt.run(Prompt.confirm({ message: "Record message history on this machine?", initial: false }))
+      if (!accepted) return yield* Console.log("Not enabled. Nothing was written.")
+      yield* fs.makeDirectory(path.dirname(file), { recursive: true, mode: 0o700 }).pipe(Effect.ignore)
+      yield* fs.writeFileString(file, `${DateTime.formatIso(yield* DateTime.now)}\n`, { mode: 0o600 })
+      yield* Console.log(`Accepted: ${file}`)
+      yield* Console.log(config.history ? "BRIDGE_HISTORY is on; restart the daemon." : "Now set BRIDGE_HISTORY=true and restart the daemon.")
+    }).pipe(Effect.provide(Layer.mergeAll(BridgeConfigLive().pipe(Layer.provide(EnvLive)), NodeServices.layer))),
+).pipe(Command.withDescription("Accept, once, that every message gets recorded; required before BRIDGE_HISTORY=true"))
+
+const historyPurge = Command.make(
+  "purge",
+  {
+    before: Flag.string("before").pipe(Flag.withSchema(Schema.DateTimeUtcFromString), Flag.withDescription("Delete history older than this instant (ISO-8601)")),
+    yes: Flag.boolean("yes").pipe(Flag.withDescription("Really delete")),
+  },
+  ({ before, yes }) =>
+    Effect.gen(function* () {
+      if (!yes) return yield* new ConfirmationRequired({ hint: "pass --yes to delete history" })
+      const store = yield* Store
+      const removed = yield* store.purgeBefore(before)
+      yield* Console.log(`Removed ${removed} message(s) older than ${DateTime.formatIso(before)}.`)
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(StoreWithDatabaseLive, BridgeConfigLive({ history: true })).pipe(
+          Layer.provideMerge(Layer.mergeAll(BridgeConfigLive({ history: true }).pipe(Layer.provide(EnvLive)), NodeServices.layer)),
+        ),
+      ),
+    ),
+).pipe(Command.withDescription("Delete history older than a date (the daemon may keep running)"))
+
+const history = Command.make("history").pipe(
+  Command.withDescription("Message history: enable it once, or purge old rows"),
+  Command.withSubcommands([historyEnable, historyPurge]),
+)
 
 const edit = Command.make(
   "edit",
@@ -316,7 +431,7 @@ const unlink = Command.make(
 
 const bridge = Command.make("bridge").pipe(
   Command.withDescription("WhatsApp ↔ Intro bridge on a dedicated number"),
-  Command.withSubcommands([link, run, harness, health, send, edit, del, react, unreact, media, turns, reply, progress, abandon, unlink]),
+  Command.withSubcommands([link, run, harness, health, send, forward, edit, del, react, unreact, media, contact, chats, messages, search, scheduled, unschedule, turns, reply, progress, abandon, history, unlink]),
 )
 
 /** The whole CLI, needing only the Node platform services. */

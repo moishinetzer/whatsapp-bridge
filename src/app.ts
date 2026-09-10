@@ -6,6 +6,9 @@ import { EventsLive } from "./engine/Events.ts"
 import { HealthLive } from "./engine/Health.ts"
 import { MediaStoreLive } from "./engine/Media.ts"
 import { OutboundLive } from "./engine/Outbound.ts"
+import { StoreWithDatabaseLive } from "./store/Store.ts"
+import { SchedulerLive } from "./store/Scheduled.ts"
+import { FileSystem, Path, Schema } from "effect"
 import { ResponderLive } from "./engine/Responder.ts"
 import { TurnEngineLive, TurnRegistryLive } from "./engine/Turns.ts"
 import { HttpServerLive } from "./http/Server.ts"
@@ -47,6 +50,28 @@ export const ProcessGuardsLive = Layer.effectDiscard(
   }),
 )
 
+/** `BRIDGE_HISTORY=true` without the one-time acceptance: the daemon says what to run and stops. */
+export class HistoryNotAccepted extends Schema.TaggedError<HistoryNotAccepted>()("HistoryNotAccepted", { file: Schema.String }) {
+  override get message() {
+    return `BRIDGE_HISTORY is on but history has not been enabled on this machine: run \`bridge history enable\` (it explains what gets stored and writes ${this.file})`
+  }
+}
+
+/** Where `bridge history enable` records the acceptance. */
+export const acceptanceFile = (dataDir: string) => `${dataDir.replace(/\/+$/, "")}/history.accepted`
+
+export const HistoryGateLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const config = yield* BridgeConfig
+    if (!config.history) return
+    const fs = yield* FileSystem.FileSystem
+    const path = yield* Path.Path
+    const file = path.resolve(acceptanceFile(config.dataDir))
+    if (!(yield* fs.exists(file).pipe(Effect.orElseSucceed(() => false)))) return yield* new HistoryNotAccepted({ file })
+    yield* Effect.logInfo("history is on").pipe(Effect.annotateLogs({ database: config.databasePath }))
+  }),
+)
+
 /** One line at startup saying how the daemon is configured (never secrets). */
 export const StartupLogLive = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -66,6 +91,9 @@ export const StartupLogLive = Layer.effectDiscard(
         mediaDir: c.mediaDir,
         mediaAuto: c.mediaAuto,
         mediaMaxBytes: c.mediaMaxBytes,
+        mediaMaxDisk: c.mediaMaxDisk,
+        database: c.databasePath,
+        history: c.history,
         typing: c.typing,
         logBodies: c.logBodies,
       }),
@@ -89,8 +117,9 @@ export const coreLayer = (transport: BaileysOptions, overrides: Partial<BridgeCo
   const Health = HealthLive.pipe(Layer.provide(Config))
   const Events = EventsLive.pipe(Layer.provide(Health))
   const Auth = AuthStoreLive.pipe(Layer.provide([Config, NodeServices.layer]))
-  const WhatsApp = BaileysLive(transport).pipe(Layer.provide([Config, Auth, Health, Events]))
-  return Layer.mergeAll(Config, Health, Events, Auth, WhatsApp)
+  const Storage = StoreWithDatabaseLive.pipe(Layer.provide([Config, NodeServices.layer]))
+  const WhatsApp = BaileysLive(transport).pipe(Layer.provide([Config, Auth, Health, Events, Storage]))
+  return Layer.mergeAll(Config, Health, Events, Auth, Storage, WhatsApp)
 }
 
 /** The daemon: transport + turn engine + local HTTP API. */
@@ -99,11 +128,15 @@ export const daemonLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
   const Registry = TurnRegistryLive.pipe(Layer.provide(Core))
   const Media = MediaStoreLive.pipe(Layer.provide([Core, NodeServices.layer]))
   const Outbound = OutboundLive.pipe(Layer.provide([Core, NodeServices.layer]))
+  const Scheduled = SchedulerLive.pipe(Layer.provide([Core, Outbound]))
   const Responder = ResponderLive.pipe(Layer.provide([Core, Outbound, FetchHttpClient.layer]))
   const Engine = TurnEngineLive.pipe(Layer.provide([Core, Registry, Responder, Media]))
-  const Server = HttpServerLive.pipe(Layer.provide([Core, Registry, Media, Outbound]))
+  const Server = HttpServerLive.pipe(Layer.provide([Core, Registry, Media, Outbound, Scheduled]))
+  const Gate = HistoryGateLive.pipe(Layer.provide([Core, NodeServices.layer]))
   const Startup = StartupLogLive.pipe(Layer.provide(Core))
-  return Layer.mergeAll(Core, Registry, Media, Outbound, Responder, Engine, Server, Startup, ProcessGuardsLive).pipe(Layer.provideMerge(AmbientLive))
+  return Layer.mergeAll(Gate, Core, Registry, Media, Outbound, Scheduled, Responder, Engine, Server, Startup, ProcessGuardsLive).pipe(
+    Layer.provideMerge(AmbientLive),
+  )
 }
 
 /** `bridge link`: the transport in link mode, nothing else. */

@@ -18,7 +18,7 @@ import makeWASocket, {
   type WAMessageUpdate,
   type WASocket,
   type WAVersion,
-  type proto,
+  proto,
 } from "@whiskeysockets/baileys"
 import { Cache, Cause, DateTime, Deferred, Duration, Effect, FiberSet, Layer, Option, Queue, Ref, Schedule, Schema, Stream } from "effect"
 
@@ -28,7 +28,7 @@ interface LongLike {
 }
 import qrcode from "qrcode-terminal"
 import { BridgeConfig } from "../config.ts"
-import { ChatId, MessageId, phoneOfJid } from "../domain/ids.ts"
+import { ChatId, MessageId, phoneOfJid, type TurnId } from "../domain/ids.ts"
 import type { InboundMessage } from "../domain/message.ts"
 import type { OutboundMedia } from "../domain/outbound.ts"
 import type { LinkedIdentity } from "../domain/status.ts"
@@ -36,18 +36,24 @@ import { Events } from "../engine/Events.ts"
 import { Health } from "../engine/Health.ts"
 import { AuthStore } from "./AuthStore.ts"
 import { isBaileysLogLevel, makeBaileysLogger } from "./BaileysLogger.ts"
-import { extractInbound, textOf, type Extracted } from "./extract.ts"
+import { extractInbound, kindOf, textOf, type Extracted } from "./extract.ts"
+import { Store, type SentEntry } from "../store/Store.ts"
 import {
   MediaDownloadFailed,
   MediaTooLarge,
   MediaUnavailable,
+  LookupFailed,
   MessageTooOld,
   MessageUnknown,
   NotConnected,
   SendFailed,
   WhatsApp,
+  type ContactInfo,
   type DownloadedMedia,
+  type GroupInfo,
   type InboundUpdate,
+  type PresenceInfo,
+  type PresenceState,
   type SendOptions,
 } from "./WhatsApp.ts"
 
@@ -69,6 +75,11 @@ type SocketEvent =
   | { readonly _tag: "Messages"; readonly messages: ReadonlyArray<WAMessage>; readonly type: "append" | "notify" }
   | { readonly _tag: "Updates"; readonly updates: ReadonlyArray<WAMessageUpdate> }
   | { readonly _tag: "Reactions"; readonly reactions: ReadonlyArray<{ readonly key: WAMessageKey; readonly reaction: proto.IReaction }> }
+  | { readonly _tag: "Receipts"; readonly receipts: ReadonlyArray<{ readonly key: WAMessageKey; readonly receipt: proto.IUserReceipt }> }
+  | { readonly _tag: "Presences"; readonly id: string; readonly presences: Record<string, { lastKnownPresence: string; lastSeen?: number | undefined }> }
+
+const encodeRaw = (raw: WAMessage): Uint8Array => proto.WebMessageInfo.encode(raw).finish()
+const decodeRaw = (bytes: Uint8Array): WAMessage => proto.WebMessageInfo.decode(bytes) as unknown as WAMessage
 
 /** WhatsApp's own limits on touching a sent message. */
 const EDIT_WINDOW = Duration.minutes(15)
@@ -171,6 +182,7 @@ export const BaileysLive = (options: BaileysOptions) =>
       const auth = yield* AuthStore
       const health = yield* Health
       const events = yield* Events
+      const store = yield* Store
 
       // Logs from inside the protocol library land in our logger, redacted.
       const runFork = yield* FiberSet.makeRuntime<never>()
@@ -202,6 +214,17 @@ export const BaileysLive = (options: BaileysOptions) =>
       const outbox = yield* Cache.make<string, { readonly raw: WAMessage; readonly sentAt: DateTime.Utc }>({
         capacity: 1_000,
         lookup: (id) => Effect.die(`not in outbox: ${id}`),
+      })
+      // Push names by jid, from inbound messages: the only name WhatsApp gives a linked device.
+      const pushNames = yield* Cache.make<string, string>({ capacity: 5_000, lookup: (jid) => Effect.die(`no push name for ${jid}`) })
+      // Delivery and read receipts are reported more than once; each (message, participant, status) is announced once.
+      const receiptSeen = yield* Cache.make<string, true>({ capacity: 20_000, lookup: () => Effect.succeed(true) })
+      const presences = yield* Ref.make(new Map<string, PresenceInfo>())
+      const presenceSubscribed = yield* Ref.make(new Set<string>())
+      const groupCache = yield* Cache.make<string, GroupInfo, LookupFailed | NotConnected>({
+        capacity: 500,
+        timeToLive: "5 minutes",
+        lookup: (chatId) => fetchGroup(ChatId.make(chatId)),
       })
       const lastVersion = yield* Ref.make<Option.Option<WAVersion>>(Option.none())
       const immediateStreak = yield* Ref.make(0)
@@ -267,6 +290,8 @@ export const BaileysLive = (options: BaileysOptions) =>
           yield* Cache.set(seen, id, true)
           yield* Cache.set(inboundRaw, id, raw)
           if (message.hasMedia) yield* Cache.set(rawMedia, id, { raw, message })
+          if (raw.pushName) yield* Cache.set(pushNames, message.senderId, raw.pushName)
+          yield* store.recordInbound(message, encodeRaw(raw)).pipe(Effect.catch((e) => Effect.logWarning("history write failed").pipe(Effect.annotateLogs({ reason: e.message }))))
           yield* health.touch("inbound")
           yield* Effect.logInfo("inbound message").pipe(log, Effect.annotateLogs({ kind: message.kind, isGroup: message.isGroup }))
           if (config.logBodies) yield* Effect.logDebug("inbound body").pipe(log, Effect.annotateLogs({ text: message.text }))
@@ -275,11 +300,42 @@ export const BaileysLive = (options: BaileysOptions) =>
         })
 
       /** Edits and deletes of messages we accepted. Anything else (our own messages, unknown chats) is ignored. */
+      const statusOf = (status: number | null | undefined): "delivered" | "read" | undefined =>
+        status === 3 ? "delivered" : status === 4 || status === 5 ? "read" : undefined
+
+      /** One delivery or read announcement per message, participant and status. */
+      const announceReceipt = (chatId: ChatId, messageId: MessageId, status: "delivered" | "read", participantId: string | undefined) =>
+        Effect.gen(function* () {
+          const key = `${messageId}|${participantId ?? ""}|${status}`
+          if (yield* Cache.has(receiptSeen, key)) return
+          yield* Cache.set(receiptSeen, key, true)
+          yield* store.updateStatus(chatId, messageId, status).pipe(Effect.ignore)
+          const participant = participantId === undefined ? {} : { participantId }
+          yield* events.publish(status === "read" ? { _tag: "MessageRead", chatId, messageId, ...participant } : { _tag: "MessageDelivered", chatId, messageId, ...participant })
+        })
+
+      const acceptReceipt = (item: { readonly key: WAMessageKey; readonly receipt: proto.IUserReceipt }) =>
+        Effect.gen(function* () {
+          const id = item.key.id ?? undefined
+          const chat = item.key.remoteJid ?? undefined
+          if (!id || !chat || !item.key.fromMe) return
+          const r = item.receipt
+          const status = r.readTimestamp || r.playedTimestamp ? "read" : r.receiptTimestamp ? "delivered" : undefined
+          if (status === undefined) return
+          const participant = isJidGroup(chat) === true ? (r.userJid ?? undefined) : undefined
+          yield* announceReceipt(ChatId.make(chat), MessageId.make(id), status, participant)
+        })
+
       const acceptUpdate = (u: WAMessageUpdate) =>
         Effect.gen(function* () {
           const id = u.key.id ?? undefined
           const chat = u.key.remoteJid ?? undefined
-          if (!id || !chat || u.key.fromMe) return
+          if (!id || !chat) return
+          if (u.key.fromMe) {
+            const status = statusOf(u.update.status)
+            if (status !== undefined && isJidGroup(chat) !== true) yield* announceReceipt(ChatId.make(chat), MessageId.make(id), status, undefined)
+            return
+          }
           const cached = yield* Cache.getOption(inboundRaw, dedupeKey(ChatId.make(chat), MessageId.make(id)))
           if (Option.isNone(cached)) return
           const chatId = ChatId.make(chat)
@@ -287,6 +343,7 @@ export const BaileysLive = (options: BaileysOptions) =>
           const log = Effect.annotateLogs({ chatId, messageId })
           if (u.update.message === null || u.update.messageStubType === WAMessageStubType.REVOKE) {
             yield* Effect.logInfo("message deleted by its sender").pipe(log)
+            yield* store.markDeleted(chatId, messageId).pipe(Effect.ignore)
             yield* Queue.offer(updates, { _tag: "Deleted", chatId, messageId })
             return
           }
@@ -295,6 +352,7 @@ export const BaileysLive = (options: BaileysOptions) =>
             const content = normalizeMessageContent(edited)
             const text = content ? (textOf(content) ?? "") : ""
             yield* Cache.set(inboundRaw, dedupeKey(chatId, messageId), { ...cached.value, message: edited })
+            yield* store.markEdited(chatId, messageId, text).pipe(Effect.ignore)
             yield* Effect.logInfo("message edited by its sender").pipe(log)
             if (config.logBodies) yield* Effect.logDebug("edited body").pipe(log, Effect.annotateLogs({ text }))
             yield* Queue.offer(updates, { _tag: "Edited", chatId, messageId, text })
@@ -320,7 +378,27 @@ export const BaileysLive = (options: BaileysOptions) =>
           yield* Effect.logInfo(emoji === "" ? "reaction removed" : "reaction received").pipe(
             Effect.annotateLogs({ chatId, messageId, senderId, emoji, onOurMessage: target.fromMe === true }),
           )
+          yield* store.recordReaction(chatId, messageId, senderId, emoji).pipe(Effect.ignore)
           yield* Queue.offer(updates, { _tag: "Reaction", chatId, messageId, senderId, emoji, onOurMessage: target.fromMe === true })
+        })
+
+      const acceptPresences = (id: string, incoming: Record<string, { lastKnownPresence: string; lastSeen?: number | undefined }>) =>
+        Effect.gen(function* () {
+          const now = yield* DateTime.now
+          const chatId = ChatId.make(id)
+          for (const [participant, data] of Object.entries(incoming)) {
+            const known: ReadonlyArray<PresenceState> = ["available", "unavailable", "composing", "recording", "paused"]
+            const state = known.includes(data.lastKnownPresence as PresenceState) ? (data.lastKnownPresence as PresenceState) : "unknown"
+            const info: PresenceInfo = {
+              chatId,
+              state,
+              at: now,
+              ...(data.lastSeen === undefined ? {} : { lastSeenAt: DateTime.makeUnsafe(data.lastSeen * 1000) }),
+            }
+            // DMs report the contact under its own jid; groups report participants, the latest wins for the chat.
+            yield* Ref.update(presences, (m) => new Map(m).set(id, info))
+            yield* Effect.logDebug("presence").pipe(Effect.annotateLogs({ chatId, participant, state }))
+          }
         })
 
       const showQr = (qr: string) =>
@@ -380,6 +458,8 @@ export const BaileysLive = (options: BaileysOptions) =>
         sock.ev.on("messages.upsert", ({ messages, type }) => Queue.offerUnsafe(socketEvents, { _tag: "Messages", messages, type }))
         sock.ev.on("messages.update", (items) => Queue.offerUnsafe(socketEvents, { _tag: "Updates", updates: items }))
         sock.ev.on("messages.reaction", (items) => Queue.offerUnsafe(socketEvents, { _tag: "Reactions", reactions: items }))
+        sock.ev.on("message-receipt.update", (items) => Queue.offerUnsafe(socketEvents, { _tag: "Receipts", receipts: items }))
+        sock.ev.on("presence.update", ({ id, presences: p }) => Queue.offerUnsafe(socketEvents, { _tag: "Presences", id, presences: p }))
 
         const saveCreds = Effect.tryPromise(() => loaded.saveCreds()).pipe(
           Effect.retry({ schedule: Schedule.exponential("100 millis").pipe(Schedule.upTo({ times: 3 })) }),
@@ -473,6 +553,10 @@ export const BaileysLive = (options: BaileysOptions) =>
               return Effect.forEach(event.updates, acceptUpdate, { discard: true })
             case "Reactions":
               return Effect.forEach(event.reactions, acceptReaction, { discard: true })
+            case "Receipts":
+              return Effect.forEach(event.receipts, acceptReceipt, { discard: true })
+            case "Presences":
+              return acceptPresences(event.id, event.presences)
           }
         }
 
@@ -595,14 +679,22 @@ export const BaileysLive = (options: BaileysOptions) =>
           Effect.map(Option.match({ onNone: (): WAMessageKey => ({ remoteJid: chatId, id: messageId, fromMe: false }), onSome: (m) => m.key })),
         )
 
-      /** A message we saw or sent this run, for quoting. */
+      /** A message we saw or sent: this run's caches first, then the database (sent messages always, inbound with history on). */
       const rawFor = (chatId: ChatId, messageId: MessageId) =>
         Effect.gen(function* () {
           const theirs = yield* Cache.getOption(inboundRaw, dedupeKey(chatId, messageId))
           if (Option.isSome(theirs)) return theirs.value
           const ours = yield* Cache.getOption(outbox, messageId)
           if (Option.isSome(ours) && ours.value.raw.key.remoteJid === chatId) return ours.value.raw
-          return yield* new MessageUnknown({ chatId, messageId, reason: "not a message the bridge saw or sent this run" })
+          const persisted = yield* store.sent(messageId).pipe(Effect.orElseSucceed(() => Option.none<SentEntry>()))
+          if (Option.isSome(persisted) && persisted.value.chatId === chatId) return decodeRaw(persisted.value.raw)
+          const kept = yield* store.raw(chatId, messageId).pipe(Effect.orElseSucceed(() => Option.none<Uint8Array>()))
+          if (Option.isSome(kept)) return decodeRaw(kept.value)
+          return yield* new MessageUnknown({
+            chatId,
+            messageId,
+            reason: store.historyEnabled ? "not a message the bridge saw or sent" : "not a message the bridge saw or sent this run",
+          })
         })
 
       const quoteFor = (chatId: ChatId, options?: SendOptions) =>
@@ -613,24 +705,57 @@ export const BaileysLive = (options: BaileysOptions) =>
       /** One of our own messages, still inside WhatsApp's window for `operation`. */
       const ownMessage = (chatId: ChatId, messageId: MessageId, operation: string, window: Duration.Duration) =>
         Effect.gen(function* () {
-          const entry = yield* Cache.getOption(outbox, messageId)
-          if (Option.isNone(entry) || entry.value.raw.key.remoteJid !== chatId) {
-            return yield* new MessageUnknown({ chatId, messageId, reason: "not a message the bridge sent this run" })
+          const cached = yield* Cache.getOption(outbox, messageId)
+          const entry = Option.isSome(cached)
+            ? cached.value
+            : yield* store.sent(messageId).pipe(
+                Effect.orElseSucceed(() => Option.none<SentEntry>()),
+                Effect.map((o) => (Option.isSome(o) ? { raw: decodeRaw(o.value.raw), sentAt: o.value.sentAt } : undefined)),
+              )
+          if (entry === undefined || entry.raw.key.remoteJid !== chatId) {
+            return yield* new MessageUnknown({ chatId, messageId, reason: "not a message the bridge sent" })
           }
           const now = yield* DateTime.now
-          const ageMs = DateTime.toEpochMillis(now) - DateTime.toEpochMillis(entry.value.sentAt)
+          const ageMs = DateTime.toEpochMillis(now) - DateTime.toEpochMillis(entry.sentAt)
           if (ageMs > Duration.toMillis(window)) {
             return yield* new MessageTooOld({ chatId, messageId, operation, limitMs: Duration.toMillis(window), ageMs })
           }
-          return entry.value.raw
+          return entry.raw
         })
 
-      const remember = (sent: WAMessage) =>
+      const remember = (sent: WAMessage, turnId: TurnId | undefined) =>
         Effect.gen(function* () {
           const id = sent.key.id ?? undefined
           if (!id) return
           const sentAt = yield* DateTime.now
           yield* Cache.set(outbox, id, { raw: sent, sentAt })
+          const chatId = ChatId.make(sent.key.remoteJid ?? "")
+          yield* store
+            .rememberSent(MessageId.make(id), { chatId, sentAt, raw: encodeRaw(sent), turnId: Option.fromNullishOr(turnId) })
+            .pipe(Effect.catch((e) => Effect.logWarning("could not persist the sent message").pipe(Effect.annotateLogs({ reason: e.message }))))
+        })
+
+      const recordOutbound = (
+        sent: WAMessage,
+        details: { readonly kind: "text" | "image" | "video" | "audio" | "document" | "other"; readonly text?: string | undefined; readonly mimetype?: string | undefined },
+        options: SendOptions | undefined,
+      ) =>
+        Effect.gen(function* () {
+          const id = sent.key.id ?? undefined
+          if (!id) return
+          yield* store
+            .recordOutbound({
+              chatId: ChatId.make(sent.key.remoteJid ?? ""),
+              messageId: MessageId.make(id),
+              kind: details.kind,
+              text: details.text,
+              mimetype: details.mimetype,
+              quotedMessageId: options?.quoteMessageId,
+              turnId: options?.turnId,
+              at: yield* DateTime.now,
+              raw: encodeRaw(sent),
+            })
+            .pipe(Effect.catch((e) => Effect.logWarning("history write failed").pipe(Effect.annotateLogs({ reason: e.message }))))
         })
 
       const newOutboundId = Effect.map(Ref.get(socket), (s) =>
@@ -644,7 +769,8 @@ export const BaileysLive = (options: BaileysOptions) =>
         )
         const id = sent?.key?.id
         if (!id) return yield* new SendFailed({ operation: "sendText", chatId, detail: "WhatsApp returned no message id" })
-        yield* remember(sent)
+        yield* remember(sent, options?.turnId)
+        yield* recordOutbound(sent, { kind: "text", text }, options)
         yield* health.touch("outbound")
         yield* Effect.logInfo("sent text").pipe(Effect.annotateLogs({ chatId, messageId: id }))
         if (config.logBodies) yield* Effect.logDebug("outbound body").pipe(Effect.annotateLogs({ chatId, text }))
@@ -682,7 +808,8 @@ export const BaileysLive = (options: BaileysOptions) =>
         )
         const id = sent?.key?.id
         if (!id) return yield* new SendFailed({ operation: `send ${media.kind}`, chatId, detail: "WhatsApp returned no message id" })
-        yield* remember(sent)
+        yield* remember(sent, options?.turnId)
+        yield* recordOutbound(sent, { kind: media.kind, text: media.caption, mimetype: media.mimetype }, options)
         yield* health.touch("outbound")
         yield* Effect.logInfo("sent media").pipe(
           Effect.annotateLogs({ chatId, messageId: id, kind: media.kind, mimetype: media.mimetype, bytes: media.bytes.byteLength }),
@@ -699,6 +826,11 @@ export const BaileysLive = (options: BaileysOptions) =>
 
       const unreact = (chatId: ChatId, messageId: MessageId) => react(chatId, messageId, "")
 
+      const sentAtOf = (messageId: MessageId) =>
+        Cache.getOption(outbox, messageId).pipe(
+          Effect.flatMap(Option.match({ onNone: () => DateTime.now, onSome: (e) => Effect.succeed(e.sentAt) })),
+        )
+
       const editText = Effect.fn("WhatsApp.editText")(function* (chatId: ChatId, messageId: MessageId, text: string) {
         const original = yield* ownMessage(chatId, messageId, "edit", EDIT_WINDOW)
         const sent = yield* withSocket("edit", chatId, (s) => s.sendMessage(chatId, { text, edit: original.key }))
@@ -708,17 +840,105 @@ export const BaileysLive = (options: BaileysOptions) =>
         yield* Effect.logInfo("edited message").pipe(Effect.annotateLogs({ chatId, messageId }))
       })
 
-      const sentAtOf = (messageId: MessageId) =>
-        Cache.getOption(outbox, messageId).pipe(
-          Effect.flatMap(Option.match({ onNone: () => DateTime.now, onSome: (e) => Effect.succeed(e.sentAt) })),
-        )
-
       const deleteMessage = Effect.fn("WhatsApp.deleteMessage")(function* (chatId: ChatId, messageId: MessageId) {
         const original = yield* ownMessage(chatId, messageId, "delete", DELETE_WINDOW)
         yield* withSocket("delete", chatId, (s) => s.sendMessage(chatId, { delete: original.key }))
         yield* Cache.invalidate(outbox, messageId)
+        yield* store.forgetSent(messageId).pipe(Effect.ignore)
         yield* health.touch("outbound")
         yield* Effect.logInfo("deleted message").pipe(Effect.annotateLogs({ chatId, messageId }))
+      })
+
+      const forward = Effect.fn("WhatsApp.forward")(function* (toChatId: ChatId, fromChatId: ChatId, messageId: MessageId, options?: SendOptions) {
+        const original = yield* rawFor(fromChatId, messageId)
+        const sent = yield* withSocket("forward", toChatId, (s) =>
+          s.sendMessage(toChatId, { forward: original }, options?.messageId === undefined ? {} : { messageId: options.messageId }),
+        )
+        const id = sent?.key?.id
+        if (!id) return yield* new SendFailed({ operation: "forward", chatId: toChatId, detail: "WhatsApp returned no message id" })
+        yield* remember(sent, options?.turnId)
+        const content = normalizeMessageContent(original.message)
+        const kind = content ? (kindOf(getContentType(content)) ?? "other") : "other"
+        yield* recordOutbound(sent, { kind: kind === "sticker" || kind === "location" || kind === "contact" ? "other" : kind, text: content ? textOf(content) : undefined }, options)
+        yield* health.touch("outbound")
+        yield* Effect.logInfo("forwarded message").pipe(Effect.annotateLogs({ from: fromChatId, to: toChatId, messageId, sentAs: id }))
+        return id as MessageId
+      })
+
+      const lookupFailed = (subject: string) => (cause: unknown) => new LookupFailed({ subject, detail: messageOf(cause) })
+
+      const contact = Effect.fn("WhatsApp.contact")(function* (jid: string) {
+        const sock = yield* Ref.get(socket)
+        if (Option.isNone(sock)) {
+          const status = yield* health.get
+          return yield* new NotConnected({ state: status.state, ...(status.detail === undefined ? {} : { detail: status.detail }) })
+        }
+        const digits = phoneOfJid(jid) ?? (jid.includes("@") ? undefined : jid.replace(/[^0-9]/g, ""))
+        let resolved = jid.includes("@") ? jid : `${digits ?? jid}@s.whatsapp.net`
+        let onWhatsApp = true
+        if (digits !== undefined && digits.length > 0) {
+          const found = yield* Effect.tryPromise({ try: () => sock.value.onWhatsApp(digits), catch: lookupFailed(jid) }).pipe(Effect.timeout("20 seconds"), Effect.catchTag("TimeoutError", () => new LookupFailed({ subject: jid, detail: "timed out" })))
+          const hit = found?.find((r) => r.exists)
+          onWhatsApp = hit !== undefined
+          if (hit !== undefined) resolved = hit.jid
+        }
+        const pictureUrl = onWhatsApp
+          ? yield* Effect.tryPromise(() => sock.value.profilePictureUrl(resolved, "image", 15_000)).pipe(Effect.option, Effect.map(Option.getOrUndefined))
+          : undefined
+        const name = yield* Cache.getOption(pushNames, resolved).pipe(Effect.map(Option.getOrUndefined))
+        const phone = phoneOfJid(resolved) ?? digits
+        const info: ContactInfo = {
+          jid: resolved,
+          ...(phone === undefined ? {} : { phone }),
+          ...(name === undefined ? {} : { name }),
+          ...(pictureUrl === undefined || pictureUrl === null ? {} : { pictureUrl }),
+          onWhatsApp,
+        }
+        return info
+      })
+
+      const fetchGroup = (chatId: ChatId) =>
+        Effect.gen(function* () {
+          const sock = yield* Ref.get(socket)
+          if (Option.isNone(sock)) {
+            const status = yield* health.get
+            return yield* new NotConnected({ state: status.state, ...(status.detail === undefined ? {} : { detail: status.detail }) })
+          }
+          const meta = yield* Effect.tryPromise({ try: () => sock.value.groupMetadata(chatId), catch: lookupFailed(chatId) }).pipe(
+            Effect.timeout("20 seconds"),
+            Effect.catchTag("TimeoutError", () => new LookupFailed({ subject: chatId, detail: "timed out" })),
+          )
+          const info: GroupInfo = {
+            chatId,
+            subject: meta.subject,
+            ...(meta.desc ? { description: meta.desc } : {}),
+            ...(meta.owner ? { owner: meta.owner } : {}),
+            participants: meta.participants.map((p) => {
+              const phone = p.phoneNumber ? phoneOfJid(p.phoneNumber) : phoneOfJid(p.id)
+              return { jid: p.id, ...(phone === undefined ? {} : { phone }), admin: p.admin === "admin" || p.admin === "superadmin" || p.isAdmin === true || p.isSuperAdmin === true }
+            }),
+            ...(meta.creation ? { createdAt: DateTime.makeUnsafe(meta.creation * 1000) } : {}),
+          }
+          return info
+        })
+
+      const groupInfo = (chatId: ChatId) => Cache.get(groupCache, chatId)
+
+      const presence = Effect.fn("WhatsApp.presence")(function* (chatId: ChatId) {
+        const sock = yield* Ref.get(socket)
+        if (Option.isNone(sock)) {
+          const status = yield* health.get
+          return yield* new NotConnected({ state: status.state, ...(status.detail === undefined ? {} : { detail: status.detail }) })
+        }
+        const already = (yield* Ref.get(presenceSubscribed)).has(chatId)
+        if (!already) {
+          yield* Effect.tryPromise(() => sock.value.presenceSubscribe(chatId)).pipe(
+            Effect.tap(() => Ref.update(presenceSubscribed, (s) => new Set(s).add(chatId))),
+            Effect.catch((e) => Effect.logDebug("presence subscribe failed").pipe(Effect.annotateLogs({ chatId, reason: messageOf(e) }))),
+          )
+        }
+        const known = (yield* Ref.get(presences)).get(chatId)
+        return known ?? { chatId, state: "unknown" as const }
       })
 
       const markRead = Effect.fn("WhatsApp.markRead")(function* (chatId: ChatId, messageIds: ReadonlyArray<MessageId>) {
@@ -790,6 +1010,10 @@ export const BaileysLive = (options: BaileysOptions) =>
         editText,
         deleteMessage,
         markRead,
+        forward,
+        contact,
+        groupInfo,
+        presence,
         react,
         unreact,
         setTyping,

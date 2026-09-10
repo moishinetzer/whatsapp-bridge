@@ -18,7 +18,7 @@ export interface Extracted {
   readonly key: WAMessageKey
 }
 
-const kindOf = (contentType: string | undefined): MessageKind | undefined => {
+export const kindOf = (contentType: string | undefined): MessageKind | undefined => {
   switch (contentType) {
     case "conversation":
     case "extendedTextMessage":

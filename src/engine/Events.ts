@@ -51,6 +51,14 @@ const describe = (event: BridgeEvent): Record<string, unknown> => {
     case "MessageEdited":
     case "MessageDeleted":
       return { chatId: event.chatId, messageId: event.messageId }
+    case "MessageDelivered":
+    case "MessageRead":
+      return { chatId: event.chatId, messageId: event.messageId, participantId: event.participantId }
+    case "ScheduledSent":
+      return { scheduledId: event.scheduledId, chatId: event.chatId, messageId: event.messageId }
+    case "ScheduledSkipped":
+    case "ScheduledFailed":
+      return { scheduledId: event.scheduledId, chatId: event.chatId, reason: event.reason }
   }
 }
 

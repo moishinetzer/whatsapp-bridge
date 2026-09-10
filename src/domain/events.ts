@@ -60,6 +60,16 @@ export const BridgeEvent = Schema.TaggedUnion({
   MessageEdited: { ...envelope, chatId: ChatId, messageId: MessageId, text: Schema.String },
   /** The sender deleted a message the bridge had accepted ("delete for everyone"). */
   MessageDeleted: { ...envelope, chatId: ChatId, messageId: MessageId },
+  /** A message the bridge sent reached the recipient's device. In groups, one per participant. */
+  MessageDelivered: { ...envelope, chatId: ChatId, messageId: MessageId, participantId: Schema.optionalKey(Schema.String) },
+  /** A message the bridge sent was read (or a voice note played). In groups, one per participant. */
+  MessageRead: { ...envelope, chatId: ChatId, messageId: MessageId, participantId: Schema.optionalKey(Schema.String) },
+  /** A scheduled send went out. */
+  ScheduledSent: { ...envelope, scheduledId: Schema.String, chatId: ChatId, messageId: MessageId },
+  /** A scheduled send was dropped: too late after downtime, or its hold for the recipient to come online expired. */
+  ScheduledSkipped: { ...envelope, scheduledId: Schema.String, chatId: ChatId, reason: Schema.String },
+  /** A scheduled send failed at the transport; the item is kept as `failed` with the reason. */
+  ScheduledFailed: { ...envelope, scheduledId: Schema.String, chatId: ChatId, reason: Schema.String },
   /** Connection state changed; mirrors `GET /health`. */
   ConnectionChanged: { ...envelope, state: BridgeState, detail: Schema.optionalKey(Schema.String) },
 })

@@ -33,6 +33,10 @@ Photos and stickers arrive with `media.path` on the `TurnOpened` message: a loca
 
 Sending works the same way in reverse. Write the file on the bridge machine and hand over its path: as part of the turn's answer (`POST /turns/{turnId}/reply` with `"attachments": [{"path": "/tmp/q3.png", "caption": "..."}]`, sent after the text) or on its own (`POST /chats/{chatId}/media`). Images and videos arrive as previews with the caption under them; a PDF, a spreadsheet, or a picture that must stay uncompressed goes as `"kind": "document"`. The bridge refuses a missing path or a file over the limit before sending anything, so a 4xx there means nothing reached the user.
 
+## Memory
+
+With history on (`bridge history enable`, then `BRIDGE_HISTORY=true`), the bridge keeps every message. Before answering something that depends on context, `GET /chats/{chatId}/messages?limit=30`; to find a thing said weeks ago, `GET /messages?q=...`. Everything ever seen can be quoted or forwarded. The SQLite file is on the same machine (`GET /status` names it) and has stable views for `sqlite3` when the API is not enough. Reminders are `sendAt` on a normal send: the bridge holds them, across restarts, and reports `ScheduledSent` or `ScheduledSkipped`.
+
 ## Being alive
 
 Moishi's signal that Intro saw a message is the blue ticks plus the 👀 on the newest unanswered message; the bridge applies both, Intro does not need to. Correcting an earlier answer is `PATCH /chats/{chatId}/messages/{messageId}` within 15 minutes; quoting the message being answered (`quoteMessageId`) is worth it when several questions are in flight. Intro's signal that the *line* is alive is `GET /health` (`ok` versus `needs_relink`). When it reports `needs_relink`, Intro cannot fix that from code: it tells Moishi (through whatever other channel it has) to run `npm run link` on the bridge machine.

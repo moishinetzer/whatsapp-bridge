@@ -11,6 +11,9 @@ importers:
       '@effect/platform-node':
         specifier: 4.0.0-rc.109
         version: 4.0.0-rc.109(effect@4.0.0-rc.109)(redis@6.2.1)
+      '@effect/sql-sqlite-node':
+        specifier: 4.0.0-rc.109
+        version: 4.0.0-rc.109(effect@4.0.0-rc.109)
       '@whiskeysockets/baileys':
         specifier: 7.0.0-rc14
         version: 7.0.0-rc14(sharp@0.34.5)
@@ -73,6 +76,11 @@ packages:
     peerDependencies:
       effect: ^4.0.0-rc.109
       redis: '>=5.0.0 <7.0.0'
+
+  '@effect/sql-sqlite-node@4.0.0-rc.109':
+    resolution: {integrity: sha512-3oXteYQ5B5UgIFbOm241HZftA2e1jBhbeMtbWhhs6nV6TkDCXvT6ctwZcRHPjGPY8hF8qAIEwWcT7BlUk9ZY2A==}
+    peerDependencies:
+      effect: ^4.0.0-rc.109
 
   '@effect/vitest@4.0.0-rc.109':
     resolution: {integrity: sha512-vu5ZkidJ/gM/+a0M07Jnq1PV4duFlYc+4Vj9TsJysK4Us7LL5bwV6uXiT7mi1/IM/3HgfAwc7Q9ROj8M65G4pA==}
@@ -1209,6 +1217,10 @@ snapshots:
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
+
+  '@effect/sql-sqlite-node@4.0.0-rc.109(effect@4.0.0-rc.109)':
+    dependencies:
+      effect: 4.0.0-rc.109
 
   '@effect/vitest@4.0.0-rc.109(effect@4.0.0-rc.109)(vitest@4.1.11(@types/node@22.20.1)(vite@8.2.2(@types/node@22.20.1)(esbuild@0.28.2)(tsx@4.23.13)))':
     dependencies:

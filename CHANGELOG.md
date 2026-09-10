@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here. Intro pins on a tag.
 
+## v0.5.0 — 2026-09-10
+
+Memory: the second of three pushes from `docs/spec/agent-surface.md`.
+
+- One SQLite file, `data/bridge.db` (Effect's `SqlClient` over Node's built-in `node:sqlite`, WAL, created 0600), always holds bridge state: what the bridge sent (so edits, deletes, quotes and resends survive restarts), scheduled sends, turn outcomes, and the media cache index.
+- History, opt-in: `bridge history enable` prints what gets stored and asks once; with `BRIDGE_HISTORY=true` and no acceptance the daemon refuses to start. Both directions, edits, tombstones on user deletes, reactions, delivery state, attachment paths, the raw message bytes. `GET /chats`, `GET /chats/{chatId}` (with group members), `GET /chats/{chatId}/messages` with `before`, `since`, `limit` and `q`, and `GET /messages?q=` full-text search (FTS5, prefix terms, phrases, snippets). `bridge history purge --before`. Stable `messages_v` and `chats_v` views for `sqlite3`; `GET /status` reports `databasePath` and `history`.
+- Media cache: a disk budget, `BRIDGE_MEDIA_MAX_DISK` (1 GB), evicting least recently used first; a use is a download, a turn delivery, a media fetch, or the file appearing in a history or search result. `BRIDGE_MEDIA_RETENTION` is now optional and unset.
+- Scheduled sends: `sendAt` and `deliverWhenOnline` on text and file sends answer `202 {scheduledId, sendAt, deliverWhenOnline}`; `GET /scheduled`, `DELETE /scheduled/{id}`; `ScheduledSent`, `ScheduledSkipped` (over an hour late after downtime, or nobody online within 24 hours) and `ScheduledFailed` events.
+- `MessageDelivered` and `MessageRead` events for the bridge's own messages, one per participant in groups.
+- `POST /chats/{chatId}/forward`, `GET /contacts/{jid}` (push name, phone, picture, on WhatsApp or not), group subject and members on `GET /chats/{chatId}`.
+- CLI: `forward`, `contact`, `chats`, `messages`, `search`, `scheduled`, `unschedule`, `history enable`, `history purge`, `send --at --when-online`.
+- Tests: the store on a real in-memory SQLite (paging, search, tombstones, purge), the LRU cache, the scheduler under the test clock, and the new endpoints. 87 in total.
+
 ## v0.4.0 — 2026-09-10
 
 How the line feels: the first of three pushes from the design session recorded in `docs/spec/agent-surface.md`.

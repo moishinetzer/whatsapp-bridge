@@ -1,9 +1,10 @@
 import { describe, expect, it } from "@effect/vitest"
 import { NodeHttpServer } from "@effect/platform-node"
-import { Duration, Effect, Fiber, Layer, Option, Queue, Redacted, Ref, Stream } from "effect"
+import { DateTime, Duration, Effect, Fiber, Layer, Option, Queue, Redacted, Ref, Stream } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiClient } from "effect/unstable/httpapi"
-import { MessageId, toChatId } from "../src/domain/ids.ts"
+import { ChatId, MessageId, toChatId } from "../src/domain/ids.ts"
+import { Store } from "../src/store/Store.ts"
 import { Events } from "../src/engine/Events.ts"
 import { Health } from "../src/engine/Health.ts"
 import { TurnId } from "../src/domain/ids.ts"
@@ -26,6 +27,12 @@ const ServerTestLayer = Layer.unwrap(
     return Layer.mergeAll(engine, server)
   }),
 )
+
+/** Narrows a send result to the immediate case; scheduled sends are asserted separately. */
+const asSent = <A extends object>(r: A): Extract<A, { messageId: unknown }> => {
+  if (!("messageId" in r)) throw new Error("expected an immediate send, got a scheduled one")
+  return r as Extract<A, { messageId: unknown }>
+}
 
 const client = (withToken: boolean) =>
   HttpApiClient.make(BridgeApi, {
@@ -69,7 +76,7 @@ describe("HTTP API", () => {
       const wa = yield* FakeWhatsApp
       const chatId = toChatId("+44 7700 900123")
 
-      const sent = yield* api.chats.send({ params: { chatId }, payload: { text: "Open Grok Bot → approve the Link spend" } })
+      const sent = asSent(yield* api.chats.send({ params: { chatId }, payload: { text: "Open Grok Bot → approve the Link spend" } }))
       expect(sent.chatId).toBe("447700900123@s.whatsapp.net")
       expect((yield* takeSoon(wa.sent)).text).toBe("Open Grok Bot → approve the Link spend")
 
@@ -204,10 +211,12 @@ describe("HTTP API outbound media", () => {
       const api = yield* client(true)
       const wa = yield* FakeWhatsApp
 
-      const fromBytes = yield* api.chats.sendMedia({
-        params: { chatId: chat },
-        payload: { data: new Uint8Array([1, 2, 3, 4]), mimetype: "image/png", caption: "a chart" },
-      })
+      const fromBytes = asSent(
+        yield* api.chats.sendMedia({
+          params: { chatId: chat },
+          payload: { data: new Uint8Array([1, 2, 3, 4]), mimetype: "image/png", caption: "a chart" },
+        }),
+      )
       const sentBytes = yield* takeSoon(wa.sentMedia)
       expect(sentBytes.messageId).toBe(fromBytes.messageId)
       expect(sentBytes.media).toMatchObject({ kind: "image", mimetype: "image/png", caption: "a chart" })
@@ -267,7 +276,7 @@ describe("HTTP API v0.4", () => {
     Effect.gen(function* () {
       const api = yield* client(true)
       const wa = yield* FakeWhatsApp
-      const quoted = yield* api.chats.send({ params: { chatId: chat }, payload: { text: "re: that", quoteMessageId: MessageId.make("in_42") } })
+      const quoted = asSent(yield* api.chats.send({ params: { chatId: chat }, payload: { text: "re: that", quoteMessageId: MessageId.make("in_42") } }))
       expect(yield* takeSoon(wa.sent)).toMatchObject({ messageId: quoted.messageId, quoteMessageId: "in_42" })
       yield* Ref.set(wa.unknownQuotes, new Set([MessageId.make("gone")]))
       const unknown = yield* api.chats.send({ params: { chatId: chat }, payload: { text: "x", quoteMessageId: MessageId.make("gone") } }).pipe(Effect.flip)
@@ -324,6 +333,118 @@ describe("HTTP API v0.4", () => {
       yield* settle
       // An empty abandon text sends nothing.
       expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+})
+
+const HistoryServerLayer = Layer.unwrap(
+  Effect.gen(function* () {
+    const engine = EngineTestLayer({ apiToken: Option.some(Redacted.make(TOKEN)), history: true })
+    const server = HttpRouter.serve(ApiLive, { middleware: bearerAuth(Option.some(Redacted.make(TOKEN))) }).pipe(
+      Layer.provide(engine),
+      Layer.provideMerge(NodeHttpServer.layerTest),
+    )
+    return Layer.mergeAll(engine, server)
+  }),
+)
+
+describe("HTTP API v0.5", () => {
+  it.effect("status names the database, history answers 409 when off", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const status = yield* api.health.status()
+      expect(status.databasePath).toBe(":memory:")
+      expect(status.history).toBe(false)
+      const off = yield* api.history.chats().pipe(Effect.flip)
+      expect(off._tag).toBe("HistoryDisabled")
+      const info = yield* api.history.chat({ params: { chatId: chat } })
+      expect(info).toEqual({ chatId: chat, isGroup: false })
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+
+  it.effect("records the conversation and serves it back with paging, search and reactions", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      const m1 = message("what time is the dentist?")
+      // The fake transport never writes history itself (the real one does before the engine sees a message); do it here.
+      const store = yield* Store
+      yield* store.recordInbound(m1, new Uint8Array([1]))
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      yield* api.turns.reply({ params: { turnId: call.turnId }, payload: { text: "Ten tomorrow." } })
+      const out = yield* takeSoon(wa.sent)
+      yield* store.recordOutbound({
+        chatId: chat,
+        messageId: out.messageId,
+        kind: "text",
+        text: out.text,
+        turnId: call.turnId,
+        at: DateTime.makeUnsafe(DateTime.toEpochMillis(m1.timestamp) + 1),
+        raw: new Uint8Array([2]),
+      })
+      yield* wa.inject({ _tag: "Reaction", chatId: chat, messageId: out.messageId, senderId: chat, emoji: "👍", onOurMessage: true })
+      yield* store.recordReaction(chat, out.messageId, chat, "👍")
+
+      const chats = yield* api.history.chats()
+      expect(chats.map((c) => [c.chatId, c.messageCount])).toEqual([[chat, 2]])
+      const page = yield* api.history.chatMessages({ params: { chatId: chat }, query: { limit: 1 } })
+      expect(page.map((r) => r.messageId)).toEqual([out.messageId])
+      expect(page[0]).toMatchObject({ direction: "out", turnId: call.turnId, reactions: [{ emoji: "👍" }] })
+      const older = yield* api.history.chatMessages({ params: { chatId: chat }, query: { before: out.messageId } })
+      expect(older.map((r) => r.messageId)).toEqual([m1.messageId])
+      expect(older[0]?.turnId).toBe(call.turnId)
+      const hits = yield* api.history.search({ query: { q: "dent" } })
+      expect(hits.length).toBe(1)
+      expect(hits[0]?.snippet).toContain("[dentist]")
+      const scoped = yield* api.history.chatMessages({ params: { chatId: chat }, query: { q: "tomorrow" } })
+      expect(scoped.map((r) => r.messageId)).toEqual([out.messageId])
+      const info = yield* api.history.chat({ params: { chatId: chat } })
+      expect(info).toMatchObject({ chatId: chat, isGroup: false, name: "Moishi", messageCount: 2 })
+      const status = yield* api.health.status()
+      expect(status.history).toBe(true)
+    }).pipe(Effect.provide(HistoryServerLayer)),
+  )
+
+  it.effect("schedules, lists and cancels sends; forwards and looks contacts up", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+      const at = DateTime.addDuration(yield* DateTime.now, Duration.hours(2))
+      const held = yield* api.chats.send({ params: { chatId: chat }, payload: { text: "later", sendAt: at, deliverWhenOnline: true } })
+      expect("scheduledId" in held).toBe(true)
+      if (!("scheduledId" in held)) return
+      expect(held.deliverWhenOnline).toBe(true)
+      const media = yield* api.chats.sendMedia({ params: { chatId: chat }, payload: { data: new Uint8Array([1, 2]), mimetype: "image/png", sendAt: at } })
+      expect("scheduledId" in media).toBe(true)
+      const listed = yield* api.scheduled.list()
+      expect(listed.map((s) => s.kind).sort()).toEqual(["media", "text"])
+      yield* api.scheduled.cancel({ params: { scheduledId: held.scheduledId } })
+      const gone = yield* api.scheduled.cancel({ params: { scheduledId: held.scheduledId } }).pipe(Effect.flip)
+      expect(gone._tag).toBe("ScheduledNotFound")
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
+
+      const forwarded = yield* api.chats.forward({ params: { chatId: chat }, payload: { fromChatId: ChatId.make("447700900456@s.whatsapp.net"), messageId: MessageId.make("in_77") } })
+      expect(yield* takeSoon(wa.forwards)).toMatchObject({ toChatId: chat, fromChatId: "447700900456@s.whatsapp.net", messageId: "in_77", sentAs: forwarded.messageId })
+      yield* Ref.set(wa.unknownQuotes, new Set([MessageId.make("gone")]))
+      const unknown = yield* api.chats.forward({ params: { chatId: chat }, payload: { fromChatId: chat, messageId: MessageId.make("gone") } }).pipe(Effect.flip)
+      expect(unknown._tag).toBe("MessageUnknown")
+
+      yield* Ref.set(wa.contacts, new Map([[chat, { jid: chat, phone: "447700900123", name: "Moishi", onWhatsApp: true }]]))
+      const known = yield* api.history.contact({ params: { jid: chat } })
+      expect(known).toMatchObject({ name: "Moishi", onWhatsApp: true })
+      const nobody = yield* api.history.contact({ params: { jid: "1@s.whatsapp.net" } })
+      expect(nobody.onWhatsApp).toBe(false)
+
+      const group = ChatId.make("123-456@g.us")
+      yield* Ref.set(wa.groups, new Map([[group, { chatId: group, subject: "Family", participants: [{ jid: chat, admin: true }] }]]))
+      const info = yield* api.history.chat({ params: { chatId: group } })
+      expect(info).toMatchObject({ isGroup: true, name: "Family", group: { subject: "Family" } })
     }).pipe(Effect.provide(ServerTestLayer)),
   )
 })

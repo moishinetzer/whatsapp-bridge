@@ -11,6 +11,11 @@ export type OutboundKind = typeof OutboundKind.Type
  * Everything else is optional and inferred: `mimetype` from the extension,
  * `kind` from the mimetype, `fileName` from the path.
  */
+/** Exactly one of `path` and `data`. Shared with the schemas that extend the payload. */
+export const exactlyOneSource = Schema.makeFilter((o: { readonly path?: string | undefined; readonly data?: Uint8Array | undefined }) =>
+  (o.path === undefined) === (o.data === undefined) ? { path: [], issue: "give exactly one of path or data" } : true,
+)
+
 export const OutboundMediaPayload = Schema.Struct({
   /** Absolute path of a file readable by the user the daemon runs as. */
   path: Schema.optionalKey(Schema.String.pipe(Schema.check(Schema.isNonEmpty()))),
@@ -26,11 +31,7 @@ export const OutboundMediaPayload = Schema.Struct({
   voiceNote: Schema.optionalKey(Schema.Boolean),
   /** Send as a reply to this message (a message the bridge saw or sent). */
   quoteMessageId: Schema.optionalKey(MessageId),
-}).check(
-  Schema.makeFilter((o) =>
-    (o.path === undefined) === (o.data === undefined) ? { path: [], issue: "give exactly one of path or data" } : true,
-  ),
-)
+}).check(exactlyOneSource)
 export type OutboundMediaPayload = typeof OutboundMediaPayload.Type
 
 /** A file ready to send: bytes in memory, kind and mimetype resolved. */

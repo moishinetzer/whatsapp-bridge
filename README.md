@@ -14,6 +14,7 @@ Built as an [Effect v4](https://effect.website) service from top to bottom (serv
 - [How a turn works](#how-a-turn-works)
 - [Integrating Intro](#integrating-intro)
 - [Attachments](#attachments)
+- [History](#history)
 - [Reference for the agent](#reference-for-the-agent)
   - [Conventions](#conventions)
   - [Endpoints](#endpoints)
@@ -142,7 +143,7 @@ Anything else (video, audio, documents), or an image whose download was slower t
 | What is automatic | `BRIDGE_MEDIA_AUTO=images` (default): image and sticker. `all`: video, audio and documents too. `none`: only on demand. |
 | How long a turn waits | `BRIDGE_MEDIA_WAIT` (8 s). Slower downloads finish in the background and are served on demand. |
 | Size limit | `BRIDGE_MEDIA_MAX_BYTES` (25 MB), checked against WhatsApp's declared size before downloading: `413 MediaTooLarge`. |
-| Retention | `BRIDGE_MEDIA_RETENTION` (7 days); a sweep every `BRIDGE_MEDIA_SWEEP_EVERY` (1 hour) deletes older files and their sidecars. |
+| Retention | A disk budget, `BRIDGE_MEDIA_MAX_DISK` (1 GB): past it, the least recently used files go first. A use is anything the bridge sees: the download, delivery on a turn, a fetch through the media endpoints, the file appearing in a history or search result. Reading the file by path is invisible to the bridge. `BRIDGE_MEDIA_RETENTION` is an optional maximum age on top, unset by default; the sweep runs every `BRIDGE_MEDIA_SWEEP_EVERY` (1 hour). With history on, a row whose file went says so in `mediaEvictedAt`. |
 | After a restart | Already-downloaded files are still served (the sidecar is the index). A message that arrived before the restart and was never downloaded cannot be fetched any more: `404 MediaUnavailable`. |
 | Expired links | WhatsApp media URLs expire; the bridge asks the phone to re-upload and retries once. |
 
@@ -163,6 +164,21 @@ curl -X POST http://127.0.0.1:8787/chats/447700900123@s.whatsapp.net/media -H 'c
 ```
 
 Or from a shell: `npm run bridge -- send --to 447700900123 --file /tmp/q3.png --caption "Revenue by month"`. A consumer on another machine sends the bytes instead of a path: `{"data": "<base64>", "mimetype": "image/png"}`. Images, videos, audio (voice notes included) and any document work; WhatsApp decides the presentation from the `kind`, which the bridge infers from the file type. The full contract is [`POST /chats/{chatId}/media`](#post-chatschatidmedia) and [`OutboundMediaPayload`](#outboundmediapayload).
+
+## History
+
+Off by default. When on, the bridge records every message in both directions in its SQLite file, and the agent gets memory across restarts: `GET /chats`, `GET /chats/{chatId}/messages`, full-text search with `GET /messages?q=`, and quoting or forwarding anything ever seen.
+
+Turning it on takes two explicit steps, because it is the whole conversation of the number in plain text on disk:
+
+```sh
+npm run bridge -- history enable      # prints exactly what will be stored and asks y/N (--yes for scripts)
+# then set BRIDGE_HISTORY=true and restart the daemon
+```
+
+With `BRIDGE_HISTORY=true` and no acceptance on this machine, the daemon refuses to start and says so. What is stored: text and captions, edits (the latest body alongside the original), deletions as tombstones (the text goes, the id and times stay), reactions, delivery state of the bridge's own messages, the path of downloaded attachments, the turn each message belonged to, and the raw message bytes so replies and forwards keep working after a restart. Nothing expires; `npm run bridge -- history purge --before 2026-01-01T00:00:00Z --yes` deletes.
+
+The file is `data/bridge.db` (`GET /status` reports the path), created 0600. It exists with history off too: the bridge keeps its own state there (what it sent, scheduled sends, turn outcomes, the media cache index); the message tables only fill when history is on. Two views are stable for anyone opening it read-only with `sqlite3`: `messages_v` (one row per message, latest text first) and `chats_v`.
 
 ## Reference for the agent
 
@@ -185,7 +201,9 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | Files | Outgoing files are described by an [`OutboundMediaPayload`](#outboundmediapayload): a local `path` (preferred, the bridge reads it) or base64 `data` with a `mimetype`. `BRIDGE_MEDIA_MAX_BYTES` (25 MB) applies in both directions. Files are read and checked before anything is sent, so a bad path is a 4xx and nothing goes out. |
 | Idempotency | Sending a message twice sends it twice. A turn accepts exactly one reply; the second gets `409 TurnNotAwaitingReply` with `state: "committed"`. Inbound messages are deduplicated by id inside the bridge. |
 | Quoting | Any send can quote a message with `quoteMessageId`: a message the bridge saw or sent this run. On a proactive send an unknown id is `404 MessageUnknown`; on a turn reply the bubble goes out unquoted and a warning is logged, so a stale id never sinks the answer. |
-| Own messages | The bridge can edit (`PATCH`) or delete (`DELETE`) a message it sent this run, within WhatsApp's windows: 15 minutes to edit, about 2 days to delete. Past that: `409 MessageTooOld`. After a restart: `404 MessageUnknown`. |
+| Own messages | The bridge can edit (`PATCH`) or delete (`DELETE`) a message it sent, within WhatsApp's windows: 15 minutes to edit, about 2 days to delete. Past that: `409 MessageTooOld`. Sent messages are remembered in the database, so this survives a restart; a message the bridge never sent is `404 MessageUnknown`. |
+| Scheduling | Any text or file send takes `sendAt` (ISO-8601) and answers `202 {scheduledId, sendAt, deliverWhenOnline}` instead of sending. `deliverWhenOnline: true` also waits for the recipient to be online, at most 24 hours. Scheduled sends survive restarts; one missed by more than an hour of downtime is dropped with a `ScheduledSkipped` event. |
+| History | Endpoints under [History](#history) answer `409 HistoryDisabled` until history is enabled. |
 | Schema version | Every event carries `v: 1`. The version only changes on an incompatible change; new optional fields do not bump it. |
 
 ### Endpoints
@@ -199,6 +217,14 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | PATCH | [`/chats/{chatId}/messages/{messageId}`](#patch-chatschatidmessagesmessageid) | Edit a message the bridge sent |
 | DELETE | [`/chats/{chatId}/messages/{messageId}`](#delete-chatschatidmessagesmessageid) | Delete for everyone a message the bridge sent |
 | POST | [`/chats/{chatId}/media`](#post-chatschatidmedia) | Send an image, video, audio or document |
+| POST | [`/chats/{chatId}/forward`](#post-chatschatidforward) | Forward a message the bridge saw or sent |
+| GET | [`/chats`](#get-chats) | Chats in the history |
+| GET | [`/chats/{chatId}`](#get-chatschatid) | One chat: history summary, group subject and members |
+| GET | [`/chats/{chatId}/messages`](#get-chatschatidmessages) | A chat's history, or a search within it |
+| GET | [`/messages`](#get-messages) | Full-text search across every chat |
+| GET | [`/contacts/{jid}`](#get-contactsjid) | Push name, phone, picture, on WhatsApp or not |
+| GET | [`/scheduled`](#get-scheduled) | Pending scheduled sends and those closed in the last day |
+| DELETE | [`/scheduled/{scheduledId}`](#delete-scheduledscheduledid) | Cancel a pending scheduled send |
 | POST | [`/chats/{chatId}/messages/{messageId}/reactions`](#post-chatschatidmessagesmessageidreactions) | React to a message |
 | DELETE | [`/chats/{chatId}/messages/{messageId}/reactions`](#delete-chatschatidmessagesmessageidreactions) | Remove our reaction |
 | POST | [`/chats/{chatId}/typing`](#post-chatschatidtyping) | Typing indicator on/off |
@@ -285,9 +311,15 @@ Content-Type: application/json
 | Field | Type | Rule |
 |---|---|---|
 | `text` | string | non-empty, else `400 InvalidRequest` |
-| `quoteMessageId` | string, optional | Send as a reply to that message. `404 MessageUnknown` if the bridge never saw or sent it this run. |
+| `quoteMessageId` | string, optional | Send as a reply to that message. `404 MessageUnknown` if the bridge never saw or sent it. |
+| `sendAt` | ISO-8601, optional | Hold the send until then. The answer is `202 {scheduledId, sendAt, deliverWhenOnline}` and nothing is sent now. |
+| `deliverWhenOnline` | boolean, optional | With `sendAt`: also wait until the recipient is online, up to 24 hours after `sendAt`, then send anyway. |
 
-Errors: `503 NotConnected`, `502 SendFailed`, `404 MessageUnknown`. Direct sends are **not** retried by the bridge (turn replies are); a single attempt is capped at 30 seconds. On `NotConnected` with `state: "connecting"` wait and retry; on `SendFailed` retry once after a pause, then give up and tell the user another way.
+```json
+202 {"scheduledId":"sched_c4b3d5de2f514669","sendAt":"2026-09-11T08:00:00.000Z","deliverWhenOnline":false}
+```
+
+Errors: `503 NotConnected`, `502 SendFailed`, `404 MessageUnknown`, `500 StoreError` (scheduling could not be written). Direct sends are **not** retried by the bridge (turn replies are); a single attempt is capped at 30 seconds. On `NotConnected` with `state: "connecting"` wait and retry; on `SendFailed` retry once after a pause, then give up and tell the user another way.
 
 #### `PATCH /chats/{chatId}/messages/{messageId}`
 
@@ -326,6 +358,21 @@ The same with bytes instead of a path (for a consumer that cannot see the bridge
 ```json
 {"data": "iVBORw0KGgoAAAANSUhEUgAA...", "mimetype": "image/png", "caption": "Revenue by month"}
 ```
+
+`sendAt` and `deliverWhenOnline` work here as on text sends: the file is read and checked now, held, and sent later; the answer is `202 {scheduledId, sendAt, deliverWhenOnline}`.
+
+#### `POST /chats/{chatId}/forward`
+
+Forward a message to this chat: one the bridge received or sent, this run or, with history on, ever. WhatsApp shows it as forwarded.
+
+```http
+POST /chats/447700900456@s.whatsapp.net/forward
+Content-Type: application/json
+
+{"fromChatId": "447700900123@s.whatsapp.net", "messageId": "3EB0C8F1A2B3C4D5E6F7"}
+```
+
+`200 {"chatId","messageId"}`. Errors: `404 MessageUnknown`, `503 NotConnected`, `502 SendFailed`.
 
 | Status | `_tag` | When |
 |---|---|---|
@@ -393,6 +440,67 @@ The download can take a while for large files; the call blocks until it is done.
 #### `GET /chats/{chatId}/messages/{messageId}/media/content`
 
 The same as above, but the response body is the file itself and `Content-Type` is the file's mimetype. Use it when Intro runs on another machine than the bridge and cannot open `path`. Same errors, as JSON.
+
+#### `GET /chats`
+
+The chats in the history, most recent first. `409 HistoryDisabled` when history is off.
+
+```json
+200 [{"chatId":"447700900123@s.whatsapp.net","name":"Moishi","isGroup":false,"lastMessageAt":"2026-09-10T10:15:35.100Z","messageCount":412}]
+```
+
+`name` is the push name of the last person who wrote in the chat.
+
+#### `GET /chats/{chatId}`
+
+What the bridge knows about one chat. Always answers, history or not. For a group it fetches the subject, description, owner and members (cached for 5 minutes).
+
+```json
+200 {"chatId":"123-456@g.us","isGroup":true,"name":"Family","lastMessageAt":"...","messageCount":88,
+     "group":{"chatId":"123-456@g.us","subject":"Family","participants":[{"jid":"447700900123@s.whatsapp.net","phone":"447700900123","admin":true}]}}
+```
+
+Errors: `503 NotConnected` and `502 LookupFailed` (groups only), `500 StoreError`.
+
+#### `GET /chats/{chatId}/messages`
+
+A chat's history, newest first, both directions. `409 HistoryDisabled` when history is off.
+
+| Query | Meaning |
+|---|---|
+| `limit` | Page size, 50 by default, 500 at most. |
+| `before` | Only messages older than this message id: the cursor for paging back. |
+| `since` | Only messages newer than this instant (ISO-8601): "what happened since I last looked". |
+| `q` | Full-text search within the chat instead of a page; each hit carries a `snippet`. |
+
+Each row is a [`HistoryRow`](#historyrow). A row with a `mediaPath` counts as a use of that file for the cache.
+
+#### `GET /messages`
+
+Full-text search across every chat: `?q=dentist&limit=20&before=<messageId>`. Words become prefix terms joined with AND, so `dent tomo` finds "dentist tomorrow"; a quoted query is one phrase. Text, captions and edited text are indexed; tombstoned messages are not. Newest first, each hit a [`HistoryRow`](#historyrow) with a `snippet` where the match is marked `[like this]`. `409 HistoryDisabled` when history is off.
+
+#### `GET /contacts/{jid}`
+
+```json
+200 {"jid":"447700900123@s.whatsapp.net","phone":"447700900123","name":"Moishi","pictureUrl":"https://pps.whatsapp.net/...","onWhatsApp":true}
+```
+
+`name` is the push name (what the person set on WhatsApp), known once they have written to the line. `pictureUrl` expires; fetch again when needed. A phone number (digits, or a jid) is checked with WhatsApp: `onWhatsApp: false` means nothing can be sent there. Errors: `503 NotConnected`, `502 LookupFailed`.
+
+#### `GET /scheduled`
+
+Pending scheduled sends, then the ones closed in the last day.
+
+```json
+200 [{"scheduledId":"sched_c4b3d5de2f514669","chatId":"447700900123@s.whatsapp.net","kind":"text","sendAt":"2026-09-11T08:00:00.000Z",
+      "deliverWhenOnline":false,"status":"pending","createdAt":"2026-09-10T12:53:18.114Z"}]
+```
+
+`status` is `pending`, `sent` (with `messageId`), `skipped` or `failed` (with `detail`), or `cancelled`.
+
+#### `DELETE /scheduled/{scheduledId}`
+
+Cancel a pending scheduled send. `204`, or `404 ScheduledNotFound` when it is not pending.
 
 #### `GET /turns`
 
@@ -500,6 +608,11 @@ Every event is a JSON object with the envelope `{"_tag", "v": 1, "seq", "at"}` p
 | `ReactionReceived` | `chatId`, `messageId`, `senderId`, `emoji`, `onOurMessage` | Someone reacted in a handled chat. Empty `emoji` means removed. `onOurMessage` is true when the target is a message the bridge sent. Informational; never opens a turn. |
 | `MessageEdited` | `chatId`, `messageId`, `text` | The sender edited an accepted message; `text` is the new body. A pending message is corrected in place (batching) or its turn is superseded (responding, awaiting). |
 | `MessageDeleted` | `chatId`, `messageId` | The sender deleted an accepted message for everyone. A pending message is dropped; a turn left empty is cancelled. |
+| `MessageDelivered` | `chatId`, `messageId`, `participantId?` | A message the bridge sent reached a device. In groups one per participant. |
+| `MessageRead` | `chatId`, `messageId`, `participantId?` | A message the bridge sent was read (or a voice note played). In groups one per participant. Needs the recipient's read receipts on. |
+| `ScheduledSent` | `scheduledId`, `chatId`, `messageId` | A scheduled send went out. |
+| `ScheduledSkipped` | `scheduledId`, `chatId`, `reason` | A scheduled send was dropped: over an hour late after downtime, or the recipient never came online within 24 hours. |
+| `ScheduledFailed` | `scheduledId`, `chatId`, `reason` | A scheduled send failed at the transport. |
 | `ConnectionChanged` | `state`, `detail?` | The WhatsApp connection changed state; same values as `/health`. |
 
 ```json
@@ -639,6 +752,35 @@ A file to send: the body of `POST /chats/{chatId}/media`, each element of `attac
 | `fileName` | string | Shown on document cards. Defaults to the path's basename, or `file.<ext>` for raw data. |
 | `voiceNote` | boolean | Audio only: send as a voice-note bubble. WhatsApp plays those only as `audio/ogg; codecs=opus`. |
 
+#### `HistoryRow`
+
+One message from the history, as `GET /chats/{chatId}/messages` and `GET /messages` return it.
+
+| Field | Type | Present | Meaning |
+|---|---|---|---|
+| `chatId`, `messageId` | string | always | |
+| `direction` | `in` or `out` | always | Received by the bridge, or sent by it. |
+| `senderId` | string | always | The sender's jid; `me` for the bridge's own messages. |
+| `senderName` | string | when known | Push name. |
+| `isGroup` | boolean | always | |
+| `timestamp` | ISO-8601 | always | |
+| `kind` | `MessageKind` | always | |
+| `text` | string | unless deleted | The body or caption as first seen. |
+| `editedText` | string | after an edit | The latest body. Read `editedText ?? text`. |
+| `mimetype` | string | for attachments | |
+| `mediaPath` | string | when downloaded | The local file; gone once `mediaEvictedAt` is set. |
+| `mediaEvictedAt` | ISO-8601 | after eviction | The cache let the file go. Fetch it again through the media endpoint. |
+| `quotedMessageId` | string | when quoting | |
+| `status` | `sent`, `delivered`, `read` | outbound | Never goes backwards. |
+| `deletedAt` | ISO-8601 | on a tombstone | The sender deleted it for everyone; the text is gone. |
+| `turnId` | string | when part of a turn | The turn it belonged to (inbound) or answered (outbound). |
+| `reactions` | `[{senderId, emoji, at}]` | always | Current reactions on it. |
+| `snippet` | string | search results | The matched text with the hit marked `[like this]`. |
+
+#### `ScheduledSend`
+
+`{scheduledId, chatId, kind: "text" | "media", sendAt, deliverWhenOnline, status, createdAt, messageId?, detail?}`. See [`GET /scheduled`](#get-scheduled).
+
 #### `BridgeStatus`
 
 The body of `GET /health` and `GET /status`, and the `status` field of `Unhealthy`.
@@ -655,6 +797,8 @@ The body of `GET /health` and `GET /status`, and the `status` field of `Unhealth
 | `reconnects` | integer | always | Socket closes seen this run. |
 | `lastDisconnect` | `{at, reason}` | after the first close | |
 | `openTurns` | integer | always | Turns in an open state. |
+| `databasePath` | string | always | The SQLite file, for opening read-only with `sqlite3`. |
+| `history` | boolean | always | Whether message history is being recorded. |
 
 #### `SentMessage` and `ReplyResult`
 
@@ -673,6 +817,10 @@ Every error body is `{"_tag": "...", ...fields}`. The status code is fixed per t
 | 404 | `MessageUnknown` | `chatId`, `messageId`, `reason` | The message to quote, edit or delete is not one the bridge saw or sent this run. | Check the id; after a restart, only new messages are known. |
 | 409 | `MessageTooOld` | `chatId`, `messageId`, `operation`, `limitMs`, `ageMs` | WhatsApp's window for the edit (15 minutes) or delete (about 2 days) has passed. | Send a correction as a new message instead. |
 | 409 | `TurnNotOpen` | `turnId`, `state` | `progress` or `abandon` on a turn that is not `responding` or `awaiting`. | Nothing to do. |
+| 409 | `HistoryDisabled` | | A history endpoint was called with history off. | Enable history, or use the live turn data. |
+| 404 | `ScheduledNotFound` | `scheduledId` | No pending scheduled send with that id (already sent, cancelled, or unknown). | Check `GET /scheduled`. |
+| 502 | `LookupFailed` | `subject`, `detail` | WhatsApp refused or timed out a contact or group lookup. | Retry later. |
+| 500 | `StoreError` | `operation`, `detail` | The database misbehaved. | Check disk space and the log. |
 | 404 | `MediaUnavailable` | `chatId`, `messageId`, `reason` | No media on that message, or not seen this run and nothing on disk. | Say so in the reply rather than pretending the attachment was seen. |
 | 404 | `OutboundFileUnreadable` | `path`, `detail` | The file to send does not exist, is a directory, or is not readable by the daemon. | Check the path (absolute, on the bridge machine). |
 | 400 | `OutboundInvalid` | `detail` | Raw `data` without a `mimetype`, or an empty file. | Fix the payload. |
@@ -720,7 +868,16 @@ The client commands (`health`, `send`, `react`, `unreact`, `media`, `turns`, `re
 | `run` | | The daemon: WhatsApp connection, turn engine, HTTP API. Long-lived; Ctrl-C stops it after in-flight replies finish. | Logs |
 | `harness` | `--slow <duration>` (0), `--once` | `run` with the `pong` responder. `--once` exits after the first completed turn. | Logs |
 | `health` | | `GET /status` | The `BridgeStatus`; **exit code 0 only when `state` is `ok`**, 1 otherwise. Unreachable daemon: `{"state":"stopped","detail":"daemon not reachable at ..."}` and exit 1. |
-| `send` | `--to <jid or phone>`, then `--text <text>` or `--file <path>` (with `--caption`, `--as <image\|video\|audio\|document>`), `--quote <messageId>` | `POST /chats/{chatId}/messages` or `POST /chats/{chatId}/media`. A phone number in any format is converted to a jid. | `{"chatId","messageId"}` |
+| `send` | `--to <jid or phone>`, then `--text <text>` or `--file <path>` (with `--caption`, `--as <image\|video\|audio\|document>`), `--quote <messageId>`, `--at <ISO-8601>` with `--when-online` | `POST /chats/{chatId}/messages` or `POST /chats/{chatId}/media`. A phone number in any format is converted to a jid. | `{"chatId","messageId"}`, or the scheduled record |
+| `forward` | `--from <chat>`, `--message <id>`, `--to <chat>` | `POST /chats/{chatId}/forward` | `{"chatId","messageId"}` |
+| `contact` | `--jid <jid or phone>` | `GET /contacts/{jid}` | `ContactInfo` |
+| `chats` | | `GET /chats` | `ChatSummary[]` |
+| `messages` | `--chat`, `--q`, `--before`, `--limit` | `GET /chats/{chatId}/messages` | `HistoryRow[]` |
+| `search` | `--q`, `--limit` | `GET /messages` | `HistoryRow[]` |
+| `scheduled` | | `GET /scheduled` | `ScheduledSend[]` |
+| `unschedule` | `--id` | `DELETE /scheduled/{id}` | `{"ok":true}` |
+| `history enable` | `--yes` | Prints what history stores, asks, writes `data/history.accepted`. Needed once before `BRIDGE_HISTORY=true`. | |
+| `history purge` | `--before <ISO-8601>`, `--yes` | Deletes history older than the instant, straight in the database. | `Removed N message(s)` |
 | `edit` | `--chat`, `--message <id>`, `--text` | `PATCH /chats/{chatId}/messages/{messageId}` | `{"ok":true}` |
 | `delete` | `--chat`, `--message <id>` | `DELETE /chats/{chatId}/messages/{messageId}` | `{"ok":true}` |
 | `react` | `--chat <jid or phone>`, `--message <id>`, `--emoji <emoji>` (👀) | `POST .../reactions` | `{"ok":true}` |
@@ -747,6 +904,14 @@ Durations on the CLI use the same format as the configuration: `"15 seconds"`, `
 **Correct yourself.** `PATCH /chats/{chatId}/messages/{messageId} {"text": "..."}` within 15 minutes of sending; `DELETE` within about 2 days. Both only for messages the bridge sent since it started.
 
 **The user edited or deleted something.** Nothing to do: a pending message is corrected or dropped for you, and the turn is superseded or cancelled with an event. If the edit arrives after you answered, `MessageEdited` is your cue to answer again if it matters.
+
+**Remember.** With history on, `GET /chats/{chatId}/messages?limit=30` before answering gives the recent conversation; `?since=<when you last looked>` gives what you missed; `GET /messages?q=dentist` finds it wherever it was said. Read `editedText ?? text`, skip rows with `deletedAt`, and treat `mediaEvictedAt` as "fetch the file again if you need it".
+
+**Schedule a message.** `POST /chats/{chatId}/messages {"text": "Dentist in an hour.", "sendAt": "2026-09-11T09:00:00Z"}` answers `202` with a `scheduledId`; `DELETE /scheduled/{id}` cancels it. Add `"deliverWhenOnline": true` for something that should land when the person is around. Watch `ScheduledSent`, `ScheduledSkipped` and `ScheduledFailed`.
+
+**Pass something on.** `POST /chats/{otherChatId}/forward {"fromChatId", "messageId"}` forwards a message, attachments included, without downloading and re-uploading it.
+
+**Who is this?** `GET /contacts/{jid}` before writing to a number you have not seen: `onWhatsApp: false` means the message can never arrive. `GET /chats/{groupId}` lists a group's members and admins.
 
 **Watch the reactions.** `ReactionReceived` with `onOurMessage: true` is feedback on an answer: a 👍 needs nothing, a ❌ or 👎 is worth a follow-up in the same chat.
 
@@ -776,7 +941,9 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BRIDGE_DATA_DIR` | `./data` | Session lives in `$BRIDGE_DATA_DIR/auth` |
+| `BRIDGE_DATA_DIR` | `./data` | Session lives in `$BRIDGE_DATA_DIR/auth`, the database in `$BRIDGE_DATA_DIR/bridge.db` |
+| `BRIDGE_DATABASE_PATH` | `<data dir>/bridge.db` | Where the SQLite file lives |
+| `BRIDGE_HISTORY` | `false` | Record every message; needs `bridge history enable` first |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8787` | Where the API listens |
 | `BRIDGE_API_TOKEN` | unset | Bearer token for the API |
 | `BRIDGE_RESPONDER` | `manual` | `manual`, `http` or `pong` |
@@ -801,7 +968,8 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 | `BRIDGE_MEDIA_AUTO` | `images` | `images`, `all` or `none`: what is downloaded before a turn opens |
 | `BRIDGE_MEDIA_MAX_BYTES` | `26214400` | Refuse larger attachments, inbound and outbound |
 | `BRIDGE_MEDIA_WAIT` | `8 seconds` | How long a turn waits for an automatic download |
-| `BRIDGE_MEDIA_RETENTION` | `7 days` | Downloaded files older than this are deleted |
+| `BRIDGE_MEDIA_MAX_DISK` | `1073741824` | Disk budget for downloaded files; least recently used go first |
+| `BRIDGE_MEDIA_RETENTION` | unset | Optional maximum age for downloaded files |
 | `BRIDGE_MEDIA_SWEEP_EVERY` | `1 hour` | How often the retention sweep runs |
 | `BRIDGE_HARNESS_SLOW` | `0 seconds` | The pong responder's thinking time (`bridge harness --slow` overrides it) |
 | `BRIDGE_URL` | `http://$HOST:$PORT` | Where the CLI client commands find the daemon |
@@ -815,7 +983,8 @@ Durations use Effect's format: `"1500 millis"`, `"2 seconds"`, `"10 minutes"`. A
 ```json
 { "state": "ok", "linkedAs": { "jid": "4479...@s.whatsapp.net", "name": "Intro" }, "responder": "manual",
   "version": "0.2.0", "startedAt": "...", "lastEventAt": "...", "lastInboundAt": "...", "lastOutboundAt": "...",
-  "reconnects": 2, "lastDisconnect": { "at": "...", "reason": "Connection Terminated (428)" }, "openTurns": 0 }
+  "reconnects": 2, "lastDisconnect": { "at": "...", "reason": "Connection Terminated (428)" }, "openTurns": 0,
+  "databasePath": "/home/box/whatsapp-bridge/data/bridge.db", "history": true }
 ```
 
 | `state` | Meaning | What to do |
@@ -852,6 +1021,8 @@ The bridge is built so that every failure is either recovered automatically or r
 | Sending the reply fails | Retried 5 times with backoff (about 30 s, enough for a reconnect); then `TurnFailed`. The message id is fixed before the first attempt, so a send that timed out but went through is never delivered twice. |
 | A reply is very long or empty | Text over 4000 characters is split at paragraph, line or sentence boundaries into several messages; blank replies are dropped. |
 | An attachment fails to download | The turn still opens (without `media`) after `BRIDGE_MEDIA_WAIT`; the failure is logged; the on-demand endpoint retries (failures are never cached). |
+| The database cannot be written | History and state writes are logged and skipped; the daemon keeps handling messages. A database that cannot be opened at all stops startup with the reason. |
+| The daemon was down when a scheduled send was due | Sent on startup if under an hour late, otherwise dropped with `ScheduledSkipped`. |
 | A file Intro wants to send is missing, unreadable or too big | Refused with `OutboundFileUnreadable` / `OutboundTooLarge` before anything is sent; on a reply the turn stays `awaiting`; in `http` mode the turn fails with the reason. |
 | Uploading a file to WhatsApp stalls | The send is capped at 3 minutes and answers `SendFailed`; a turn reply is retried like a text. |
 | The 👀 reaction fails | Warning logged; `BRIDGE_SEEN_FALLBACK_TEXT` sends a text instead. |
@@ -865,6 +1036,7 @@ The bridge is built so that every failure is either recovered automatically or r
 
 - The session under `data/auth` is the keys to the number. The directory is created with mode 0700 and is git-ignored, as are `.env` files. Never commit or share it.
 - The API binds to loopback by default. If you must expose it, set `BRIDGE_API_TOKEN` and put it behind something that terminates TLS.
+- `data/bridge.db` is created 0600. With history on it holds every message in plain text; back it up with the same care as the session, and purge what you do not need.
 - Sending by `path` reads any file the daemon's user can read and hands it to WhatsApp. That is the point on Intro's own machine; it is one more reason to keep the API on loopback or behind the token, and to run the daemon as a user with nothing to leak.
 - The bridge makes no calls to OpenAI, xAI or any model provider. Its only outbound connections are WhatsApp's servers, the WhatsApp Web version lookup at startup, and `INTRO_HANDLER_URL` if you configure one.
 - `markOnlineOnConnect` is off so the phone keeps receiving notifications.

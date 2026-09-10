@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-bridge",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "WhatsApp <-> Intro bridge: a local daemon on a dedicated number, built on Effect v4 and Baileys",
   "type": "module",
@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@effect/platform-node": "4.0.0-rc.109",
+    "@effect/sql-sqlite-node": "4.0.0-rc.109",
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "effect": "4.0.0-rc.109",
     "pino": "^9.6.0",

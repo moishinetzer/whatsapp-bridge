@@ -43,6 +43,10 @@ export type HealthSnapshot = typeof HealthSnapshot.Type
 export const BridgeStatus = HealthSnapshot.pipe(
   Schema.fieldsAssign({
     openTurns: Schema.Number,
+    /** The SQLite file; open it read-only with `sqlite3` for anything the API does not cover. */
+    databasePath: Schema.String,
+    /** Whether message history is being recorded. */
+    history: Schema.Boolean,
   }),
 )
 export type BridgeStatus = typeof BridgeStatus.Type

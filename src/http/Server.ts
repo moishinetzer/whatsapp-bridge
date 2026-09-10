@@ -12,16 +12,21 @@ import { Outbound } from "../engine/Outbound.ts"
 import type { Outgoing } from "../domain/outbound.ts"
 import type { MessageId } from "../domain/ids.ts"
 import { TurnNotOpen, TurnRegistry } from "../engine/Turns.ts"
+import { Scheduler } from "../store/Scheduled.ts"
+import { Store } from "../store/Store.ts"
 import { SendFailed, WhatsApp } from "../whatsapp/WhatsApp.ts"
+import type { ChatId } from "../domain/ids.ts"
+import type { HistoryRow } from "../domain/history.ts"
 import { EVENT_SCHEMA_VERSION, type BridgeEvent } from "../domain/events.ts"
 import { BridgeApi, Unhealthy } from "./Api.ts"
 
 const status = Effect.gen(function* () {
   const health = yield* Health
   const registry = yield* TurnRegistry
+  const store = yield* Store
   const snapshot = yield* health.get
   const openTurns = yield* registry.openCount
-  return { ...snapshot, openTurns }
+  return { ...snapshot, openTurns, databasePath: store.databasePath, history: store.historyEnabled }
 })
 
 export const HealthGroupLive = HttpApiBuilder.group(BridgeApi, "health", (handlers) =>
@@ -64,7 +69,23 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
     .handle("send", ({ params, payload }) =>
       Effect.gen(function* () {
         const whatsapp = yield* WhatsApp
+        if (payload.sendAt !== undefined) {
+          const scheduler = yield* Scheduler
+          const held = yield* scheduler.schedule(
+            { kind: "text", chatId: params.chatId, payload: { text: payload.text, ...(payload.quoteMessageId === undefined ? {} : { quoteMessageId: payload.quoteMessageId }) } },
+            payload.sendAt,
+            payload.deliverWhenOnline === true,
+          )
+          return { scheduledId: held.scheduledId, sendAt: held.sendAt, deliverWhenOnline: held.deliverWhenOnline }
+        }
         const messageId = yield* whatsapp.sendText(params.chatId, payload.text, { quoteMessageId: payload.quoteMessageId })
+        return { chatId: params.chatId, messageId }
+      }),
+    )
+    .handle("forward", ({ params, payload }) =>
+      Effect.gen(function* () {
+        const whatsapp = yield* WhatsApp
+        const messageId = yield* whatsapp.forward(params.chatId, payload.fromChatId, payload.messageId)
         return { chatId: params.chatId, messageId }
       }),
     )
@@ -74,7 +95,14 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
       Effect.gen(function* () {
         const outbound = yield* Outbound
         const whatsapp = yield* WhatsApp
-        const media = yield* outbound.load(payload)
+        const { sendAt, deliverWhenOnline, ...file } = payload
+        // The file is checked now, even for a later send, so a bad path is a 4xx today rather than a failure tonight.
+        const media = yield* outbound.load(file)
+        if (sendAt !== undefined) {
+          const scheduler = yield* Scheduler
+          const held = yield* scheduler.schedule({ kind: "media", chatId: params.chatId, payload: file }, sendAt, deliverWhenOnline === true)
+          return { scheduledId: held.scheduledId, sendAt: held.sendAt, deliverWhenOnline: held.deliverWhenOnline }
+        }
         const messageId = yield* whatsapp.sendMedia(params.chatId, media)
         return { chatId: params.chatId, messageId }
       }),
@@ -92,6 +120,62 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
         )
       }),
     ),
+)
+
+/** Any row that still has a file on disk counts as used when it is returned. */
+const touchMedia = (rows: ReadonlyArray<HistoryRow>) =>
+  Effect.forEach(
+    rows.filter((r) => r.mediaPath !== undefined && r.mediaEvictedAt === undefined),
+    (r) => MediaStore.use((m) => m.touch(r.chatId, r.messageId)),
+    { discard: true },
+  )
+
+export const HistoryGroupLive = HttpApiBuilder.group(BridgeApi, "history", (handlers) =>
+  handlers
+    .handle("chats", () => Store.use((s) => s.chats))
+    .handle("chat", ({ params }) =>
+      Effect.gen(function* () {
+        const store = yield* Store
+        const whatsapp = yield* WhatsApp
+        const chatId: ChatId = params.chatId
+        const isGroup = chatId.endsWith("@g.us")
+        const known = yield* store.chats.pipe(Effect.catchTag("HistoryDisabled", () => Effect.succeed([])))
+        const summary = known.find((c) => c.chatId === chatId)
+        const group = isGroup ? yield* whatsapp.groupInfo(chatId) : undefined
+        return {
+          chatId,
+          isGroup,
+          ...(summary?.name === undefined ? (group === undefined ? {} : { name: group.subject }) : { name: summary.name }),
+          ...(summary === undefined ? {} : { lastMessageAt: summary.lastMessageAt, messageCount: summary.messageCount }),
+          ...(group === undefined ? {} : { group }),
+        }
+      }),
+    )
+    .handle("chatMessages", ({ params, query }) =>
+      Effect.gen(function* () {
+        const store = yield* Store
+        const limit = query.limit ?? 50
+        const rows: ReadonlyArray<HistoryRow> =
+          query.q !== undefined && query.q.trim().length > 0
+            ? yield* store.search(query.q, { chatId: params.chatId, before: query.before, limit })
+            : yield* store.messages(params.chatId, { before: query.before, since: query.since, limit })
+        yield* touchMedia(rows)
+        return rows
+      }),
+    )
+    .handle("search", ({ query }) =>
+      Effect.gen(function* () {
+        const store = yield* Store
+        const rows: ReadonlyArray<HistoryRow> = yield* store.search(query.q, { before: query.before, limit: query.limit ?? 50 })
+        yield* touchMedia(rows)
+        return rows
+      }),
+    )
+    .handle("contact", ({ params }) => WhatsApp.use((w) => w.contact(params.jid))),
+)
+
+export const ScheduledGroupLive = HttpApiBuilder.group(BridgeApi, "scheduled", (handlers) =>
+  handlers.handle("list", () => Scheduler.use((s) => s.list)).handle("cancel", ({ params }) => Scheduler.use((s) => s.cancel(params.scheduledId))),
 )
 
 export const TurnsGroupLive = HttpApiBuilder.group(BridgeApi, "turns", (handlers) =>
@@ -182,7 +266,7 @@ export const ClientErrorsLive = HttpRouter.middleware(
 /** All groups mounted, plus the OpenAPI document and the Scalar UI. */
 export const ApiLive = Layer.mergeAll(
   HttpApiBuilder.layer(BridgeApi, { openapiPath: "/openapi.json" }).pipe(
-    Layer.provide([HealthGroupLive, EventsGroupLive, ChatsGroupLive, TurnsGroupLive]),
+    Layer.provide([HealthGroupLive, EventsGroupLive, ChatsGroupLive, HistoryGroupLive, ScheduledGroupLive, TurnsGroupLive]),
   ),
   HttpApiScalar.layer(BridgeApi, { path: "/docs" }),
   ClientErrorsLive,

@@ -24,6 +24,7 @@ import { isMedia, outgoing, type Outgoing } from "../domain/outbound.ts"
 import { WhatsApp, type InboundUpdate, type MessageError, type WhatsAppError } from "../whatsapp/WhatsApp.ts"
 import { Events } from "./Events.ts"
 import { MediaStore, type MediaError } from "./Media.ts"
+import { Store } from "../store/Store.ts"
 import { Responder, type TurnPayload } from "./Responder.ts"
 import { prepareOutgoing } from "./text.ts"
 
@@ -247,7 +248,19 @@ export const TurnRegistryLive = Layer.effect(
   TurnRegistry,
   Effect.gen(function* () {
     const config = yield* BridgeConfig
+    const store = yield* Store
     const turns = yield* Ref.make(HashMap.empty<TurnId, TurnRecord>())
+
+    /** Every state change lands in the database; a failure there never touches the turn. */
+    const persist = (turnId: TurnId) =>
+      Effect.gen(function* () {
+        const map = yield* Ref.get(turns)
+        const record = HashMap.get(map, turnId)
+        if (Option.isNone(record)) return
+        yield* store.recordTurn(record.value.summary).pipe(
+          Effect.catch((e) => Effect.logDebug("could not persist the turn").pipe(Effect.annotateLogs({ turnId, reason: e.message }))),
+        )
+      })
 
     const prune = (map: HashMap.HashMap<TurnId, TurnRecord>): HashMap.HashMap<TurnId, TurnRecord> => {
       if (HashMap.size(map) <= HISTORY) return map
@@ -298,9 +311,10 @@ export const TurnRegistryLive = Layer.effect(
         })
         return prune(HashMap.set(map, summary.turnId, record))
       })
+      yield* persist(summary.turnId)
     })
 
-    const setState = (turnId: TurnId, state: TurnState) => patch(turnId, { state })
+    const setState = (turnId: TurnId, state: TurnState) => Effect.andThen(patch(turnId, { state }), persist(turnId))
 
     const abandonRequested = (turnId: TurnId) => Effect.flatMap(getRecord(turnId).pipe(Effect.orDie), (r) => Deferred.await(r.abandon))
 
@@ -380,22 +394,26 @@ export const TurnRegistryLive = Layer.effect(
       }))
       const record = yield* getRecord(turnId).pipe(Effect.option)
       if (Option.isSome(record)) yield* Deferred.succeed(record.value.done, sent)
+      yield* persist(turnId)
     })
 
     const supersede = Effect.fn("TurnRegistry.supersede")(function* (turnId: TurnId, by: TurnId) {
       yield* update(turnId, (r) => ({ ...r, awaiting: Option.none(), summary: { ...r.summary, state: "superseded", supersededBy: by } }))
+      yield* persist(turnId)
     })
 
     const fail = Effect.fn("TurnRegistry.fail")(function* (turnId: TurnId, reason: string) {
       yield* update(turnId, (r) => ({ ...r, awaiting: Option.none(), summary: { ...r.summary, state: "failed", failure: reason } }))
       const record = yield* getRecord(turnId).pipe(Effect.option)
       if (Option.isSome(record)) yield* Deferred.fail(record.value.done, new TurnFailedError({ turnId, reason }))
+      yield* persist(turnId)
     })
 
     const cancel = Effect.fn("TurnRegistry.cancel")(function* (turnId: TurnId, reason: string) {
       yield* update(turnId, (r) => ({ ...r, awaiting: Option.none(), summary: { ...r.summary, state: "cancelled" } }))
       const record = yield* getRecord(turnId).pipe(Effect.option)
       if (Option.isSome(record)) yield* Deferred.fail(record.value.done, new TurnFailedError({ turnId, reason: `cancelled: ${reason}` }))
+      yield* persist(turnId)
     })
 
     const reply = Effect.fn("TurnRegistry.reply")(function* (
@@ -534,6 +552,7 @@ export const TurnEngineLive = Layer.effectDiscard(
     const registry = yield* TurnRegistry
     const responder = yield* Responder
     const mediaStore = yield* MediaStore
+    const store = yield* Store
     const scope = yield* Effect.scope
     const chats = yield* Ref.make(HashMap.empty<ChatId, ChatState>())
     // Defence in depth: the transport dedupes too, but one 👀 and one turn per message is this engine's promise.
@@ -725,6 +744,7 @@ export const TurnEngineLive = Layer.effectDiscard(
           messages: turn.messages,
           ...(turn.supersedes === undefined ? {} : { supersedes: turn.supersedes }),
         })
+        yield* store.setTurn(turn.chatId, turn.messages.map((m) => m.messageId), turn.turnId).pipe(Effect.ignore)
         const typingFiber = yield* keepTyping(turn.turnId, turn.chatId)
 
         yield* Effect.uninterruptibleMask((restore) =>
@@ -754,8 +774,8 @@ export const TurnEngineLive = Layer.effectDiscard(
                 const messageId = yield* whatsapp.newOutboundId
                 const send = (quoteMessageId: MessageId | undefined) =>
                   isMedia(item)
-                    ? whatsapp.sendMedia(turn.chatId, item, { messageId, quoteMessageId })
-                    : whatsapp.sendText(turn.chatId, item.text, { messageId, quoteMessageId })
+                    ? whatsapp.sendMedia(turn.chatId, item, { messageId, quoteMessageId, turnId: turn.turnId })
+                    : whatsapp.sendText(turn.chatId, item.text, { messageId, quoteMessageId, turnId: turn.turnId })
                 // A quote the bridge cannot resolve must not sink the reply: send it unquoted.
                 return yield* send(item.quoteMessageId).pipe(
                   Effect.catchTag("MessageUnknown", (e) =>

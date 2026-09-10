@@ -7,14 +7,18 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MediaFile } from "../src/domain/message.ts"
 import { MediaStore, MediaStoreLive } from "../src/engine/Media.ts"
+import { StoreWithDatabaseLive } from "../src/store/Store.ts"
 import { FakeWhatsApp, FakeWhatsAppLive, TestConfigLive, chat, jpeg, message } from "./support/fakes.ts"
 
-const storeLayer = (dir: string, extra: Parameters<typeof TestConfigLive>[0] = {}) =>
-  Layer.mergeAll(
-    MediaStoreLive.pipe(Layer.provide([TestConfigLive({ mediaDir: dir, ...extra }), FakeWhatsAppLive, NodeServices.layer])),
+const storeLayer = (dir: string, extra: Parameters<typeof TestConfigLive>[0] = {}) => {
+  const config = TestConfigLive({ mediaDir: dir, ...extra })
+  const storage = StoreWithDatabaseLive.pipe(Layer.provide([config, NodeServices.layer]))
+  return Layer.mergeAll(
+    MediaStoreLive.pipe(Layer.provide([config, FakeWhatsAppLive, storage, NodeServices.layer])),
     FakeWhatsAppLive,
     NodeServices.layer,
   )
+}
 
 describe("MediaStore", () => {
   it.effect("downloads once, persists the file and a sidecar with tight permissions", () =>
@@ -130,6 +134,46 @@ describe("MediaStore", () => {
       expect(MediaFile.fields.downloadedAt).toBeDefined()
       expect(DateTime.toEpochMillis(freshFile.downloadedAt)).toBeGreaterThan(DateTime.toEpochMillis(oldFile.downloadedAt))
       expect(record).toContain("image/jpeg")
-    }).pipe(Effect.provide(storeLayer(mkdtempSync(join(tmpdir(), "media-f-")), { mediaSweepEvery: Duration.days(365) }))),
+    }).pipe(
+      Effect.provide(
+        storeLayer(mkdtempSync(join(tmpdir(), "media-f-")), { mediaSweepEvery: Duration.days(365), mediaRetention: Option.some(Duration.days(7)) }),
+      ),
+    ),
+  )
+
+  it.effect("evicts least recently used files once the disk budget is exceeded", () =>
+    Effect.gen(function* () {
+      const store = yield* MediaStore
+      const wa = yield* FakeWhatsApp
+      const fs = yield* FileSystem.FileSystem
+      const a = message("a", { kind: "image" })
+      const b = message("b", { kind: "image" })
+      const c = message("c", { kind: "image" })
+      yield* Ref.set(wa.media, new Map([[a.messageId, jpeg(100)], [b.messageId, jpeg(100)], [c.messageId, jpeg(100)]]))
+      const fa = yield* store.get(chat, a.messageId)
+      yield* TestClock.adjust("1 second")
+      const fb = yield* store.get(chat, b.messageId)
+      yield* TestClock.adjust("1 second")
+      // a is used again, so b is now the least recently used.
+      yield* store.get(chat, a.messageId)
+      yield* TestClock.adjust("1 second")
+      const fc = yield* store.get(chat, c.messageId)
+      expect((yield* store.usage).bytes).toBe(300)
+      const removed = yield* store.sweep
+      expect(removed).toBe(1)
+      expect(yield* fs.exists(fb.path)).toBe(false)
+      expect(yield* fs.exists(fa.path)).toBe(true)
+      expect(yield* fs.exists(fc.path)).toBe(true)
+      expect(yield* store.usage).toEqual({ bytes: 200, files: 2 })
+      // Touching keeps a file alive on the next sweep.
+      yield* Ref.set(wa.media, new Map([[b.messageId, jpeg(100)]]))
+      yield* TestClock.adjust("1 second")
+      yield* store.touch(chat, a.messageId)
+      yield* TestClock.adjust("1 second")
+      yield* store.get(chat, b.messageId)
+      yield* store.sweep
+      expect(yield* fs.exists(fc.path)).toBe(false)
+      expect(yield* fs.exists(fa.path)).toBe(true)
+    }).pipe(Effect.provide(storeLayer(mkdtempSync(join(tmpdir(), "media-g-")), { mediaSweepEvery: Duration.days(365), mediaMaxDisk: 250 }))),
   )
 })

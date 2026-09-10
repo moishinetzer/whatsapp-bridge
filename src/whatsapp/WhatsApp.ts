@@ -1,5 +1,5 @@
 import { Context, Effect, Schema, Stream } from "effect"
-import { ChatId, MessageId } from "../domain/ids.ts"
+import { ChatId, MessageId, TurnId } from "../domain/ids.ts"
 import type { InboundMessage, MessageKind } from "../domain/message.ts"
 import type { OutboundMedia } from "../domain/outbound.ts"
 import { BridgeState, LinkedIdentity } from "../domain/status.ts"
@@ -105,6 +105,56 @@ export interface DownloadedMedia {
   readonly kind: MessageKind
 }
 
+/** What `GET /contacts/{jid}` answers. Names are push names: what the person set on WhatsApp, not your address book. */
+export const ContactInfo = Schema.Struct({
+  jid: Schema.String,
+  phone: Schema.optionalKey(Schema.String),
+  name: Schema.optionalKey(Schema.String),
+  /** Expires after a while; fetch again when needed. */
+  pictureUrl: Schema.optionalKey(Schema.String),
+  onWhatsApp: Schema.Boolean,
+})
+export type ContactInfo = typeof ContactInfo.Type
+
+export const GroupParticipantInfo = Schema.Struct({
+  jid: Schema.String,
+  phone: Schema.optionalKey(Schema.String),
+  admin: Schema.Boolean,
+})
+
+export const GroupInfo = Schema.Struct({
+  chatId: ChatId,
+  subject: Schema.String,
+  description: Schema.optionalKey(Schema.String),
+  owner: Schema.optionalKey(Schema.String),
+  participants: Schema.Array(GroupParticipantInfo),
+  createdAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
+})
+export type GroupInfo = typeof GroupInfo.Type
+
+export const PresenceState = Schema.Literals(["available", "unavailable", "composing", "recording", "paused", "unknown"])
+export type PresenceState = typeof PresenceState.Type
+
+/** The last thing WhatsApp said about someone's presence. `lastSeenAt` is hidden by most privacy settings. */
+export const PresenceInfo = Schema.Struct({
+  chatId: ChatId,
+  state: PresenceState,
+  at: Schema.optionalKey(Schema.DateTimeUtcFromString),
+  lastSeenAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
+})
+export type PresenceInfo = typeof PresenceInfo.Type
+
+/** WhatsApp refused a lookup, or the id is not something it knows. */
+export class LookupFailed extends Schema.TaggedError<LookupFailed>()(
+  "LookupFailed",
+  { subject: Schema.String, detail: Schema.String },
+  { httpApiStatus: 502 },
+) {
+  override get message() {
+    return `lookup of ${this.subject} failed: ${this.detail}`
+  }
+}
+
 export interface SendOptions {
   /**
    * The id the message will carry. Generate it once with `newOutboundId` and
@@ -114,6 +164,8 @@ export interface SendOptions {
   readonly messageId?: MessageId | undefined
   /** Send as a reply to this message. `MessageUnknown` when the bridge never saw or sent it. */
   readonly quoteMessageId?: MessageId | undefined
+  /** The turn this send answers, for the history. */
+  readonly turnId?: TurnId | undefined
 }
 
 export interface WhatsAppShape {
@@ -132,6 +184,12 @@ export interface WhatsAppShape {
   readonly deleteMessage: (chatId: ChatId, messageId: MessageId) => Effect.Effect<void, WhatsAppError | MessageError>
   /** Mark accepted inbound messages as read (blue ticks). Unknown ids are skipped. */
   readonly markRead: (chatId: ChatId, messageIds: ReadonlyArray<MessageId>) => Effect.Effect<void, WhatsAppError>
+  /** Forward a message the bridge saw or sent to another chat. */
+  readonly forward: (toChatId: ChatId, fromChatId: ChatId, messageId: MessageId, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError | MessageUnknown>
+  readonly contact: (jid: string) => Effect.Effect<ContactInfo, NotConnected | LookupFailed>
+  readonly groupInfo: (chatId: ChatId) => Effect.Effect<GroupInfo, NotConnected | LookupFailed>
+  /** Subscribes to the chat's presence (once) and returns the last known state. */
+  readonly presence: (chatId: ChatId) => Effect.Effect<PresenceInfo, NotConnected>
   /** Edits, deletes and reactions on messages in handled chats, after the bridge accepted them. */
   readonly updates: Stream.Stream<InboundUpdate>
   readonly react: (chatId: ChatId, messageId: MessageId, emoji: string) => Effect.Effect<void, WhatsAppError>

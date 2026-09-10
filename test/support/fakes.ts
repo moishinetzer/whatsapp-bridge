@@ -9,18 +9,24 @@ import { InboundMessage, type MessageKind } from "../../src/domain/message.ts"
 import { EventsLive } from "../../src/engine/Events.ts"
 import { MediaStoreLive } from "../../src/engine/Media.ts"
 import { OutboundLive } from "../../src/engine/Outbound.ts"
+import { StoreWithDatabaseLive } from "../../src/store/Store.ts"
+import { SchedulerLive } from "../../src/store/Scheduled.ts"
 import { outgoing, type OutboundMedia } from "../../src/domain/outbound.ts"
 import { HealthLive } from "../../src/engine/Health.ts"
 import { HandlerFailed, Responder, type ResponderReply, type TurnPayload } from "../../src/engine/Responder.ts"
 import { TurnEngineLive, TurnRegistryLive } from "../../src/engine/Turns.ts"
 import {
+  LookupFailed,
   MediaTooLarge,
   MediaUnavailable,
   MessageUnknown,
   SendFailed,
   WhatsApp,
+  type ContactInfo,
   type DownloadedMedia,
+  type GroupInfo,
   type InboundUpdate,
+  type PresenceState,
 } from "../../src/whatsapp/WhatsApp.ts"
 
 // ---------------------------------------------------------------------------
@@ -33,11 +39,14 @@ export const testMediaDir = mkdtempSync(join(tmpdir(), "bridge-media-"))
 export const testConfig = (overrides: Partial<BridgeConfigShape> = {}): BridgeConfigShape => ({
   dataDir: "./data-test",
   authDir: "./data-test/auth",
+  databasePath: ":memory:",
+  history: false,
   mediaDir: testMediaDir,
   mediaAuto: "images",
   mediaMaxBytes: 25 * 1024 * 1024,
+  mediaMaxDisk: 1024 * 1024 * 1024,
   mediaWait: Duration.seconds(8),
-  mediaRetention: Duration.days(7),
+  mediaRetention: Option.none(),
   mediaSweepEvery: Duration.hours(1),
   host: "127.0.0.1",
   port: 0,
@@ -116,6 +125,15 @@ export interface FakeWhatsAppShape {
   readonly inject: (update: InboundUpdate) => Effect.Effect<void>
   /** Message ids the fake refuses to quote (everything else is accepted). */
   readonly unknownQuotes: Ref.Ref<ReadonlySet<MessageId>>
+  /** Every forward: where it went, where it came from, which message. */
+  readonly forwards: Queue.Queue<{ readonly toChatId: ChatId; readonly fromChatId: ChatId; readonly messageId: MessageId; readonly sentAs: MessageId }>
+  /** What `contact` answers, by jid; unknown jids answer `onWhatsApp: false`. */
+  readonly contacts: Ref.Ref<ReadonlyMap<string, ContactInfo>>
+  readonly groups: Ref.Ref<ReadonlyMap<ChatId, GroupInfo>>
+  /** What `presence` answers, by chat; unknown chats are `unknown`. */
+  readonly presences: Ref.Ref<ReadonlyMap<ChatId, PresenceState>>
+  /** Chats the bridge asked presence for, in order. */
+  readonly presenceAsks: Queue.Queue<ChatId>
   /** Announced right before a send waits on `sendGate` (when one is set). */
   readonly sending: Queue.Queue<Outbound>
   readonly typing: Ref.Ref<ReadonlyArray<{ readonly chatId: ChatId; readonly composing: boolean }>>
@@ -146,6 +164,11 @@ export const FakeWhatsAppLive = Layer.effectContext(
     const deletes = yield* Queue.unbounded<{ readonly chatId: ChatId; readonly messageId: MessageId }>()
     const updates = yield* Queue.unbounded<InboundUpdate>()
     const unknownQuotes = yield* Ref.make<ReadonlySet<MessageId>>(new Set())
+    const forwards = yield* Queue.unbounded<{ readonly toChatId: ChatId; readonly fromChatId: ChatId; readonly messageId: MessageId; readonly sentAs: MessageId }>()
+    const contacts = yield* Ref.make<ReadonlyMap<string, ContactInfo>>(new Map())
+    const groups = yield* Ref.make<ReadonlyMap<ChatId, GroupInfo>>(new Map())
+    const presences = yield* Ref.make<ReadonlyMap<ChatId, PresenceState>>(new Map())
+    const presenceAsks = yield* Queue.unbounded<ChatId>()
     const typing = yield* Ref.make<ReadonlyArray<{ readonly chatId: ChatId; readonly composing: boolean }>>([])
     const failNextSends = yield* Ref.make(0)
     const sendGate = yield* Ref.make<Option.Option<Latch.Latch>>(Option.none())
@@ -214,6 +237,26 @@ export const FakeWhatsAppLive = Layer.effectContext(
       editText: (chatId, messageId, text) => Queue.offer(edits, { chatId, messageId, text }).pipe(Effect.asVoid),
       deleteMessage: (chatId, messageId) => Queue.offer(deletes, { chatId, messageId }).pipe(Effect.asVoid),
       markRead: (chatId, messageIds) => Effect.forEach(messageIds, (messageId) => Queue.offer(reads, { chatId, messageId }), { discard: true }),
+      forward: (toChatId, fromChatId, messageId, options) =>
+        Effect.gen(function* () {
+          if ((yield* Ref.get(unknownQuotes)).has(messageId)) return yield* new MessageUnknown({ chatId: fromChatId, messageId, reason: "not in the fake" })
+          const sentAs = options?.messageId ?? (yield* newOutboundId)
+          yield* Queue.offer(forwards, { toChatId, fromChatId, messageId, sentAs })
+          return sentAs
+        }),
+      contact: (jid) =>
+        Effect.map(Ref.get(contacts), (m) => m.get(jid) ?? { jid, onWhatsApp: false }),
+      groupInfo: (chatId) =>
+        Effect.flatMap(Ref.get(groups), (m) => {
+          const g = m.get(chatId)
+          return g === undefined ? Effect.fail(new LookupFailed({ subject: chatId, detail: "not a group in the fake" })) : Effect.succeed(g)
+        }),
+      presence: (chatId) =>
+        Effect.gen(function* () {
+          yield* Queue.offer(presenceAsks, chatId)
+          const state = (yield* Ref.get(presences)).get(chatId) ?? "unknown"
+          return { chatId, state }
+        }),
       updates: Stream.fromQueue(updates),
       react: (chatId, messageId, emoji) => Queue.offer(reactions, { chatId, messageId, emoji }).pipe(Effect.asVoid),
       unreact: (chatId, messageId) => Queue.offer(reactions, { chatId, messageId, emoji: "" }).pipe(Effect.asVoid),
@@ -233,6 +276,11 @@ export const FakeWhatsAppLive = Layer.effectContext(
       deletes,
       inject: (u) => Queue.offer(updates, u).pipe(Effect.asVoid),
       unknownQuotes,
+      forwards,
+      contacts,
+      groups,
+      presences,
+      presenceAsks,
       typing,
       failNextSends,
       sendGate,
@@ -291,11 +339,13 @@ export const EngineTestLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
   const Config = TestConfigLive(overrides)
   const Health = HealthLive.pipe(Layer.provide(Config))
   const Events = EventsLive.pipe(Layer.provide(Health))
-  const Registry = TurnRegistryLive.pipe(Layer.provide(Config))
-  const Media = MediaStoreLive.pipe(Layer.provide([Config, FakeWhatsAppLive, NodeServices.layer]))
+  const Storage = StoreWithDatabaseLive.pipe(Layer.provide([Config, NodeServices.layer]))
+  const Registry = TurnRegistryLive.pipe(Layer.provide([Config, Storage]))
+  const Media = MediaStoreLive.pipe(Layer.provide([Config, FakeWhatsAppLive, Storage, NodeServices.layer]))
   const Outbound = OutboundLive.pipe(Layer.provide([Config, NodeServices.layer]))
-  const Engine = TurnEngineLive.pipe(Layer.provide([Config, FakeWhatsAppLive, Events, Registry, TestResponderLive, Media]))
-  return Layer.mergeAll(Config, Health, Events, FakeWhatsAppLive, Registry, TestResponderLive, Media, Outbound, Engine)
+  const Scheduled = SchedulerLive.pipe(Layer.provide([Storage, FakeWhatsAppLive, Outbound, Events]))
+  const Engine = TurnEngineLive.pipe(Layer.provide([Config, FakeWhatsAppLive, Events, Registry, TestResponderLive, Media, Storage]))
+  return Layer.mergeAll(Config, Health, Events, FakeWhatsAppLive, Registry, Storage, TestResponderLive, Media, Outbound, Scheduled, Engine)
 }
 
 // ---------------------------------------------------------------------------
