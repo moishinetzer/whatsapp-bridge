@@ -1,0 +1,31 @@
+# Observer: context from the primary number, version 0.7
+
+Settled in a design session on 2026-09-10, continuing the numbering of `docs/spec/agent-surface.md`. Each numbered item is a decision. The code follows it.
+
+## Vocabulary
+
+- **Primary number**: Moishi's own WhatsApp number, on his phone.
+- **Owner**: the person who holds the primary number.
+- **Observer**: a read-only linked device on the primary number, run by this codebase in `BRIDGE_MODE=observer`. It stores what it sees and sends nothing.
+- **Personal line**: the dedicated number the agent answers on, the daemon this repo has run so far.
+- **Owner turn**: a turn on the personal line whose messages are a DM from the owner.
+- **Context**: stored conversation the agent may read while answering a turn.
+
+## Decisions
+
+28. **Purpose.** Context exists so the agent answers the owner better on the personal line. It does not exist so the agent can message third parties; that stays out of scope.
+29. **The observer is a second instance of the same daemon.** Own data directory, own database, own media directory, own port. It links to the primary number and appears in Linked Devices as "Intro Observer". The mode has no send methods: it never sends a message, never marks anything read, never sets itself online, never reacts, never subscribes to presence. The library's automatic delivery receipts are the same ones WhatsApp Web sends and are left alone. The remaining terms-of-service risk on the primary number is accepted by the owner, knowingly.
+30. **Everything is captured.** DMs, groups, the owner's own messages sent from the phone (stored with their direction), reactions, edits, deletions as tombstones, calls as rows. Media per `BRIDGE_MEDIA_AUTO` into the observer's own media store under the same LRU budget as the personal line (`BRIDGE_MEDIA_MAX_DISK`, 1 GB); anything else on demand.
+31. **Backfill is the recent slice only.** Full history sync is never requested. The recent history WhatsApp pushes at link time is kept, chunk by chunk, and a chunk is refused before download when its oldest message is older than `BRIDGE_OBSERVE_BACKFILL_DAYS` (30; 0 refuses everything), when more than 20 chunks have been accepted, or when its declared size is over 8 MB. Rows are inserted in batches through a bounded queue so the socket never waits on the database. Media for backfilled messages is downloaded afterwards, one file at a time, under the same policy and budget. Progress shows on `bridge observe link` and in `/status`. The slice is offered once; refusing it means re-linking to get it later.
+32. **Retention and exclusions.** `BRIDGE_OBSERVE_RETENTION` defaults to 180 days; `bridge observe purge --before` deletes earlier. Chats in `BRIDGE_OBSERVE_EXCLUDE` are dropped at ingest and never written, so a later config change cannot reveal them.
+33. **Address book.** Saved names, push names and the lid to phone mapping from the phone's contact sync are stored in a `contacts` table, name chats in both databases, and give the personal line the owner's lid.
+34. **One-time confirmation.** `bridge observe enable` prints what will be stored (other people's messages included), that search results reach the model provider when the agent queries them, and the device name that will show in Linked Devices, asks once, and writes `data/observer.accepted`. Without it the observer refuses to start. `/status` reports `observer: true` and a log line repeats it weekly.
+35. **Context is a turn-scoped capability, provided by Effect.** The engine builds a layer per turn. An owner turn gets `OwnerContext`: the personal line's whole history plus the observer's, plus contacts and primary attachments on demand. Every other turn, a group or an allowlisted person's DM, gets `ChatContext(chatId)`: that chat's history on the personal line and nothing else. The capability lives in the turn's scope and is gone at commit, failure or cancel; a superseded turn's dies with it. Code that reads primary history requires `OwnerContext`, so a group turn cannot be written to read it. The HTTP surface is `GET /turns/{turnId}/context/...` only, with `line` and `primary` namespaces so ids never mix. A request the turn's capability does not cover is `403 ContextNotAllowed`; a closed turn is `409 TurnNotOpen`. Every read is logged with its turn id.
+36. **The unscoped history endpoints leave the HTTP API.** `GET /chats`, `GET /chats/{chatId}`, `GET /chats/{chatId}/messages` and `GET /messages` move under `/turns/{turnId}/context/`. `GET /contacts/{jid}` (a live lookup, not stored context) and `GET /chats/{chatId}/presence` stay. The CLI commands `chats`, `messages` and `search` read the database files directly, on the same machine.
+37. **No new tokens.** The personal line opens the observer's database read-only and calls the observer's port for two things only: health and fetching an attachment. `BRIDGE_API_TOKEN` stays optional on both daemons, as before. When the observer is down, primary reads fail with `503 ObserverUnavailable`; line reads are unaffected.
+38. **Who gets a reply.** With `BRIDGE_OWNER` set, a chat is allowed when it is the owner's DM, a group the owner is a member of (checked from group metadata, cached), or listed in `BRIDGE_ALLOWED_SENDERS`. A listed person unlocks their DM only; a group must be listed as a group or have the owner in it. The same rule applies to sends: anything else is `403 NotAllowlisted`. The owner is matched by number or by the lid learned from the observer. Without `BRIDGE_OWNER` the line behaves as today.
+39. **What the agent does with context is a rule, not a mechanism.** What it learned in the owner's DM is not repeated in any other chat. The bridge cannot enforce that; `docs/intro-integration.md` states it.
+
+## Out of scope
+
+Messaging third parties on the strength of primary context, an event stream from the observer, full history sync, encryption at rest beyond file modes and disk encryption, more than one observer.
