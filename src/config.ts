@@ -64,6 +64,26 @@ export interface BridgeConfigShape {
   readonly mediaSweepEvery: Duration.Duration
   /** Harness only: how long the pong responder pretends to think. */
   readonly harnessSlow: Duration.Duration
+
+  // ---- the owner and the observer (version 0.7) ----------------------------
+  /**
+   * Digits of the primary number's holder. When set, the access rule is on:
+   * the owner's DM, groups the owner is in, and `allowedSenders` get replies;
+   * the owner's DM turns get `OwnerContext`.
+   */
+  readonly owner: Option.Option<string>
+  /** The observer's data directory: its session, database and media live here. */
+  readonly observerDir: string
+  /** The observer daemon's port. */
+  readonly observerPort: number
+  /** Where the personal line reaches the observer for health and attachments. */
+  readonly observerUrl: string
+  /** Observer: keep the recent history WhatsApp pushes at link time, this many days back. 0 refuses every chunk. */
+  readonly observeBackfillDays: number
+  /** Observer: rows older than this are purged daily. */
+  readonly observeRetention: Duration.Duration
+  /** Observer: chats never written to disk (jids or digits). */
+  readonly observeExclude: ReadonlyArray<string>
 }
 
 export class BridgeConfig extends Context.Service<BridgeConfig, BridgeConfigShape>()("bridge/Config") {}
@@ -130,6 +150,24 @@ const knobs = {
   mediaRetention: knob("BRIDGE_MEDIA_RETENTION", Config.option(Config.duration("BRIDGE_MEDIA_RETENTION"))),
   mediaSweepEvery: knob("BRIDGE_MEDIA_SWEEP_EVERY", Config.duration("BRIDGE_MEDIA_SWEEP_EVERY").pipe(Config.withDefault(Duration.hours(1)))),
   harnessSlow: knob("BRIDGE_HARNESS_SLOW", Config.duration("BRIDGE_HARNESS_SLOW").pipe(Config.withDefault(Duration.zero))),
+  owner: knob(
+    "BRIDGE_OWNER",
+    Config.option(Config.string("BRIDGE_OWNER")).pipe(
+      Config.map(Option.flatMap((raw) => {
+        const digits = raw.replace(/[^0-9]/g, "")
+        return digits.length === 0 ? Option.none<string>() : Option.some(digits)
+      })),
+    ),
+  ),
+  observerDir: knob("BRIDGE_OBSERVER_DIR", Config.string("BRIDGE_OBSERVER_DIR").pipe(Config.withDefault("./data-observer"))),
+  observerPort: knob("BRIDGE_OBSERVER_PORT", Config.port("BRIDGE_OBSERVER_PORT").pipe(Config.withDefault(8788))),
+  observerUrl: knob("BRIDGE_OBSERVER_URL", Config.option(Config.string("BRIDGE_OBSERVER_URL"))),
+  observeBackfillDays: knob(
+    "BRIDGE_OBSERVE_BACKFILL_DAYS",
+    Config.int("BRIDGE_OBSERVE_BACKFILL_DAYS").pipe(Config.withDefault(30)),
+  ),
+  observeRetention: knob("BRIDGE_OBSERVE_RETENTION", Config.duration("BRIDGE_OBSERVE_RETENTION").pipe(Config.withDefault(Duration.days(180)))),
+  observeExclude: knob("BRIDGE_OBSERVE_EXCLUDE", Config.string("BRIDGE_OBSERVE_EXCLUDE").pipe(Config.map(list), Config.withDefault([]))),
 }
 
 type Knobs = typeof knobs
@@ -141,14 +179,34 @@ const configs = Object.fromEntries(Object.entries(knobs).map(([k, v]) => [k, v.c
 export const bridgeConfig: Config.Config<BridgeConfigShape> = Config.all(configs).pipe(
   Config.map((c) => {
     const dataDir = c.dataDir.replace(/\/+$/, "")
+    const observerDir = c.observerDir.replace(/\/+$/, "")
     return {
       ...c,
       authDir: `${dataDir}/auth`,
       databasePath: Option.getOrElse(c.databasePath, () => `${dataDir}/bridge.db`),
       mediaDir: Option.getOrElse(c.mediaDir, () => `${dataDir}/media`),
+      observerDir,
+      observerUrl: Option.getOrElse(c.observerUrl, () => `http://127.0.0.1:${c.observerPort}`),
     }
   }),
 )
+
+/** Where the observer keeps its database, derived from its data directory. */
+export const observerDatabasePath = (observerDir: string) => `${observerDir.replace(/\/+$/, "")}/bridge.db`
+
+/**
+ * The observer process runs the same daemon on its own directory and port,
+ * with history always on and its own name in Linked Devices.
+ */
+export const forObserver = (c: BridgeConfigShape): Partial<BridgeConfigShape> => ({
+  dataDir: c.observerDir,
+  authDir: `${c.observerDir}/auth`,
+  databasePath: observerDatabasePath(c.observerDir),
+  mediaDir: `${c.observerDir}/media`,
+  port: c.observerPort,
+  history: true,
+  browserName: "Intro Observer",
+})
 
 /** Re-reads each knob on its own to name the ones that failed. */
 const blame = (error: Config.ConfigError) =>
@@ -161,12 +219,14 @@ const blame = (error: Config.ConfigError) =>
     return yield* new ConfigInvalid({ variables: failures, detail: error.message })
   })
 
-/** The config service, with optional overrides layered on top of the environment (CLI flags). */
-export const BridgeConfigLive = (overrides: Partial<BridgeConfigShape> = {}) =>
+export type ConfigOverrides = Partial<BridgeConfigShape> | ((config: BridgeConfigShape) => Partial<BridgeConfigShape>)
+
+/** The config service, with optional overrides layered on top of the environment (CLI flags, the observer's directory). */
+export const BridgeConfigLive = (overrides: ConfigOverrides = {}) =>
   Layer.effect(
     BridgeConfig,
     bridgeConfig.pipe(
-      Effect.map((c) => BridgeConfig.of({ ...c, ...overrides })),
+      Effect.map((c) => BridgeConfig.of({ ...c, ...(typeof overrides === "function" ? overrides(c) : overrides) })),
       Effect.catchTag("ConfigError", blame),
     ),
   )
@@ -187,3 +247,9 @@ export const bridgeUrl: Config.Config<string> = Config.all({
   host: Config.string("BRIDGE_HOST").pipe(Config.withDefault("127.0.0.1")),
   port: Config.port("BRIDGE_PORT").pipe(Config.withDefault(8787)),
 }).pipe(Config.map(({ url, host, port }) => Option.getOrElse(url, () => `http://${host}:${port}`)))
+
+/** Where the CLI finds the observer daemon. */
+export const observerUrl: Config.Config<string> = Config.all({
+  url: Config.option(Config.string("BRIDGE_OBSERVER_URL")),
+  port: Config.port("BRIDGE_OBSERVER_PORT").pipe(Config.withDefault(8788)),
+}).pipe(Config.map(({ url, port }) => Option.getOrElse(url, () => `http://127.0.0.1:${port}`)))

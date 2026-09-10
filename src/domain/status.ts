@@ -19,6 +19,8 @@ export type ResponderKind = typeof ResponderKind.Type
 export const LinkedIdentity = Schema.Struct({
   jid: Schema.String,
   name: Schema.optionalKey(Schema.String),
+  /** The account's lid, when WhatsApp handed one out. */
+  lid: Schema.optionalKey(Schema.String),
 })
 export type LinkedIdentity = typeof LinkedIdentity.Type
 
@@ -47,6 +49,10 @@ export const BridgeStatus = HealthSnapshot.pipe(
     databasePath: Schema.String,
     /** Whether message history is being recorded. */
     history: Schema.Boolean,
+    /** `open`: anyone may talk to the line. `owner`: the owner's DM, groups the owner is in, and the allowlist. */
+    access: Schema.optionalKey(Schema.Literals(["open", "owner"])),
+    /** Where the observer is expected, when an owner is configured. */
+    observerUrl: Schema.optionalKey(Schema.String),
   }),
 )
 export type BridgeStatus = typeof BridgeStatus.Type

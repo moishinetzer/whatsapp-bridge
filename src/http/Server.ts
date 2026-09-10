@@ -12,9 +12,23 @@ import { Outbound, OutboundInvalid } from "../engine/Outbound.ts"
 import type { Outgoing } from "../domain/outbound.ts"
 import type { MessageId } from "../domain/ids.ts"
 import { TurnNotOpen, TurnRegistry } from "../engine/Turns.ts"
+import {
+  ContextNotAllowed,
+  OwnerContext,
+  lineChats,
+  lineSearch,
+  primaryChat,
+  primaryChats,
+  primaryContacts,
+  primaryMedia,
+  primaryMessages,
+  primarySearch,
+  type TurnAccess,
+} from "../engine/Context.ts"
+import type { TurnId } from "../domain/ids.ts"
 import { Scheduler } from "../store/Scheduled.ts"
 import { Store } from "../store/Store.ts"
-import { SendFailed, WhatsApp } from "../whatsapp/WhatsApp.ts"
+import { NotAllowlisted, SendFailed, WhatsApp } from "../whatsapp/WhatsApp.ts"
 import type { ChatId } from "../domain/ids.ts"
 import type { HistoryRow } from "../domain/history.ts"
 import { EVENT_SCHEMA_VERSION, type BridgeEvent } from "../domain/events.ts"
@@ -24,10 +38,23 @@ const status = Effect.gen(function* () {
   const health = yield* Health
   const registry = yield* TurnRegistry
   const store = yield* Store
+  const config = yield* BridgeConfig
   const snapshot = yield* health.get
   const openTurns = yield* registry.openCount
-  return { ...snapshot, openTurns, databasePath: store.databasePath, history: store.historyEnabled }
+  const owned = Option.isSome(config.owner)
+  return {
+    ...snapshot,
+    openTurns,
+    databasePath: store.databasePath,
+    history: store.historyEnabled,
+    access: owned ? ("owner" as const) : ("open" as const),
+    ...(owned ? { observerUrl: config.observerUrl } : {}),
+  }
 })
+
+/** The access rule, applied to a chat the agent wants to reach. */
+const ensureAllowed = (chatId: ChatId) =>
+  WhatsApp.use((w) => w.chatAllowed(chatId)).pipe(Effect.flatMap((ok) => (ok ? Effect.void : Effect.fail(new NotAllowlisted({ chatId })))))
 
 export const HealthGroupLive = HttpApiBuilder.group(BridgeApi, "health", (handlers) =>
   handlers
@@ -69,6 +96,7 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
     .handle("send", ({ params, payload }) =>
       Effect.gen(function* () {
         const whatsapp = yield* WhatsApp
+        yield* ensureAllowed(params.chatId)
         if (payload.sendAt !== undefined) {
           const scheduler = yield* Scheduler
           const held = yield* scheduler.schedule(
@@ -85,6 +113,7 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
     .handle("sendLocation", ({ params, payload }) =>
       Effect.gen(function* () {
         const whatsapp = yield* WhatsApp
+        yield* ensureAllowed(params.chatId)
         const { quoteMessageId, ...location } = payload
         const messageId = yield* whatsapp.sendLocation(params.chatId, location, { quoteMessageId })
         return { chatId: params.chatId, messageId }
@@ -93,6 +122,7 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
     .handle("sendContacts", ({ params, payload }) =>
       Effect.gen(function* () {
         const whatsapp = yield* WhatsApp
+        yield* ensureAllowed(params.chatId)
         const messageId = yield* whatsapp.sendContacts(params.chatId, payload.contacts, { quoteMessageId: payload.quoteMessageId })
         return { chatId: params.chatId, messageId }
       }),
@@ -100,6 +130,7 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
     .handle("sendPoll", ({ params, payload }) =>
       Effect.gen(function* () {
         const whatsapp = yield* WhatsApp
+        yield* ensureAllowed(params.chatId)
         const messageId = yield* whatsapp.sendPoll(
           params.chatId,
           { question: payload.question, options: payload.options, multiple: payload.multiple === true },
@@ -112,6 +143,7 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
       Effect.gen(function* () {
         const whatsapp = yield* WhatsApp
         const outbound = yield* Outbound
+        yield* ensureAllowed(params.chatId)
         const items = yield* Effect.forEach(payload.items, outbound.load)
         const odd = items.find((i) => i.kind !== "image" && i.kind !== "video")
         if (odd !== undefined) return yield* new OutboundInvalid({ detail: `an album takes images and videos only, not ${odd.kind}` })
@@ -123,6 +155,7 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
     .handle("forward", ({ params, payload }) =>
       Effect.gen(function* () {
         const whatsapp = yield* WhatsApp
+        yield* ensureAllowed(params.chatId)
         const messageId = yield* whatsapp.forward(params.chatId, payload.fromChatId, payload.messageId)
         return { chatId: params.chatId, messageId }
       }),
@@ -133,6 +166,7 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
       Effect.gen(function* () {
         const outbound = yield* Outbound
         const whatsapp = yield* WhatsApp
+        yield* ensureAllowed(params.chatId)
         const { sendAt, deliverWhenOnline, ...file } = payload
         // The file is checked now, even for a later send, so a bad path is a 4xx today rather than a failure tonight.
         const media = yield* outbound.load(file)
@@ -168,48 +202,106 @@ const touchMedia = (rows: ReadonlyArray<HistoryRow>) =>
     { discard: true },
   )
 
-export const HistoryGroupLive = HttpApiBuilder.group(BridgeApi, "history", (handlers) =>
+export const ContactsGroupLive = HttpApiBuilder.group(BridgeApi, "contacts", (handlers) =>
+  handlers.handle("contact", ({ params }) => WhatsApp.use((w) => w.contact(params.jid))),
+)
+
+/** The turn's capability, or why there is none. */
+const accessOf = (turnId: TurnId) => TurnRegistry.use((r) => r.access(turnId))
+
+/** Owner turns only: everything under `primary`, and the line across chats. */
+const ownerOnly = (turnId: TurnId) =>
+  Effect.flatMap(accessOf(turnId), (a) =>
+    a.kind === "owner"
+      ? Effect.succeed(a.context)
+      : Effect.fail(new ContextNotAllowed({ turnId, access: a.kind, detail: "only a turn in the owner's DM may read this" })),
+  )
+
+/** A chat on the line: any chat for an owner turn, only its own for a chat turn. */
+const chatScoped = (turnId: TurnId, chatId: ChatId) =>
+  Effect.flatMap(accessOf(turnId), (a): Effect.Effect<TurnAccess, ContextNotAllowed> => {
+    if (a.kind === "owner" || a.context.chatId === chatId) return Effect.succeed(a)
+    return Effect.fail(new ContextNotAllowed({ turnId, access: a.kind, detail: `this turn may read ${a.context.chatId} only` }))
+  })
+
+const withOwner = <A, E, R>(turnId: TurnId, read: Effect.Effect<A, E, R | OwnerContext>) =>
+  Effect.flatMap(ownerOnly(turnId), (context) => read.pipe(Effect.provideService(OwnerContext, context)))
+
+const logRead = (turnId: TurnId, what: string, extra: Record<string, unknown> = {}) =>
+  Effect.logInfo("context read").pipe(Effect.annotateLogs({ turnId, what, ...extra }))
+
+export const ContextGroupLive = HttpApiBuilder.group(BridgeApi, "context", (handlers) =>
   handlers
-    .handle("chats", () => Store.use((s) => s.chats))
-    .handle("chat", ({ params }) =>
+    .handle("summary", ({ params }) =>
       Effect.gen(function* () {
-        const store = yield* Store
-        const whatsapp = yield* WhatsApp
-        const chatId: ChatId = params.chatId
-        const isGroup = chatId.endsWith("@g.us")
-        const known = yield* store.chats.pipe(Effect.catchTag("HistoryDisabled", () => Effect.succeed([])))
-        const summary = known.find((c) => c.chatId === chatId)
-        const group = isGroup ? yield* whatsapp.groupInfo(chatId) : undefined
-        return {
-          chatId,
-          isGroup,
-          ...(summary?.name === undefined ? (group === undefined ? {} : { name: group.subject }) : { name: summary.name }),
-          ...(summary === undefined ? {} : { lastMessageAt: summary.lastMessageAt, messageCount: summary.messageCount }),
-          ...(group === undefined ? {} : { group }),
-        }
+        const registry = yield* TurnRegistry
+        const turn = yield* registry.get(params.turnId)
+        const access = yield* registry.access(params.turnId)
+        const config = yield* BridgeConfig
+        return { turnId: params.turnId, chatId: turn.chatId, access: access.kind, primary: Option.isSome(config.owner) }
       }),
     )
-    .handle("chatMessages", ({ params, query }) =>
+    .handle("lineChats", ({ params }) => withOwner(params.turnId, lineChats).pipe(Effect.tap(() => logRead(params.turnId, "line.chats"))))
+    .handle("lineChat", ({ params }) =>
       Effect.gen(function* () {
-        const store = yield* Store
+        const a = yield* chatScoped(params.turnId, params.chatId)
+        yield* logRead(params.turnId, "line.chat", { chatId: params.chatId })
+        return yield* a.kind === "owner" ? a.context.line.chat(params.chatId) : a.context.chat
+      }),
+    )
+    .handle("lineMessages", ({ params, query }) =>
+      Effect.gen(function* () {
+        const a = yield* chatScoped(params.turnId, params.chatId)
         const limit = query.limit ?? 50
+        const searching = query.q !== undefined && query.q.trim().length > 0
         const rows: ReadonlyArray<HistoryRow> =
-          query.q !== undefined && query.q.trim().length > 0
-            ? yield* store.search(query.q, { chatId: params.chatId, before: query.before, limit })
-            : yield* store.messages(params.chatId, { before: query.before, since: query.since, limit })
+          a.kind === "owner"
+            ? searching
+              ? yield* a.context.line.search(query.q ?? "", { chatId: params.chatId, before: query.before, limit })
+              : yield* a.context.line.messages(params.chatId, { before: query.before, since: query.since, limit })
+            : searching
+              ? yield* a.context.search(query.q ?? "", { before: query.before, limit })
+              : yield* a.context.messages({ before: query.before, since: query.since, limit })
         yield* touchMedia(rows)
+        yield* logRead(params.turnId, searching ? "line.search" : "line.messages", { chatId: params.chatId, rows: rows.length })
         return rows
       }),
     )
-    .handle("search", ({ query }) =>
+    .handle("lineSearch", ({ params, query }) =>
+      withOwner(params.turnId, lineSearch(query.q, { before: query.before, limit: query.limit ?? 50 })).pipe(
+        Effect.tap((rows) => Effect.andThen(touchMedia(rows), logRead(params.turnId, "line.search", { rows: rows.length }))),
+        Effect.map((rows): ReadonlyArray<HistoryRow> => rows),
+      ),
+    )
+    .handle("primaryChats", ({ params }) => withOwner(params.turnId, primaryChats).pipe(Effect.tap(() => logRead(params.turnId, "primary.chats"))))
+    .handle("primaryChat", ({ params }) =>
+      withOwner(params.turnId, primaryChat(params.chatId)).pipe(Effect.tap(() => logRead(params.turnId, "primary.chat", { chatId: params.chatId }))),
+    )
+    .handle("primaryMessages", ({ params, query }) =>
       Effect.gen(function* () {
-        const store = yield* Store
-        const rows: ReadonlyArray<HistoryRow> = yield* store.search(query.q, { before: query.before, limit: query.limit ?? 50 })
-        yield* touchMedia(rows)
+        const limit = query.limit ?? 50
+        const searching = query.q !== undefined && query.q.trim().length > 0
+        const rows: ReadonlyArray<HistoryRow> = searching
+          ? yield* withOwner(params.turnId, primarySearch(query.q ?? "", { chatId: params.chatId, before: query.before, limit }))
+          : yield* withOwner(params.turnId, primaryMessages(params.chatId, { before: query.before, since: query.since, limit }))
+        yield* logRead(params.turnId, searching ? "primary.search" : "primary.messages", { chatId: params.chatId, rows: rows.length })
         return rows
       }),
     )
-    .handle("contact", ({ params }) => WhatsApp.use((w) => w.contact(params.jid))),
+    .handle("primarySearch", ({ params, query }) =>
+      withOwner(params.turnId, primarySearch(query.q, { before: query.before, limit: query.limit ?? 50 })).pipe(
+        Effect.tap((rows) => logRead(params.turnId, "primary.search", { rows: rows.length })),
+        Effect.map((rows): ReadonlyArray<HistoryRow> => rows),
+      ),
+    )
+    .handle("primaryContacts", ({ params, query }) =>
+      withOwner(params.turnId, primaryContacts(query.q, query.limit ?? 50)).pipe(Effect.tap((rows) => logRead(params.turnId, "primary.contacts", { rows: rows.length }))),
+    )
+    .handle("primaryMedia", ({ params }) =>
+      withOwner(params.turnId, primaryMedia(params.chatId, params.messageId)).pipe(
+        Effect.tap(() => logRead(params.turnId, "primary.media", { chatId: params.chatId, messageId: params.messageId })),
+      ),
+    ),
 )
 
 export const ScheduledGroupLive = HttpApiBuilder.group(BridgeApi, "scheduled", (handlers) =>
@@ -307,7 +399,7 @@ export const ClientErrorsLive = HttpRouter.middleware(
 /** All groups mounted, plus the OpenAPI document and the Scalar UI. */
 export const ApiLive = Layer.mergeAll(
   HttpApiBuilder.layer(BridgeApi, { openapiPath: "/openapi.json" }).pipe(
-    Layer.provide([HealthGroupLive, EventsGroupLive, ChatsGroupLive, HistoryGroupLive, ScheduledGroupLive, TurnsGroupLive]),
+    Layer.provide([HealthGroupLive, EventsGroupLive, ChatsGroupLive, ContactsGroupLive, ContextGroupLive, ScheduledGroupLive, TurnsGroupLive]),
   ),
   HttpApiScalar.layer(BridgeApi, { path: "/docs" }),
   ClientErrorsLive,

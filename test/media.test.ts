@@ -8,13 +8,14 @@ import { join } from "node:path"
 import { MediaFile } from "../src/domain/message.ts"
 import { MediaStore, MediaStoreLive } from "../src/engine/Media.ts"
 import { StoreWithDatabaseLive } from "../src/store/Store.ts"
+import { MediaSourceFromWhatsApp } from "../src/whatsapp/MediaSource.ts"
 import { FakeWhatsApp, FakeWhatsAppLive, TestConfigLive, chat, jpeg, message } from "./support/fakes.ts"
 
 const storeLayer = (dir: string, extra: Parameters<typeof TestConfigLive>[0] = {}) => {
   const config = TestConfigLive({ mediaDir: dir, ...extra })
   const storage = StoreWithDatabaseLive.pipe(Layer.provide([config, NodeServices.layer]))
   return Layer.mergeAll(
-    MediaStoreLive.pipe(Layer.provide([config, FakeWhatsAppLive, storage, NodeServices.layer])),
+    MediaStoreLive.pipe(Layer.provide([config, MediaSourceFromWhatsApp.pipe(Layer.provide(FakeWhatsAppLive)), storage, NodeServices.layer])),
     FakeWhatsAppLive,
     NodeServices.layer,
   )

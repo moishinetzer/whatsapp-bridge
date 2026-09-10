@@ -4,7 +4,8 @@ import { BridgeConfig } from "../config.ts"
 import { ChatId, MessageId } from "../domain/ids.ts"
 import { MediaFile, type MessageKind } from "../domain/message.ts"
 import { Store } from "../store/Store.ts"
-import { WhatsApp, type MediaTransportError } from "../whatsapp/WhatsApp.ts"
+import { MediaSource } from "../whatsapp/MediaSource.ts"
+import type { MediaTransportError } from "../whatsapp/WhatsApp.ts"
 
 /** The disk under the media directory misbehaved. */
 export class MediaStoreError extends Schema.TaggedError<MediaStoreError>()(
@@ -76,7 +77,7 @@ export const MediaStoreLive = Layer.effect(
   MediaStore,
   Effect.gen(function* () {
     const config = yield* BridgeConfig
-    const whatsapp = yield* WhatsApp
+    const source = yield* MediaSource
     const store = yield* Store
     const sql = yield* SqlClient.SqlClient
     const fs = yield* FileSystem.FileSystem
@@ -143,7 +144,7 @@ export const MediaStoreLive = Layer.effect(
 
     const download = (chatId: ChatId, messageId: MessageId) =>
       Effect.gen(function* () {
-        const media = yield* whatsapp.downloadMedia(chatId, messageId, { maxBytes: config.mediaMaxBytes })
+        const media = yield* source.downloadMedia(chatId, messageId, { maxBytes: config.mediaMaxBytes })
         const chatDir = path.join(dir, safe(chatId))
         yield* fs.makeDirectory(chatDir, { recursive: true, mode: 0o700 }).pipe(Effect.mapError(storeError("mkdir")))
         const file = path.join(chatDir, `${safe(messageId)}.${media.extension}`)

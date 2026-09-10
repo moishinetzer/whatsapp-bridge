@@ -3,8 +3,10 @@ node_modules/
 dist/
 *.tsbuildinfo
 
-# Runtime data: the linked WhatsApp session lives here. NEVER commit it.
+# Runtime data: the linked WhatsApp sessions live here (the line's and the observer's). NEVER commit them.
 data/
+data-observer/
+data-test/
 **/auth/
 **/auth.invalid-*/
 *.creds.json

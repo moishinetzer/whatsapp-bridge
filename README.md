@@ -15,6 +15,7 @@ Built as an [Effect v4](https://effect.website) service from top to bottom (serv
 - [Integrating Intro](#integrating-intro)
 - [Attachments](#attachments)
 - [History](#history)
+- [Two numbers: the observer](#two-numbers-the-observer)
 - [Reference for the agent](#reference-for-the-agent)
   - [Conventions](#conventions)
   - [Endpoints](#endpoints)
@@ -170,7 +171,7 @@ Several pictures at once go as one **album**, the grid WhatsApp shows for a batc
 
 ## History
 
-Off by default. When on, the bridge records every message in both directions in its SQLite file, and the agent gets memory across restarts: `GET /chats`, `GET /chats/{chatId}/messages`, full-text search with `GET /messages?q=`, and quoting or forwarding anything ever seen.
+Off by default. When on, the bridge records every message in both directions in its SQLite file, and the agent gets memory across restarts, read through the turn it is answering: `GET /turns/{turnId}/context/line/...` pages a chat, searches it, and (in the owner's DM) searches every chat. Quoting and forwarding anything ever seen work too.
 
 Turning it on takes two explicit steps, because it is the whole conversation of the number in plain text on disk:
 
@@ -181,7 +182,40 @@ npm run bridge -- history enable      # prints exactly what will be stored and a
 
 With `BRIDGE_HISTORY=true` and no acceptance on this machine, the daemon refuses to start and says so. What is stored: text and captions, edits (the latest body alongside the original), deletions as tombstones (the text goes, the id and times stay), reactions, delivery state of the bridge's own messages, the path of downloaded attachments, the turn each message belonged to, and the raw message bytes so replies and forwards keep working after a restart. Nothing expires; `npm run bridge -- history purge --before 2026-01-01T00:00:00Z --yes` deletes.
 
-The file is `data/bridge.db` (`GET /status` reports the path), created 0600. It exists with history off too: the bridge keeps its own state there (what it sent, scheduled sends, turn outcomes, the media cache index); the message tables only fill when history is on. Two views are stable for anyone opening it read-only with `sqlite3`: `messages_v` (one row per message, latest text first) and `chats_v`.
+There is no endpoint that reads the history outside a turn. At the shell, `npm run bridge -- chats`, `messages --chat <id>` and `search --q <words>` read the database file directly; `--observer` reads the observer's file instead.
+
+## Two numbers: the observer
+
+The personal line answers on a dedicated number and knows nothing of what you say on your own. The observer closes that gap: a second process of this same daemon, linked to **your own number** as a read-only device (what WhatsApp Web is), storing what it sees in its own database. The agent may read that database only while answering a DM from you on the personal line. Nothing else can.
+
+```
+your phone ──▶ WhatsApp ──▶ observer (bridge observe run)  ──writes──▶ data-observer/bridge.db
+                                    reads nothing else, sends nothing            ▲ read-only
+                                                                                 │
+you ──▶ dedicated number ──▶ personal line (bridge run) ──▶ owner's DM turn ──▶ OwnerContext ──▶ agent
+```
+
+| | |
+|---|---|
+| What it never does | Send a message, mark anything read, set itself online, react, subscribe to presence. The mode has no send methods; the library's automatic delivery receipts are the same ones WhatsApp Web sends. |
+| What it stores | Every DM and group, both directions (your own messages as `direction: "out"`), reactions, edits, deletions as tombstones, calls as `kind: "call"` rows, the address book (saved names, push names, lid to phone), chat names, and attachments per `BRIDGE_MEDIA_AUTO` (`images` by default) under its own `BRIDGE_MEDIA_MAX_DISK` budget. |
+| Backfill | The recent history WhatsApp pushes at link time, never the full archive. Chunks are refused before download when older than `BRIDGE_OBSERVE_BACKFILL_DAYS` (30; `0` refuses everything), past 20 chunks, or over 8 MB each. Rows go in batched transactions; media for them is fetched afterwards, one file at a time. The slice is offered once: refusing it means re-linking to get it later. |
+| Retention | Rows older than `BRIDGE_OBSERVE_RETENTION` (180 days) are purged daily. `BRIDGE_OBSERVE_EXCLUDE` names chats never written at all. `bridge observe purge --before` deletes by hand. |
+| Who reads it | The personal line, and only through an open turn in the owner's DM (`GET /turns/{turnId}/context/primary/...`). A group turn, a friend's turn, or a request outside any turn gets `403 ContextNotAllowed`. Every read is logged with its turn id. |
+| The rule on the line | With `BRIDGE_OWNER` set, the personal line answers your DM, groups you are a member of, and chats in `BRIDGE_ALLOWED_SENDERS`; a listed person unlocks their DM only, never a group. Sends anywhere else are `403 NotAllowlisted`. |
+| Where it lives | `BRIDGE_OBSERVER_DIR` (`./data-observer`): its own session, database, media and acceptance file. Its port is `BRIDGE_OBSERVER_PORT` (8788) and serves health and attachments only. The personal line opens the database file read-only and calls the port for attachments. |
+| When it is down | Primary reads answer `503 ObserverUnavailable` with the reason; the line and its own history keep working. `bridge observe health` says why. |
+
+Setting it up, once:
+
+```sh
+npm run bridge -- observe enable          # prints what is stored, that reads reach the model provider, asks y/N
+npm run bridge -- observe link            # scan the QR with YOUR phone (or --phone <digits> for a pairing code)
+npm run bridge -- observe run             # keep it running next to `bridge run`
+# on the personal line: BRIDGE_OWNER=<your digits>, restart
+```
+
+The device shows in your phone's Linked devices as "Intro Observer"; removing it there stops the observer for good (`needs_relink`). What the agent read in your DM lives on in its own memory; that it does not repeat it elsewhere is a rule for the agent (`docs/intro-integration.md`), not something the bridge can enforce. The design and its reasons are in `docs/spec/observer.md`.
 
 ## Reference for the agent
 
@@ -206,7 +240,8 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | Quoting | Any send can quote a message with `quoteMessageId`: a message the bridge saw or sent this run. On a proactive send an unknown id is `404 MessageUnknown`; on a turn reply the bubble goes out unquoted and a warning is logged, so a stale id never sinks the answer. |
 | Own messages | The bridge can edit (`PATCH`) or delete (`DELETE`) a message it sent, within WhatsApp's windows: 15 minutes to edit, about 2 days to delete. Past that: `409 MessageTooOld`. Sent messages are remembered in the database, so this survives a restart; a message the bridge never sent is `404 MessageUnknown`. |
 | Scheduling | Any text or file send takes `sendAt` (ISO-8601) and answers `202 {scheduledId, sendAt, deliverWhenOnline}` instead of sending. `deliverWhenOnline: true` also waits for the recipient to be online, at most 24 hours. Scheduled sends survive restarts; one missed by more than an hour of downtime is dropped with a `ScheduledSkipped` event. |
-| History | Endpoints under [History](#history) answer `409 HistoryDisabled` until history is enabled. |
+| Context | Stored history is read only through an open turn: `GET /turns/{turnId}/context/...`. A turn in the owner's DM (`access: "owner"`) reads both lines; any other turn (`access: "chat"`) reads its own chat on the personal line and nothing else. The capability ends with the turn (`409 TurnNotOpen` after). Line reads answer `409 HistoryDisabled` until history is enabled; primary reads answer `503 ObserverUnavailable` until the observer runs. |
+| Access rule | With `BRIDGE_OWNER` set: the owner's DM, groups the owner is in, and `BRIDGE_ALLOWED_SENDERS` get replies, and only those chats can be sent to (`403 NotAllowlisted`). Without it, `BRIDGE_ALLOWED_SENDERS` alone applies, as before. |
 | Groups | Off unless `BRIDGE_GROUPS=true`. A turn opens for a group message only when it mentions the bridge or quotes one of its messages; every group turn carries `context`, the last 10 messages seen in that group. Answer `{}` when the mention needs nothing. `mentions` on a text send makes an @-mention real (WhatsApp only links a mention when the jid is listed). |
 | Albums | `POST /chats/{chatId}/album` and `album: true` on a reply send adjacent images and videos as one album. Documents and audio never group. |
 | Presence | The bridge subscribes to a chat's presence the first time it messages the line, to hold the batch window while they type. `PresenceChanged` events flow only for chats asked about through `GET /chats/{chatId}/presence`. |
@@ -229,11 +264,10 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | POST | [`/chats/{chatId}/contacts`](#post-chatschatidcontacts) | Send one or more contact cards |
 | POST | [`/chats/{chatId}/polls`](#post-chatschatidpolls) | Send a poll; votes arrive as `PollVote` events |
 | GET | [`/chats/{chatId}/presence`](#get-chatschatidpresence) | Last known presence; subscribes the chat to `PresenceChanged` events |
-| GET | [`/chats`](#get-chats) | Chats in the history |
-| GET | [`/chats/{chatId}`](#get-chatschatid) | One chat: history summary, group subject and members |
-| GET | [`/chats/{chatId}/messages`](#get-chatschatidmessages) | A chat's history, or a search within it |
-| GET | [`/messages`](#get-messages) | Full-text search across every chat |
 | GET | [`/contacts/{jid}`](#get-contactsjid) | Push name, phone, picture, on WhatsApp or not |
+| GET | [`/turns/{turnId}/context`](#get-turnsturnidcontext) | What this turn may read |
+| GET | [`/turns/{turnId}/context/line/...`](#get-turnsturnidcontextline) | The personal line's history: chats, one chat, its messages, search |
+| GET | [`/turns/{turnId}/context/primary/...`](#get-turnsturnidcontextprimary) | The primary number's history, contacts and attachments (owner turns only) |
 | GET | [`/scheduled`](#get-scheduled) | Pending scheduled sends and those closed in the last day |
 | DELETE | [`/scheduled/{scheduledId}`](#delete-scheduledscheduledid) | Cancel a pending scheduled send |
 | POST | [`/chats/{chatId}/messages/{messageId}/reactions`](#post-chatschatidmessagesmessageidreactions) | React to a message |
@@ -515,43 +549,52 @@ The download can take a while for large files; the call blocks until it is done.
 
 The same as above, but the response body is the file itself and `Content-Type` is the file's mimetype. Use it when Intro runs on another machine than the bridge and cannot open `path`. Same errors, as JSON.
 
-#### `GET /chats`
+#### `GET /turns/{turnId}/context`
 
-The chats in the history, most recent first. `409 HistoryDisabled` when history is off.
-
-```json
-200 [{"chatId":"447700900123@s.whatsapp.net","name":"Moishi","isGroup":false,"lastMessageAt":"2026-09-10T10:15:35.100Z","messageCount":412}]
-```
-
-`name` is the push name of the last person who wrote in the chat.
-
-#### `GET /chats/{chatId}`
-
-What the bridge knows about one chat. Always answers, history or not. For a group it fetches the subject, description, owner and members (cached for 5 minutes).
+What the turn may read, decided when it opened.
 
 ```json
-200 {"chatId":"123-456@g.us","isGroup":true,"name":"Family","lastMessageAt":"...","messageCount":88,
-     "group":{"chatId":"123-456@g.us","subject":"Family","participants":[{"jid":"447700900123@s.whatsapp.net","phone":"447700900123","admin":true}]}}
+200 {"turnId":"turn_1f3c9e2ab7d04c6e8a1b","chatId":"447700900123@s.whatsapp.net","access":"owner","primary":true}
 ```
 
-Errors: `503 NotConnected` and `502 LookupFailed` (groups only), `500 StoreError`.
+`access` is `owner` for a DM whose every message is from `BRIDGE_OWNER`, `chat` otherwise. `primary` says an owner is configured at all. Errors: `404 TurnNotFound`, `409 TurnNotOpen` once the turn is committed, failed, cancelled or superseded.
 
-#### `GET /chats/{chatId}/messages`
+#### `GET /turns/{turnId}/context/line/...`
 
-A chat's history, newest first, both directions. `409 HistoryDisabled` when history is off.
+The personal line's own history (needs `BRIDGE_HISTORY`).
 
-| Query | Meaning |
+| Path | Who | Returns |
+|---|---|---|
+| `/line/chats` | owner | `ChatSummary[]`, most recent first. `name` is WhatsApp's own, else the address book, else the last push name. |
+| `/line/chats/{chatId}` | owner, or the turn's own chat | [`ChatInfo`](#chatinfo): summary plus, for a group, subject, description, owner and members (cached 5 minutes). Answers history or not. |
+| `/line/chats/{chatId}/messages` | owner, or the turn's own chat | `HistoryRow[]`, newest first. Query: `limit` (50, max 500), `before` (page back from a message id), `since` (ISO-8601), `q` (search within the chat, hits carry a `snippet`). |
+| `/line/messages?q=` | owner | Full-text search across every chat: words are prefix terms joined with AND (`dent tomo` finds "dentist tomorrow"), a quoted query is one phrase; `before` and `limit` as above. |
+
+A row with a `mediaPath` counts as a use of that file for the cache. Errors: `404 TurnNotFound`, `409 TurnNotOpen`, `403 ContextNotAllowed` (a chat turn asking beyond its chat), `409 HistoryDisabled`, `500 StoreError`; the chat info also `503 NotConnected` and `502 LookupFailed` for groups.
+
+#### `GET /turns/{turnId}/context/primary/...`
+
+The primary number's history, from the observer's database. Owner turns only; everything else is `403 ContextNotAllowed`.
+
+| Path | Returns |
 |---|---|
-| `limit` | Page size, 50 by default, 500 at most. |
-| `before` | Only messages older than this message id: the cursor for paging back. |
-| `since` | Only messages newer than this instant (ISO-8601): "what happened since I last looked". |
-| `q` | Full-text search within the chat instead of a page; each hit carries a `snippet`. |
+| `/primary/chats` | `ChatSummary[]`, named from your address book and WhatsApp's chat names. |
+| `/primary/chats/{chatId}` | [`ChatInfo`](#chatinfo) without members (the observer keeps no group metadata). |
+| `/primary/chats/{chatId}/messages` | `HistoryRow[]`, same query as the line. `direction: "out"` rows are what you sent from your phone; `kind: "call"` rows are calls. |
+| `/primary/messages?q=` | Full-text search across every chat of the primary number. |
+| `/primary/contacts?q=` | [`ContactRecord[]`](#contactrecord): saved name, push name, phone, lid. `q` matches names, digits and jids; empty lists everyone with a name (`limit` 50, max 500). |
+| `/primary/chats/{chatId}/messages/{messageId}/media` | The attachment, fetched through the observer onto the bridge machine: a [`MediaFile`](#mediafile) with a `path`. |
 
-Each row is a [`HistoryRow`](#historyrow). A row with a `mediaPath` counts as a use of that file for the cache.
+```http
+GET /turns/turn_1f3c9e2ab7d04c6e8a1b/context/primary/messages?q=boiler
+```
 
-#### `GET /messages`
+```json
+200 [{"chatId":"447700900789@s.whatsapp.net","messageId":"3EB0...","direction":"in","senderId":"447700900789@s.whatsapp.net","senderName":"Landlord",
+      "isGroup":false,"timestamp":"2026-09-08T09:12:00.000Z","kind":"text","text":"is the boiler fixed yet?","reactions":[],"snippet":"is the [boiler] fixed yet?"}]
+```
 
-Full-text search across every chat: `?q=dentist&limit=20&before=<messageId>`. Words become prefix terms joined with AND, so `dent tomo` finds "dentist tomorrow"; a quoted query is one phrase. Text, captions and edited text are indexed; tombstoned messages are not. Newest first, each hit a [`HistoryRow`](#historyrow) with a `snippet` where the match is marked `[like this]`. `409 HistoryDisabled` when history is off.
+Errors: `404 TurnNotFound`, `409 TurnNotOpen`, `403 ContextNotAllowed`, `503 ObserverUnavailable` (`detail` says whether the database file is missing, unreadable, or the port is down); the media path also the usual media errors.
 
 #### `GET /contacts/{jid}`
 
@@ -675,7 +718,7 @@ Every event is a JSON object with the envelope `{"_tag", "v": 1, "seq", "at"}` p
 | `Ready` | | First frame on every `GET /events` connection; `seq` is the latest real seq. |
 | `Heartbeat` | | Every 25 seconds of silence; `seq` is the latest real seq. |
 | `MessageReceived` | `message` | A message passed the filters and was accepted; 👀 is being applied. Informational: do not answer it, wait for the turn. |
-| `TurnOpened` | `turnId`, `chatId`, `isGroup`, `messages[]`, `supersedes?`, `context?` | The batch window closed; these messages want one reply. In groups, `context` is the last 10 messages seen in the chat before these, oldest first, handled or not. |
+| `TurnOpened` | `turnId`, `chatId`, `isGroup`, `messages[]`, `supersedes?`, `context?`, `access` | The batch window closed; these messages want one reply. In groups, `context` is the last 10 messages seen in the chat before these, oldest first, handled or not. `access` is what `/turns/{id}/context` may read: `owner` or `chat`. |
 | `TurnSuperseded` | `turnId`, `chatId`, `by` | Newer messages arrived mid-turn; stop working on `turnId`. The `TurnOpened` for `by` follows and carries everything. |
 | `TurnCompleted` | `turnId`, `chatId`, `sentMessageIds[]` | The reply went out and the 👀 were cleared. Empty `sentMessageIds` means the turn was completed with nothing to send. |
 | `TurnFailed` | `turnId`, `chatId`, `reason` | No reply could be sent, or the agent abandoned the turn; the eye came off and the failure text went out. |
@@ -771,6 +814,7 @@ One WhatsApp message as Intro sees it, inside `MessageReceived.message`, `TurnOp
 | `mentionedIds` | string[] | when it @-mentions anyone | Jids mentioned in the text. |
 | `mentionsMe` | boolean | when true | The bridge's own number was mentioned. In groups this is what opened the turn. |
 | `quotesMe` | boolean | when true | The message quotes one the bridge sent. In groups this also opens a turn. |
+| `fromOwner` | boolean | when true | The sender is `BRIDGE_OWNER`, by number or by a lid that maps to it. A DM of such messages is an owner turn. |
 | `location` | [`Location`](#location) | when `kind` is `location` | The pin, or the first point of a live location. |
 | `contacts` | [`SharedContact`](#sharedcontact)[] | when `kind` is `contact` | The cards. |
 | `media` | [`MediaFile`](#mediafile) | when downloaded in time | The local file. Present on `TurnOpened` for automatically downloaded kinds whose download finished within `BRIDGE_MEDIA_WAIT`; never on `MessageReceived`. Otherwise fetch it via the media endpoint. |
@@ -811,6 +855,7 @@ What `GET /turns` and `GET /turns/{turnId}` return.
 | `state` | see below | always | |
 | `messages` | `InboundMessage[]` | always | The batch, oldest first. |
 | `context` | `InboundMessage[]` | groups, when there is any | The last 10 messages seen in the group before `messages`, oldest first. |
+| `access` | `owner` `chat` | always | What `/turns/{id}/context` may read while the turn is open. |
 | `supersedes` | string | when it replaced a turn | |
 | `supersededBy` | string | when `state` is `superseded` | The turn to answer instead. |
 | `openedAt` | ISO-8601 | always | |
@@ -831,7 +876,7 @@ Transitions: `batching` → `responding` → (`awaiting`) → `committed`, with 
 
 #### `TurnPayload`
 
-What the `http` responder POSTs to `INTRO_HANDLER_URL`. Same fields as `TurnOpened` minus the envelope: `{"v": 1, "turnId", "chatId", "isGroup", "messages": [InboundMessage], "supersedes"?, "context"?}`.
+What the `http` responder POSTs to `INTRO_HANDLER_URL`. Same fields as `TurnOpened` minus the envelope: `{"v": 1, "turnId", "chatId", "isGroup", "messages": [InboundMessage], "supersedes"?, "context"?}`. Read context back through `GET /turns/{turnId}/context/...` while the request is open.
 
 #### `HandlerResponse`
 
@@ -861,9 +906,17 @@ A file to send: the body of `POST /chats/{chatId}/media`, each element of `attac
 | `fileName` | string | Shown on document cards. Defaults to the path's basename, or `file.<ext>` for raw data. |
 | `voiceNote` | boolean | Audio only: send as a voice-note bubble. WhatsApp plays those only as `audio/ogg; codecs=opus`. |
 
+#### `ChatInfo`
+
+`{chatId, isGroup, name?, lastMessageAt?, messageCount?, group?}`. `group` is [`GroupInfo`](#get-contactsjid)-shaped: `{chatId, subject, description?, owner?, participants: [{jid, phone?, admin}], createdAt?}`, present for groups on the line side only.
+
+#### `ContactRecord`
+
+`{jid, lid?, phone?, name?, pushName?, updatedAt}`: one entry of the address book the observer synced from your phone, or learned from traffic. `name` is what you saved; `pushName` what the person set.
+
 #### `HistoryRow`
 
-One message from the history, as `GET /chats/{chatId}/messages` and `GET /messages` return it.
+One message from the history, as the `messages` and search reads under `GET /turns/{turnId}/context/...` return it.
 
 | Field | Type | Present | Meaning |
 |---|---|---|---|
@@ -908,6 +961,8 @@ The body of `GET /health` and `GET /status`, and the `status` field of `Unhealth
 | `openTurns` | integer | always | Turns in an open state. |
 | `databasePath` | string | always | The SQLite file, for opening read-only with `sqlite3`. |
 | `history` | boolean | always | Whether message history is being recorded. |
+| `access` | `open` `owner` | always | Whether the access rule is on (`BRIDGE_OWNER` set). |
+| `observerUrl` | string | when `access` is `owner` | Where the observer is expected. |
 
 #### `SentMessage` and `ReplyResult`
 
@@ -926,7 +981,10 @@ Every error body is `{"_tag": "...", ...fields}`. The status code is fixed per t
 | 404 | `MessageUnknown` | `chatId`, `messageId`, `reason` | The message to quote, edit or delete is not one the bridge saw or sent this run. | Check the id; after a restart, only new messages are known. |
 | 409 | `MessageTooOld` | `chatId`, `messageId`, `operation`, `limitMs`, `ageMs` | WhatsApp's window for the edit (15 minutes) or delete (about 2 days) has passed. | Send a correction as a new message instead. |
 | 409 | `TurnNotOpen` | `turnId`, `state` | `progress` or `abandon` on a turn that is not `responding` or `awaiting`. | Nothing to do. |
-| 409 | `HistoryDisabled` | | A history endpoint was called with history off. | Enable history, or use the live turn data. |
+| 409 | `HistoryDisabled` | | A line context read with history off. | Enable history, or use the live turn data. |
+| 403 | `ContextNotAllowed` | `turnId`, `access`, `detail` | The turn's capability does not cover the read: a chat turn asking beyond its own chat, or for the primary number. | Answer from what the turn carries. |
+| 403 | `NotAllowlisted` | `chatId` | A send to a chat outside the access rule. | Do not send there. |
+| 503 | `ObserverUnavailable` | `detail` | The observer's database file or port could not be reached. | Say the primary history is unavailable; the line still works. |
 | 404 | `ScheduledNotFound` | `scheduledId` | No pending scheduled send with that id (already sent, cancelled, or unknown). | Check `GET /scheduled`. |
 | 502 | `LookupFailed` | `subject`, `detail` | WhatsApp refused or timed out a contact or group lookup. | Retry later. |
 | 500 | `StoreError` | `operation`, `detail` | The database misbehaved. | Check disk space and the log. |
@@ -969,7 +1027,7 @@ Every error body is `{"_tag": "...", ...fields}`. The status code is fixed per t
 
 `npm run bridge -- <command> [flags]` from the checkout, or `bridge <command>` after `npm run build`. `npm run link`, `npm start`, `npm run harness` and `npm run health` are shortcuts for `link`, `run`, `harness` and `health`. Every command prints `--help`. Global flags: `--log-level <all|trace|debug|info|warn|error|fatal|none>`, `--version`.
 
-The client commands (everything but `link`, `run`, `harness`, `history enable`, `history purge` and `unlink`) talk to a running daemon at `BRIDGE_URL` (default `http://$BRIDGE_HOST:$BRIDGE_PORT`) and send `BRIDGE_API_TOKEN` when it is set. They print the daemon's JSON answer on stdout, or the error's message on stderr with a non-zero exit code. When the daemon is not listening they fail with `daemon not reachable at <url>: <detail>`.
+The client commands (everything but `link`, `run`, `harness`, the `history` and `observe` commands, `chats`, `messages`, `search` and `unlink`) talk to a running daemon at `BRIDGE_URL` (default `http://$BRIDGE_HOST:$BRIDGE_PORT`) and send `BRIDGE_API_TOKEN` when it is set. They print the daemon's JSON answer on stdout, or the error's message on stderr with a non-zero exit code. When the daemon is not listening they fail with `daemon not reachable at <url>: <detail>`.
 
 | Command | Flags | Does | Prints |
 |---|---|---|---|
@@ -983,9 +1041,14 @@ The client commands (everything but `link`, `run`, `harness`, `history enable`, 
 | `poll` | `--to`, `--question`, `--option <text>` (repeat, two to twelve), `--multiple` | `POST /chats/{chatId}/polls` | `{"chatId","messageId"}` |
 | `presence` | `--chat` | `GET /chats/{chatId}/presence` | `PresenceInfo` |
 | `contact` | `--jid <jid or phone>` | `GET /contacts/{jid}` | `ContactInfo` |
-| `chats` | | `GET /chats` | `ChatSummary[]` |
-| `messages` | `--chat`, `--q`, `--before`, `--limit` | `GET /chats/{chatId}/messages` | `HistoryRow[]` |
-| `search` | `--q`, `--limit` | `GET /messages` | `HistoryRow[]` |
+| `chats` | `--observer` | Reads the database file directly (no daemon needed); `--observer` reads the observer's | `ChatSummary[]` |
+| `messages` | `--chat`, `--q`, `--before`, `--limit`, `--observer` | Reads the database file directly | `HistoryRow[]` |
+| `search` | `--q`, `--limit`, `--observer` | Reads the database file directly | `HistoryRow[]` |
+| `observe enable` | `--yes` | Prints what the observer stores and where it goes, asks, writes `data-observer/observer.accepted`. Needed once. | |
+| `observe link` | `--phone <digits>`, `--timeout` | Links the observer to your own number and saves the session under `$BRIDGE_OBSERVER_DIR/auth`. | `Observer linked as <jid>` |
+| `observe run` | | The observer daemon: read-only on your number, its own database and port. | Logs |
+| `observe health` | | `GET /status` on the observer | `ObserverStatus` with `backfill`; exit 0 only when `ok` |
+| `observe purge` | `--before <ISO-8601>`, `--yes` | Deletes observed history older than the instant. | `Removed N message(s)` |
 | `scheduled` | | `GET /scheduled` | `ScheduledSend[]` |
 | `unschedule` | `--id` | `DELETE /scheduled/{id}` | `{"ok":true}` |
 | `history enable` | `--yes` | Prints what history stores, asks, writes `data/history.accepted`. Needed once before `BRIDGE_HISTORY=true`. | |
@@ -1017,13 +1080,15 @@ Durations on the CLI use the same format as the configuration: `"15 seconds"`, `
 
 **The user edited or deleted something.** Nothing to do: a pending message is corrected or dropped for you, and the turn is superseded or cancelled with an event. If the edit arrives after you answered, `MessageEdited` is your cue to answer again if it matters.
 
-**Remember.** With history on, `GET /chats/{chatId}/messages?limit=30` before answering gives the recent conversation; `?since=<when you last looked>` gives what you missed; `GET /messages?q=dentist` finds it wherever it was said. Read `editedText ?? text`, skip rows with `deletedAt`, and treat `mediaEvictedAt` as "fetch the file again if you need it".
+**Remember.** With history on, `GET /turns/{turnId}/context/line/chats/{chatId}/messages?limit=30` before answering gives the recent conversation of the chat you are in; `?since=<when you last looked>` gives what you missed. In the owner's DM, `.../context/line/messages?q=dentist` finds it wherever it was said. Read `editedText ?? text`, skip rows with `deletedAt`, and treat `mediaEvictedAt` as "fetch the file again if you need it". Read while the turn is open: the capability ends with your reply.
+
+**The owner's own conversations.** When `TurnOpened.access` is `owner`, the primary number is readable: `GET /turns/{turnId}/context/primary/messages?q=boiler` for "what did the landlord say?", `.../primary/chats/{chatId}/messages` for a thread, `.../primary/contacts?q=patel` to turn a name into a chat. Rows with `direction: "out"` are what the owner wrote from the phone; `kind: "call"` rows are calls. Say where a fact came from ("in your chat with the landlord on Tuesday"). What you read here stays in this DM: never repeat it in a group or to anyone else. `503 ObserverUnavailable` means the observer is not running; say so rather than guessing.
 
 **Schedule a message.** `POST /chats/{chatId}/messages {"text": "Dentist in an hour.", "sendAt": "2026-09-11T09:00:00Z"}` answers `202` with a `scheduledId`; `DELETE /scheduled/{id}` cancels it. Add `"deliverWhenOnline": true` for something that should land when the person is around. Watch `ScheduledSent`, `ScheduledSkipped` and `ScheduledFailed`.
 
 **Pass something on.** `POST /chats/{otherChatId}/forward {"fromChatId", "messageId"}` forwards a message, attachments included, without downloading and re-uploading it.
 
-**Who is this?** `GET /contacts/{jid}` before writing to a number you have not seen: `onWhatsApp: false` means the message can never arrive. `GET /chats/{groupId}` lists a group's members and admins.
+**Who is this?** `GET /contacts/{jid}` before writing to a number you have not seen: `onWhatsApp: false` means the message can never arrive. `GET /turns/{turnId}/context/line/chats/{groupId}` lists a group's members and admins.
 
 **Watch the reactions.** `ReactionReceived` with `onOurMessage: true` is feedback on an answer: a 👍 needs nothing, a ❌ or 👎 is worth a follow-up in the same chat.
 
@@ -1045,7 +1110,7 @@ Durations on the CLI use the same format as the configuration: `"15 seconds"`, `
 
 **Deduplicate across surfaces.** Every message has `chatId` + `messageId`, every turn has `turnId`; key your own dedupe on them so an ask answered in the app is not answered again on WhatsApp.
 
-**Group chats.** Only when `BRIDGE_GROUPS=true`. `isGroup` is true, `chatId` ends in `@g.us`, `senderId` is the participant, `senderName` their push name. A turn opens only when someone @-mentions the bridge (`mentionsMe`) or quotes one of its messages (`quotesMe`); read `context` for what the group was discussing before that, and `GET /chats/{chatId}` for who is in it. If the mention needs no answer, `POST /turns/{turnId}/reply {}`. To address one member in a reply, write `@<digits>` and list their jid in `mentions`. Quote the triggering message (`quoteMessageId`) so the answer reads as a reply in a busy chat.
+**Group chats.** Only when `BRIDGE_GROUPS=true`. `isGroup` is true, `chatId` ends in `@g.us`, `senderId` is the participant, `senderName` their push name. A turn opens only when someone @-mentions the bridge (`mentionsMe`) or quotes one of its messages (`quotesMe`); read `context` for what the group was discussing before that, and `GET /turns/{turnId}/context/line/chats/{chatId}` for who is in it. If the mention needs no answer, `POST /turns/{turnId}/reply {}`. To address one member in a reply, write `@<digits>` and list their jid in `mentions`. Quote the triggering message (`quoteMessageId`) so the answer reads as a reply in a busy chat.
 
 **Send a place, a card, a vote.** `POST /chats/{chatId}/location {"latitude", "longitude", "name"?}` for a pin; `POST /chats/{chatId}/contacts {"contacts": [{"name", "phone"}]}` for a card the user can save; `POST /chats/{chatId}/polls {"question", "options": [...]}` to ask a multiple-choice question and read the answer from `PollVote` events (`selected` is the voter's current choice, so the last event per voter wins). Inbound, `kind: "location"` and `kind: "contact"` messages carry `location` and `contacts`.
 
@@ -1078,7 +1143,14 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 | `BRIDGE_TYPING_MAX` | `3 minutes` | How long "typing…" is kept alive per turn, re-armed by progress |
 | `BRIDGE_GROUPS` | `false` | Handle group chats |
 | `BRIDGE_GROUP_TRIGGER` | `mention` | What opens a group turn: `mention` (mentioned or quoted) or `always` (every message) |
-| `BRIDGE_ALLOWED_SENDERS` | unset (anyone) | Comma-separated numbers/jids allowed to talk to the line |
+| `BRIDGE_ALLOWED_SENDERS` | unset (anyone) | Comma-separated numbers/jids allowed to talk to the line. With `BRIDGE_OWNER`, a person unlocks their DM only; a group jid unlocks that group |
+| `BRIDGE_OWNER` | unset | Your own number (digits). Turns the access rule on and makes your DM turns `owner` access |
+| `BRIDGE_OBSERVER_DIR` | `./data-observer` | The observer's data directory: session, database, media, acceptance |
+| `BRIDGE_OBSERVER_PORT` | `8788` | The observer daemon's port |
+| `BRIDGE_OBSERVER_URL` | `http://127.0.0.1:$BRIDGE_OBSERVER_PORT` | Where the personal line fetches primary attachments and the CLI reads observer health |
+| `BRIDGE_OBSERVE_BACKFILL_DAYS` | `30` | Observer: keep the recent history WhatsApp pushes at link time, this many days back; `0` refuses it |
+| `BRIDGE_OBSERVE_RETENTION` | `180 days` | Observer: rows older than this are purged daily |
+| `BRIDGE_OBSERVE_EXCLUDE` | unset | Observer: comma-separated chats (jids or digits) never written to disk |
 | `BRIDGE_OFFLINE_WINDOW` | `0 seconds` | Handle messages replayed after downtime that are younger than this |
 | `BRIDGE_TYPING` | `true` | Typing indicator while answering |
 | `LOG_LEVEL` / `LOG_FORMAT` / `LOG_BODIES` | `Info` / `pretty` / `false` | Logging |
@@ -1104,8 +1176,10 @@ Durations use Effect's format: `"1500 millis"`, `"2 seconds"`, `"10 minutes"`. A
 { "state": "ok", "linkedAs": { "jid": "4479...@s.whatsapp.net", "name": "Intro" }, "responder": "manual",
   "version": "0.2.0", "startedAt": "...", "lastEventAt": "...", "lastInboundAt": "...", "lastOutboundAt": "...",
   "reconnects": 2, "lastDisconnect": { "at": "...", "reason": "Connection Terminated (428)" }, "openTurns": 0,
-  "databasePath": "/home/box/whatsapp-bridge/data/bridge.db", "history": true }
+  "databasePath": "/home/box/whatsapp-bridge/data/bridge.db", "history": true, "access": "owner", "observerUrl": "http://127.0.0.1:8788" }
 ```
+
+`bridge observe health` reports the observer the same way, plus `backfill` (chunks accepted and refused, messages stored, media queued, whether the link-time backfill finished) and `messages`.
 
 | `state` | Meaning | What to do |
 |---|---|---|
@@ -1113,7 +1187,7 @@ Durations use Effect's format: `"1500 millis"`, `"2 seconds"`, `"10 minutes"`. A
 | `linking` | `bridge link` is waiting for the phone | Scan / enter the code |
 | `connecting` | Session exists, socket (re)connecting | Wait; backoff is jittered and capped at 60 s |
 | `ok` | Messages flow | |
-| `needs_relink` | No session, logged out, or banned (`detail` says which) | `npm run link` |
+| `needs_relink` | No session, logged out, or banned (`detail` says which) | `npm run link` (the observer: `bridge observe link`) |
 | `stopped` | Daemon not running (CLI only) | Start it |
 
 While `connecting`, sends fail with `NotConnected`; the engine retries outbound calls with backoff for about half a minute, which covers a normal reconnect. `TurnFailed` events and the `failure` field on a turn carry the reason when it does not.
@@ -1161,6 +1235,8 @@ The bridge is built so that every failure is either recovered automatically or r
 - The bridge makes no calls to OpenAI, xAI or any model provider. Its only outbound connections are WhatsApp's servers, the WhatsApp Web version lookup at startup, and `INTRO_HANDLER_URL` if you configure one.
 - `markOnlineOnConnect` is off so the phone keeps receiving notifications.
 - Presence subscriptions are per chat and only for chats that message the line or that the agent asks about; the bridge reports presence to nobody but the agent.
+- The observer's directory holds your own number's session and a plain-text copy of its recent conversations, 0600 in 0700, on the same terms as the line's: disk encryption and a machine nobody else uses. Reads reach the model provider only as the agent's queries in your DM; nothing is uploaded on its own.
+- The observer is an unofficial client on your primary number. It only listens, like WhatsApp Web, but WhatsApp's terms do not allow it, and the one who accepted that with `bridge observe enable` is you.
 
 ## Development
 

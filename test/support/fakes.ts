@@ -7,9 +7,12 @@ import { BridgeConfig, type BridgeConfigShape } from "../../src/config.ts"
 import { ChatId, MessageId } from "../../src/domain/ids.ts"
 import { InboundMessage, type MessageKind } from "../../src/domain/message.ts"
 import { EventsLive } from "../../src/engine/Events.ts"
+import { ContextSourceLive } from "../../src/engine/Context.ts"
+import { FetchHttpClient } from "effect/unstable/http"
 import { MediaStoreLive } from "../../src/engine/Media.ts"
 import { OutboundLive } from "../../src/engine/Outbound.ts"
 import { StoreWithDatabaseLive } from "../../src/store/Store.ts"
+import { MediaSourceFromWhatsApp } from "../../src/whatsapp/MediaSource.ts"
 import { SchedulerLive } from "../../src/store/Scheduled.ts"
 import { outgoing, type OutboundMedia } from "../../src/domain/outbound.ts"
 import { HealthLive } from "../../src/engine/Health.ts"
@@ -76,6 +79,13 @@ export const testConfig = (overrides: Partial<BridgeConfigShape> = {}): BridgeCo
   baileysLogLevel: "silent",
   browserName: "test",
   harnessSlow: Duration.zero,
+  owner: Option.none(),
+  observerDir: "./data-test/observer",
+  observerPort: 8788,
+  observerUrl: "http://127.0.0.1:8788",
+  observeBackfillDays: 30,
+  observeRetention: Duration.days(180),
+  observeExclude: [],
   ...overrides,
 })
 
@@ -152,6 +162,8 @@ export interface FakeWhatsAppShape {
   readonly albums: Queue.Queue<{ readonly chatId: ChatId; readonly items: ReadonlyArray<OutboundMedia>; readonly messageIds: ReadonlyArray<MessageId> }>
   /** Mentions passed with text sends, by message id. */
   readonly mentions: Ref.Ref<ReadonlyMap<MessageId, ReadonlyArray<string>>>
+  /** Chats the fake's access rule refuses (everything else is allowed). */
+  readonly disallowed: Ref.Ref<ReadonlySet<ChatId>>
   /** Announced right before a send waits on `sendGate` (when one is set). */
   readonly sending: Queue.Queue<Outbound>
   readonly typing: Ref.Ref<ReadonlyArray<{ readonly chatId: ChatId; readonly composing: boolean }>>
@@ -195,6 +207,7 @@ export const FakeWhatsAppLive = Layer.effectContext(
     const polls = yield* Queue.unbounded<{ readonly chatId: ChatId; readonly poll: PollInput; readonly messageId: MessageId }>()
     const albums = yield* Queue.unbounded<{ readonly chatId: ChatId; readonly items: ReadonlyArray<OutboundMedia>; readonly messageIds: ReadonlyArray<MessageId> }>()
     const mentions = yield* Ref.make<ReadonlyMap<MessageId, ReadonlyArray<string>>>(new Map())
+    const disallowed = yield* Ref.make<ReadonlySet<ChatId>>(new Set())
     const typing = yield* Ref.make<ReadonlyArray<{ readonly chatId: ChatId; readonly composing: boolean }>>([])
     const failNextSends = yield* Ref.make(0)
     const sendGate = yield* Ref.make<Option.Option<Latch.Latch>>(Option.none())
@@ -282,6 +295,7 @@ export const FakeWhatsAppLive = Layer.effectContext(
           const g = m.get(chatId)
           return g === undefined ? Effect.fail(new LookupFailed({ subject: chatId, detail: "not a group in the fake" })) : Effect.succeed(g)
         }),
+      chatAllowed: (chatId) => Effect.map(Ref.get(disallowed), (set) => !set.has(chatId)),
       presence: (chatId) =>
         Effect.gen(function* () {
           yield* Queue.offer(presenceAsks, chatId)
@@ -358,6 +372,7 @@ export const FakeWhatsAppLive = Layer.effectContext(
       polls,
       albums,
       mentions,
+      disallowed,
       typing,
       failNextSends,
       sendGate,
@@ -418,11 +433,12 @@ export const EngineTestLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
   const Events = EventsLive.pipe(Layer.provide(Health))
   const Storage = StoreWithDatabaseLive.pipe(Layer.provide([Config, NodeServices.layer]))
   const Registry = TurnRegistryLive.pipe(Layer.provide([Config, Storage]))
-  const Media = MediaStoreLive.pipe(Layer.provide([Config, FakeWhatsAppLive, Storage, NodeServices.layer]))
+  const Media = MediaStoreLive.pipe(Layer.provide([Config, MediaSourceFromWhatsApp.pipe(Layer.provide(FakeWhatsAppLive)), Storage, NodeServices.layer]))
   const Outbound = OutboundLive.pipe(Layer.provide([Config, NodeServices.layer]))
   const Scheduled = SchedulerLive.pipe(Layer.provide([Storage, FakeWhatsAppLive, Outbound, Events]))
-  const Engine = TurnEngineLive.pipe(Layer.provide([Config, FakeWhatsAppLive, Events, Registry, TestResponderLive, Media, Storage]))
-  return Layer.mergeAll(Config, Health, Events, FakeWhatsAppLive, Registry, Storage, TestResponderLive, Media, Outbound, Scheduled, Engine)
+  const Context = ContextSourceLive.pipe(Layer.provide([Config, Storage, FakeWhatsAppLive, NodeServices.layer, FetchHttpClient.layer]))
+  const Engine = TurnEngineLive.pipe(Layer.provide([Config, FakeWhatsAppLive, Events, Registry, TestResponderLive, Media, Storage, Context]))
+  return Layer.mergeAll(Config, Health, Events, FakeWhatsAppLive, Registry, Storage, TestResponderLive, Media, Outbound, Scheduled, Context, Engine)
 }
 
 // ---------------------------------------------------------------------------
@@ -435,22 +451,35 @@ export const chat = ChatId.make("447700900123@s.whatsapp.net")
 
 export const message = (
   text: string,
-  options: { readonly chatId?: ChatId; readonly isGroup?: boolean; readonly kind?: MessageKind; readonly mimetype?: string } = {},
+  options: {
+    readonly chatId?: ChatId
+    readonly isGroup?: boolean
+    readonly kind?: MessageKind
+    readonly mimetype?: string
+    /** Digits of the sender; defaults to the DM's number, or the owner's in a group. */
+    readonly senderNumber?: string
+    readonly senderName?: string
+    /** Stamped by the transport in production when the sender is `BRIDGE_OWNER`. */
+    readonly fromOwner?: boolean
+  } = {},
 ): InboundMessage => {
   const kind = options.kind ?? "text"
   const hasMedia = kind === "image" || kind === "sticker" || kind === "video" || kind === "audio" || kind === "document"
+  const chatId = options.chatId ?? chat
+  const senderNumber = options.senderNumber ?? (options.isGroup ? "447700900123" : (chatId.split("@")[0] ?? "447700900123"))
   return InboundMessage.make({
-    chatId: options.chatId ?? chat,
+    chatId,
     messageId: MessageId.make(`in_${++counter}`),
-    senderId: options.chatId ?? chat,
-    senderNumber: "447700900123",
-    senderName: "Moishi",
+    senderId: options.isGroup ? `${senderNumber}@s.whatsapp.net` : chatId,
+    senderNumber,
+    senderName: options.senderName ?? "Moishi",
     isGroup: options.isGroup ?? false,
     timestamp: DateTime.makeUnsafe(1_700_000_000_000 + counter),
     kind,
     text,
     hasMedia,
     ...(options.mimetype === undefined ? {} : { mimetype: options.mimetype }),
+    ...(options.fromOwner === true ? { fromOwner: true } : {}),
   })
 }
 

@@ -39,6 +39,8 @@ export const BridgeEvent = Schema.TaggedUnion({
     supersedes: Schema.optionalKey(TurnId),
     /** Groups: the last messages in the chat before this turn, oldest first, so the agent sees what was being discussed. */
     context: Schema.optionalKey(Schema.Array(InboundMessage)),
+    /** What `/turns/{id}/context` may read: `owner` (both lines) for the owner's DM, `chat` (this chat only) otherwise. */
+    access: Schema.optionalKey(Schema.Literals(["owner", "chat"])),
   },
   /** Newer messages arrived mid-turn. Stop working on `turnId`; `by` carries everything. */
   TurnSuperseded: { ...envelope, turnId: TurnId, chatId: ChatId, by: TurnId },

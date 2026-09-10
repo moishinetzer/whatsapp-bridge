@@ -1,4 +1,4 @@
-import { Schema } from "effect"
+import { Schema, type DateTime } from "effect"
 import { ChatId, MessageId, TurnId } from "./ids.ts"
 import { MessageKind } from "./message.ts"
 
@@ -59,3 +59,28 @@ export const ChatSummary = Schema.Struct({
   messageCount: Schema.Number,
 })
 export type ChatSummary = typeof ChatSummary.Type
+
+/** One entry of the address book synced from the phone, or learned from traffic. */
+export const ContactRecord = Schema.Struct({
+  jid: Schema.String,
+  lid: Schema.optionalKey(Schema.String),
+  phone: Schema.optionalKey(Schema.String),
+  /** The name saved in the phone's address book. */
+  name: Schema.optionalKey(Schema.String),
+  /** The name the contact set for themselves. */
+  pushName: Schema.optionalKey(Schema.String),
+  updatedAt: Schema.DateTimeUtcFromString,
+})
+export type ContactRecord = typeof ContactRecord.Type
+
+/** A call, stored as a `call` row in the history so "they called twice" is context too. */
+export interface CallRecord {
+  readonly callId: string
+  readonly chatId: ChatId
+  readonly fromId: string
+  readonly direction: Direction
+  readonly at: DateTime.Utc
+  readonly status: string
+  readonly isVideo: boolean
+  readonly isGroup: boolean
+}

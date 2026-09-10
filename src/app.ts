@@ -1,7 +1,7 @@
 import { FetchHttpClient } from "effect/unstable/http"
 import { NodeServices } from "@effect/platform-node"
 import { Duration, Effect, FiberSet, Layer, Option } from "effect"
-import { BridgeConfig, BridgeConfigLive, DotEnvLive, type BridgeConfigShape } from "./config.ts"
+import { BridgeConfig, BridgeConfigLive, DotEnvLive, forObserver, type BridgeConfigShape } from "./config.ts"
 import { EventsLive } from "./engine/Events.ts"
 import { HealthLive } from "./engine/Health.ts"
 import { MediaStoreLive } from "./engine/Media.ts"
@@ -10,11 +10,18 @@ import { StoreWithDatabaseLive } from "./store/Store.ts"
 import { SchedulerLive } from "./store/Scheduled.ts"
 import { FileSystem, Path, Schema } from "effect"
 import { ResponderLive } from "./engine/Responder.ts"
+import { ContextSourceLive } from "./engine/Context.ts"
 import { TurnEngineLive, TurnRegistryLive } from "./engine/Turns.ts"
 import { HttpServerLive } from "./http/Server.ts"
 import { LoggingLive } from "./logging.ts"
 import { AuthStoreLive } from "./whatsapp/AuthStore.ts"
 import { BaileysLive, type BaileysOptions } from "./whatsapp/Baileys.ts"
+import { MediaSourceFromWhatsApp } from "./whatsapp/MediaSource.ts"
+import { Observer, ObserverLive, ObserverMediaSourceLive, type ObserverOptions } from "./whatsapp/Observer.ts"
+import { ObserverHttpServerLive } from "./http/ObserverServer.ts"
+import { MediaStore } from "./engine/Media.ts"
+import { Store } from "./store/Store.ts"
+import { DateTime, Schedule, Stream } from "effect"
 
 /**
  * The last line of defence for the process. The protocol library runs a lot
@@ -126,15 +133,16 @@ export const coreLayer = (transport: BaileysOptions, overrides: Partial<BridgeCo
 export const daemonLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
   const Core = coreLayer({ mode: "serve" }, overrides)
   const Registry = TurnRegistryLive.pipe(Layer.provide(Core))
-  const Media = MediaStoreLive.pipe(Layer.provide([Core, NodeServices.layer]))
+  const Media = MediaStoreLive.pipe(Layer.provide([Core, MediaSourceFromWhatsApp.pipe(Layer.provide(Core)), NodeServices.layer]))
   const Outbound = OutboundLive.pipe(Layer.provide([Core, NodeServices.layer]))
   const Scheduled = SchedulerLive.pipe(Layer.provide([Core, Outbound]))
   const Responder = ResponderLive.pipe(Layer.provide([Core, Outbound, FetchHttpClient.layer]))
-  const Engine = TurnEngineLive.pipe(Layer.provide([Core, Registry, Responder, Media]))
+  const Context = ContextSourceLive.pipe(Layer.provide([Core, NodeServices.layer, FetchHttpClient.layer]))
+  const Engine = TurnEngineLive.pipe(Layer.provide([Core, Registry, Responder, Media, Context]))
   const Server = HttpServerLive.pipe(Layer.provide([Core, Registry, Media, Outbound, Scheduled]))
   const Gate = HistoryGateLive.pipe(Layer.provide([Core, NodeServices.layer]))
   const Startup = StartupLogLive.pipe(Layer.provide(Core))
-  return Layer.mergeAll(Gate, Core, Registry, Media, Outbound, Scheduled, Responder, Engine, Server, Startup, ProcessGuardsLive).pipe(
+  return Layer.mergeAll(Gate, Core, Registry, Media, Outbound, Scheduled, Responder, Context, Engine, Server, Startup, ProcessGuardsLive).pipe(
     Layer.provideMerge(AmbientLive),
   )
 }
@@ -142,3 +150,111 @@ export const daemonLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
 /** `bridge link`: the transport in link mode, nothing else. */
 export const linkLayer = (phone: string | undefined) =>
   Layer.mergeAll(coreLayer({ mode: "link", phone }), ProcessGuardsLive).pipe(Layer.provideMerge(AmbientLive))
+
+// ---------------------------------------------------------------------------
+// The observer: a second process on the primary number, reading only.
+// ---------------------------------------------------------------------------
+
+/** The observer was configured without the one-time acceptance: the daemon says what to run and stops. */
+export class ObserverNotAccepted extends Schema.TaggedError<ObserverNotAccepted>()("ObserverNotAccepted", { file: Schema.String }) {
+  override get message() {
+    return `the observer has not been enabled on this machine: run \`bridge observe enable\` (it explains what gets stored and writes ${this.file})`
+  }
+}
+
+/** Where `bridge observe enable` records the acceptance, inside the observer's own directory. */
+export const observerAcceptanceFile = (observerDir: string) => `${observerDir.replace(/\/+$/, "")}/observer.accepted`
+
+const ObserverGateLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const config = yield* BridgeConfig
+    const fs = yield* FileSystem.FileSystem
+    const path = yield* Path.Path
+    const file = path.resolve(observerAcceptanceFile(config.dataDir))
+    if (!(yield* fs.exists(file).pipe(Effect.orElseSucceed(() => false)))) return yield* new ObserverNotAccepted({ file })
+  }),
+)
+
+/** Attachments the policy wants, fetched one at a time with a pause, so a backfill never hammers WhatsApp. */
+const ObserverMediaLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const observer = yield* Observer
+    const media = yield* MediaStore
+    yield* observer.mediaWanted.pipe(
+      Stream.runForEach(({ chatId, messageId }) =>
+        media.get(chatId, messageId).pipe(
+          Effect.catch((e) => Effect.logDebug("observer media not fetched").pipe(Effect.annotateLogs({ chatId, messageId, reason: e.message }))),
+          Effect.andThen(Effect.sleep("250 millis")),
+        ),
+      ),
+      Effect.forkScoped,
+    )
+  }),
+)
+
+/** Daily: rows older than the retention go. Weekly: a line saying the observer is on, so it never becomes furniture. */
+const ObserverMaintenanceLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const config = yield* BridgeConfig
+    const store = yield* Store
+    const purge = Effect.gen(function* () {
+      const now = yield* DateTime.now
+      const removed = yield* store.purgeBefore(DateTime.subtractDuration(now, config.observeRetention))
+      if (removed > 0) yield* Effect.logInfo("observer retention").pipe(Effect.annotateLogs({ removed, retentionMs: Duration.toMillis(config.observeRetention) }))
+    }).pipe(Effect.catch((e) => Effect.logWarning("observer retention failed").pipe(Effect.annotateLogs({ reason: e.message }))))
+    yield* purge.pipe(Effect.repeat(Schedule.spaced("24 hours")), Effect.forkScoped)
+    yield* Effect.logInfo("the observer is recording every message on the primary number").pipe(
+      Effect.annotateLogs({ database: config.databasePath, retentionMs: Duration.toMillis(config.observeRetention), exclude: config.observeExclude.length }),
+      Effect.repeat(Schedule.spaced("7 days")),
+      Effect.forkScoped,
+    )
+  }),
+)
+
+const ObserverStartupLogLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const c = yield* BridgeConfig
+    yield* Effect.logInfo("observer configuration").pipe(
+      Effect.annotateLogs({
+        api: `http://${c.host}:${c.port}`,
+        apiToken: Option.isSome(c.apiToken) ? "set" : "none",
+        dataDir: c.dataDir,
+        database: c.databasePath,
+        mediaDir: c.mediaDir,
+        mediaAuto: c.mediaAuto,
+        mediaMaxDisk: c.mediaMaxDisk,
+        backfillDays: c.observeBackfillDays,
+        retentionMs: Duration.toMillis(c.observeRetention),
+        excluded: c.observeExclude.length,
+      }),
+    )
+  }),
+)
+
+/** Config, health, session, store and the observer transport on the observer's own directory. */
+const observerCore = (options: ObserverOptions) => {
+  const Config = BridgeConfigLive(forObserver).pipe(Layer.provide(EnvLive))
+  const Health = HealthLive.pipe(Layer.provide(Config))
+  const Auth = AuthStoreLive.pipe(Layer.provide([Config, NodeServices.layer]))
+  const Storage = StoreWithDatabaseLive.pipe(Layer.provide([Config, NodeServices.layer]))
+  const Transport = ObserverLive(options).pipe(Layer.provide([Config, Auth, Health, Storage]))
+  return Layer.mergeAll(Config, Health, Auth, Storage, Transport)
+}
+
+/** `bridge observe run`: the read-only daemon on the primary number. */
+export const observerLayer = () => {
+  const Core = observerCore({ mode: "serve" })
+  const Source = ObserverMediaSourceLive.pipe(Layer.provide(Core))
+  const Media = MediaStoreLive.pipe(Layer.provide([Core, Source, NodeServices.layer]))
+  const Fetcher = ObserverMediaLive.pipe(Layer.provide([Core, Media]))
+  const Server = ObserverHttpServerLive.pipe(Layer.provide([Core, Media]))
+  const Gate = ObserverGateLive.pipe(Layer.provide([Core, NodeServices.layer]))
+  // After the gate, so a refused start never logs "recording" first.
+  const Maintenance = ObserverMaintenanceLive.pipe(Layer.provide([Core, Gate]))
+  const Startup = ObserverStartupLogLive.pipe(Layer.provide(Core))
+  return Layer.mergeAll(Gate, Core, Media, Fetcher, Server, Maintenance, Startup, ProcessGuardsLive).pipe(Layer.provideMerge(AmbientLive))
+}
+
+/** `bridge observe link`: the observer transport in link mode, nothing else. */
+export const observerLinkLayer = (phone: string | undefined) =>
+  Layer.mergeAll(observerCore({ mode: "link", phone }), ProcessGuardsLive).pipe(Layer.provideMerge(AmbientLive))

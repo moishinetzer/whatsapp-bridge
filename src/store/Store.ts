@@ -2,10 +2,13 @@ import { Context, DateTime, Effect, Layer, Option, Schema } from "effect"
 import { SqlClient } from "effect/unstable/sql"
 import { BridgeConfig } from "../config.ts"
 import { ChatId, MessageId, TurnId } from "../domain/ids.ts"
-import type { ChatSummary, DeliveryStatus, SearchHit, StoredMessage } from "../domain/history.ts"
+import type { CallRecord, ChatSummary, ContactRecord, DeliveryStatus, Direction, SearchHit, StoredMessage } from "../domain/history.ts"
 import type { InboundMessage, MessageKind } from "../domain/message.ts"
 import type { TurnSummary } from "../engine/Turns.ts"
 import { DatabaseLive, MigrationsLive } from "./Database.ts"
+import { makeHistoryReads, millis, type PageOptions, type SearchOptions } from "./History.ts"
+
+export { ftsQuery, type PageOptions, type SearchOptions } from "./History.ts"
 
 /** The database misbehaved. */
 export class StoreError extends Schema.TaggedError<StoreError>()(
@@ -46,12 +49,20 @@ export interface OutboundRecord {
   readonly raw: Uint8Array
 }
 
-export interface PageOptions {
-  /** Only messages older than this one. */
-  readonly before?: MessageId | undefined
-  /** Only messages newer than this instant. */
-  readonly since?: DateTime.Utc | undefined
-  readonly limit: number
+/** A message the observer saw, in either direction, with its raw bytes when there are any. */
+export interface ObservedItem {
+  readonly message: InboundMessage
+  readonly raw: Uint8Array | undefined
+  readonly direction: Direction
+}
+
+/** What is known about a contact from one source; fields left out are kept as they were. */
+export interface ContactUpsert {
+  readonly jid: string
+  readonly lid?: string | undefined
+  readonly phone?: string | undefined
+  readonly name?: string | undefined
+  readonly pushName?: string | undefined
 }
 
 export interface StoreShape {
@@ -64,10 +75,18 @@ export interface StoreShape {
   readonly forgetSent: (messageId: MessageId) => Effect.Effect<void, StoreError>
   /** Upsert a turn's summary; the outcome of every turn is kept. */
   readonly recordTurn: (summary: TurnSummary) => Effect.Effect<void, StoreError>
+  /** Small facts that must survive a restart (who the account is, backfill progress). */
+  readonly getState: (key: string) => Effect.Effect<Option.Option<string>, StoreError>
+  readonly setState: (key: string, value: string) => Effect.Effect<void, StoreError>
 
   // History: writes are no-ops when disabled, reads fail with `HistoryDisabled`.
   readonly recordInbound: (message: InboundMessage, raw: Uint8Array) => Effect.Effect<void, StoreError>
+  /** One message in either direction: the observer's live traffic. `out` is the account's own message. */
+  readonly recordMessage: (message: InboundMessage, raw: Uint8Array | undefined, direction: Direction) => Effect.Effect<void, StoreError>
+  /** Many messages in one transaction (backfill). Returns how many were new. */
+  readonly recordBatch: (items: ReadonlyArray<ObservedItem>) => Effect.Effect<number, StoreError>
   readonly recordOutbound: (record: OutboundRecord) => Effect.Effect<void, StoreError>
+  readonly recordCall: (call: CallRecord) => Effect.Effect<void, StoreError>
   readonly markEdited: (chatId: ChatId, messageId: MessageId, text: string) => Effect.Effect<void, StoreError>
   /** Tombstone: the text, media path and raw bytes go; id and timestamps stay. */
   readonly markDeleted: (chatId: ChatId, messageId: MessageId) => Effect.Effect<void, StoreError>
@@ -77,13 +96,17 @@ export interface StoreShape {
   readonly attachMedia: (chatId: ChatId, messageId: MessageId, path: string) => Effect.Effect<void, StoreError>
   readonly markMediaEvicted: (path: string) => Effect.Effect<void, StoreError>
   readonly setTurn: (chatId: ChatId, messageIds: ReadonlyArray<MessageId>, turnId: TurnId) => Effect.Effect<void, StoreError>
+  readonly upsertContacts: (contacts: ReadonlyArray<ContactUpsert>) => Effect.Effect<void, StoreError>
+  readonly upsertChat: (chatId: ChatId, name: string | undefined, isGroup: boolean) => Effect.Effect<void, StoreError>
 
   readonly chats: Effect.Effect<ReadonlyArray<ChatSummary>, StoreError | HistoryDisabled>
+  /** The best name for a chat, when history knows one. */
+  readonly chatName: (chatId: ChatId) => Effect.Effect<Option.Option<string>, StoreError>
   readonly messages: (chatId: ChatId, options: PageOptions) => Effect.Effect<ReadonlyArray<StoredMessage>, StoreError | HistoryDisabled>
-  readonly search: (
-    query: string,
-    options: { readonly chatId?: ChatId | undefined; readonly before?: MessageId | undefined; readonly limit: number },
-  ) => Effect.Effect<ReadonlyArray<SearchHit>, StoreError | HistoryDisabled>
+  readonly search: (query: string, options: SearchOptions) => Effect.Effect<ReadonlyArray<SearchHit>, StoreError | HistoryDisabled>
+  readonly contacts: (query: string | undefined, limit: number) => Effect.Effect<ReadonlyArray<ContactRecord>, StoreError | HistoryDisabled>
+  readonly contactByPhone: (phone: string) => Effect.Effect<Option.Option<ContactRecord>, StoreError>
+  readonly contactByLid: (lid: string) => Effect.Effect<Option.Option<ContactRecord>, StoreError>
   /** The raw protobuf of an inbound message, when history kept it. */
   readonly raw: (chatId: ChatId, messageId: MessageId) => Effect.Effect<Option.Option<Uint8Array>, StoreError>
   /** Delete history rows older than the instant; returns how many. */
@@ -92,60 +115,13 @@ export interface StoreShape {
 
 export class Store extends Context.Service<Store, StoreShape>()("bridge/Store") {}
 
-interface MessageRow {
-  readonly chat_id: string
-  readonly message_id: string
-  readonly direction: string
-  readonly sender_id: string
-  readonly sender_name: string | null
-  readonly is_group: number
-  readonly timestamp: number
-  readonly kind: string
-  readonly text: string | null
-  readonly edited_text: string | null
-  readonly mimetype: string | null
-  readonly media_path: string | null
-  readonly media_evicted_at: number | null
-  readonly quoted_message_id: string | null
-  readonly status: string | null
-  readonly deleted_at: number | null
-  readonly turn_id: string | null
-}
-
-interface ReactionRow {
-  readonly chat_id: string
-  readonly message_id: string
-  readonly sender_id: string
-  readonly emoji: string
-  readonly at: number
-}
-
-/**
- * FTS5 has its own query language and throws on unbalanced quotes. The agent's
- * words become quoted prefix terms (implicit AND); a query wrapped in quotes
- * becomes one phrase.
- */
-export const ftsQuery = (q: string): string => {
-  const trimmed = q.trim()
-  if (trimmed.length === 0) return '""'
-  const escape = (s: string) => s.replace(/"/g, '""')
-  if (trimmed.length > 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) return `"${escape(trimmed.slice(1, -1))}"`
-  return trimmed
-    .split(/\s+/)
-    .map((term) => `"${escape(term)}"*`)
-    .join(" ")
-}
-
-const millis = (d: DateTime.Utc): number => DateTime.toEpochMillis(d)
-const at = (n: number): DateTime.Utc => DateTime.makeUnsafe(n)
-const maybe = <T>(v: T | null | undefined): T | undefined => (v === null || v === undefined ? undefined : v)
-
 export const StoreLive = Layer.effect(
   Store,
   Effect.gen(function* () {
     const config = yield* BridgeConfig
     const sql = yield* SqlClient.SqlClient
     const enabled = config.history
+    const reads = makeHistoryReads(sql)
 
     const storeError = (operation: string) => (cause: unknown) =>
       new StoreError({ operation, detail: cause instanceof Error ? cause.message : String(cause) })
@@ -180,7 +156,7 @@ export const StoreLive = Layer.effect(
           if (row === undefined) return Option.none<SentEntry>()
           return Option.some<SentEntry>({
             chatId: ChatId.make(row.chat_id),
-            sentAt: at(row.sent_at),
+            sentAt: DateTime.makeUnsafe(row.sent_at),
             raw: row.raw,
             turnId: Option.fromNullishOr(row.turn_id).pipe(Option.map(TurnId.make)),
           })
@@ -200,6 +176,10 @@ export const StoreLive = Layer.effect(
             ON CONFLICT (turn_id) DO UPDATE SET state = excluded.state, closed_at = excluded.closed_at, summary = excluded.summary`,
       ).pipe(Effect.asVoid)
 
+    const getState = (key: string) => run("getState", reads.state(key))
+    const setState = (key: string, value: string) =>
+      run("setState", sql`INSERT INTO state (key, value) VALUES (${key}, ${value}) ON CONFLICT (key) DO UPDATE SET value = excluded.value`).pipe(Effect.asVoid)
+
     // ---- history ---------------------------------------------------------
 
     const indexText = (chatId: ChatId, messageId: MessageId, text: string | undefined) =>
@@ -210,19 +190,38 @@ export const StoreLive = Layer.effect(
     const unindex = (chatId: ChatId, messageId: MessageId) =>
       sql`DELETE FROM messages_fts WHERE chat_id = ${chatId} AND message_id = ${messageId}`
 
-    const recordInbound = (m: InboundMessage, raw: Uint8Array) =>
-      whenEnabled(
-        "recordInbound",
-        sql.withTransaction(
-          Effect.gen(function* () {
-            yield* sql`INSERT INTO messages (chat_id, message_id, direction, sender_id, sender_name, is_group, timestamp, kind, text, mimetype, media_path, quoted_message_id, raw)
-              VALUES (${m.chatId}, ${m.messageId}, 'in', ${m.senderId}, ${m.senderName ?? null}, ${m.isGroup ? 1 : 0}, ${millis(m.timestamp)}, ${m.kind},
-                      ${m.text ?? null}, ${m.mimetype ?? null}, ${m.media?.path ?? null}, ${m.quotedMessageId ?? null}, ${raw})
-              ON CONFLICT (chat_id, message_id) DO NOTHING`
-            yield* indexText(m.chatId, m.messageId, m.text)
-          }),
-        ),
-      )
+    /** Inserts one message row; `true` when it was new. `out` rows carry `me` as the sender, whichever line wrote them. */
+    const insertMessage = (m: InboundMessage, raw: Uint8Array | undefined, direction: Direction) =>
+      Effect.gen(function* () {
+        const inserted = yield* sql<{ message_id: string }>`INSERT INTO messages (chat_id, message_id, direction, sender_id, sender_name, is_group, timestamp, kind, text, mimetype, media_path, quoted_message_id, raw)
+          VALUES (${m.chatId}, ${m.messageId}, ${direction}, ${direction === "out" ? "me" : m.senderId}, ${m.senderName ?? null}, ${m.isGroup ? 1 : 0}, ${millis(m.timestamp)}, ${m.kind},
+                  ${m.text ?? null}, ${m.mimetype ?? null}, ${m.media?.path ?? null}, ${m.quotedMessageId ?? null}, ${raw ?? null})
+          ON CONFLICT (chat_id, message_id) DO NOTHING RETURNING message_id`
+        if (inserted.length === 0) return false
+        yield* indexText(m.chatId, m.messageId, m.text)
+        return true
+      })
+
+    const recordMessage = (m: InboundMessage, raw: Uint8Array | undefined, direction: Direction) =>
+      whenEnabled("recordMessage", sql.withTransaction(insertMessage(m, raw, direction)))
+
+    const recordInbound = (m: InboundMessage, raw: Uint8Array) => recordMessage(m, raw, "in")
+
+    const recordBatch = (items: ReadonlyArray<ObservedItem>) =>
+      !enabled || items.length === 0
+        ? Effect.succeed(0)
+        : run(
+            "recordBatch",
+            sql.withTransaction(
+              Effect.gen(function* () {
+                let added = 0
+                for (const item of items) {
+                  if (yield* insertMessage(item.message, item.raw, item.direction)) added += 1
+                }
+                return added
+              }),
+            ),
+          )
 
     const recordOutbound = (r: OutboundRecord) =>
       whenEnabled(
@@ -234,6 +233,22 @@ export const StoreLive = Layer.effect(
                       ${r.text ?? null}, ${r.mimetype ?? null}, ${r.mediaPath ?? null}, ${r.quotedMessageId ?? null}, 'sent', ${r.turnId ?? null}, ${r.raw})
               ON CONFLICT (chat_id, message_id) DO NOTHING`
             yield* indexText(r.chatId, r.messageId, r.text)
+          }),
+        ),
+      )
+
+    const recordCall = (call: CallRecord) =>
+      whenEnabled(
+        "recordCall",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const text = `${call.isVideo ? "video" : "voice"} call: ${call.status}`
+            const messageId = MessageId.make(`call_${call.callId}`)
+            yield* sql`INSERT INTO messages (chat_id, message_id, direction, sender_id, is_group, timestamp, kind, text)
+              VALUES (${call.chatId}, ${messageId}, ${call.direction}, ${call.direction === "out" ? "me" : call.fromId}, ${call.isGroup ? 1 : 0}, ${millis(call.at)}, 'call', ${text})
+              ON CONFLICT (chat_id, message_id) DO UPDATE SET text = excluded.text`
+            yield* unindex(call.chatId, messageId)
+            yield* indexText(call.chatId, messageId, text)
           }),
         ),
       )
@@ -296,128 +311,34 @@ export const StoreLive = Layer.effect(
             sql`UPDATE messages SET turn_id = ${turnId} WHERE chat_id = ${chatId} AND ${sql.in("message_id", messageIds)}`,
           )
 
-    const reactionsFor = (rows: ReadonlyArray<MessageRow>) =>
-      rows.length === 0
-        ? Effect.succeed(new Map<string, Array<{ senderId: string; emoji: string; at: DateTime.Utc }>>())
-        : Effect.map(
-            sql<ReactionRow>`SELECT chat_id, message_id, sender_id, emoji, at FROM reactions
-              WHERE ${sql.in("message_id", rows.map((r) => r.message_id))} ORDER BY at`,
-            (reactions) => {
-              const byMessage = new Map<string, Array<{ senderId: string; emoji: string; at: DateTime.Utc }>>()
-              for (const r of reactions) {
-                const key = `${r.chat_id}|${r.message_id}`
-                const list = byMessage.get(key) ?? []
-                list.push({ senderId: r.sender_id, emoji: r.emoji, at: at(r.at) })
-                byMessage.set(key, list)
-              }
-              return byMessage
-            },
-          )
-
-    const toStored = (row: MessageRow, reactions: ReadonlyArray<{ senderId: string; emoji: string; at: DateTime.Utc }>): StoredMessage => ({
-      chatId: ChatId.make(row.chat_id),
-      messageId: MessageId.make(row.message_id),
-      direction: row.direction === "out" ? "out" : "in",
-      senderId: row.sender_id,
-      ...(row.sender_name === null ? {} : { senderName: row.sender_name }),
-      isGroup: row.is_group === 1,
-      timestamp: at(row.timestamp),
-      kind: row.kind as MessageKind,
-      ...(row.text === null ? {} : { text: row.text }),
-      ...(row.edited_text === null ? {} : { editedText: row.edited_text }),
-      ...(row.mimetype === null ? {} : { mimetype: row.mimetype }),
-      ...(row.media_path === null ? {} : { mediaPath: row.media_path }),
-      ...(row.media_evicted_at === null ? {} : { mediaEvictedAt: at(row.media_evicted_at) }),
-      ...(row.quoted_message_id === null ? {} : { quotedMessageId: MessageId.make(row.quoted_message_id) }),
-      ...(row.status === null ? {} : { status: row.status as DeliveryStatus }),
-      ...(row.deleted_at === null ? {} : { deletedAt: at(row.deleted_at) }),
-      ...(row.turn_id === null ? {} : { turnId: TurnId.make(row.turn_id) }),
-      reactions,
-    })
-
-    const hydrate = (rows: ReadonlyArray<MessageRow>) =>
-      Effect.map(reactionsFor(rows), (byMessage) => rows.map((row) => toStored(row, byMessage.get(`${row.chat_id}|${row.message_id}`) ?? [])))
-
-    const columns = sql.literal(
-      "chat_id, message_id, direction, sender_id, sender_name, is_group, timestamp, kind, text, edited_text, mimetype, media_path, media_evicted_at, quoted_message_id, status, deleted_at, turn_id",
-    )
-
-    /** The timestamp of a message used as a cursor, or `undefined` when it is unknown. */
-    const timestampOf = (chatId: ChatId | undefined, messageId: MessageId) =>
-      Effect.map(
-        chatId === undefined
-          ? sql<{ timestamp: number }>`SELECT timestamp FROM messages WHERE message_id = ${messageId} LIMIT 1`
-          : sql<{ timestamp: number }>`SELECT timestamp FROM messages WHERE chat_id = ${chatId} AND message_id = ${messageId}`,
-        (rows) => maybe(rows[0]?.timestamp),
-      )
-
-    const messages = (chatId: ChatId, options: PageOptions) =>
-      requireEnabled(
-        "messages",
-        Effect.gen(function* () {
-          const limit = Math.max(1, Math.min(options.limit, 500))
-          const before = options.before === undefined ? undefined : yield* timestampOf(chatId, options.before)
-          const since = options.since === undefined ? undefined : millis(options.since)
-          const rows = yield* sql<MessageRow>`SELECT ${columns} FROM messages WHERE chat_id = ${chatId}
-            ${before === undefined ? sql.literal("") : sql`AND timestamp < ${before}`}
-            ${since === undefined ? sql.literal("") : sql`AND timestamp > ${since}`}
-            ORDER BY timestamp DESC, message_id DESC LIMIT ${limit}`
-          return yield* hydrate(rows)
-        }),
-      )
-
-    const search = (query: string, options: { readonly chatId?: ChatId | undefined; readonly before?: MessageId | undefined; readonly limit: number }) =>
-      requireEnabled(
-        "search",
-        Effect.gen(function* () {
-          const limit = Math.max(1, Math.min(options.limit, 500))
-          const before = options.before === undefined ? undefined : yield* timestampOf(options.chatId, options.before)
-          const rows = yield* sql<MessageRow & { snippet: string }>`
-            SELECT m.chat_id, m.message_id, m.direction, m.sender_id, m.sender_name, m.is_group, m.timestamp, m.kind, m.text, m.edited_text,
-                   m.mimetype, m.media_path, m.media_evicted_at, m.quoted_message_id, m.status, m.deleted_at, m.turn_id,
-                   snippet(messages_fts, 0, '[', ']', '…', 12) AS snippet
-            FROM messages_fts
-            JOIN messages m ON m.chat_id = messages_fts.chat_id AND m.message_id = messages_fts.message_id
-            WHERE messages_fts MATCH ${ftsQuery(query)}
-            ${options.chatId === undefined ? sql.literal("") : sql`AND m.chat_id = ${options.chatId}`}
-            ${before === undefined ? sql.literal("") : sql`AND m.timestamp < ${before}`}
-            ORDER BY m.timestamp DESC LIMIT ${limit}`
-          const stored = yield* hydrate(rows)
-          return stored.map((s, i): SearchHit => ({ ...s, snippet: rows[i]?.snippet ?? "" }))
-        }),
-      )
-
-    const chats = requireEnabled(
-      "chats",
-      Effect.map(
-        sql<{ chat_id: string; is_group: number; last_message_at: number; message_count: number; name: string | null }>`
-          SELECT m.chat_id, MAX(m.is_group) AS is_group, MAX(m.timestamp) AS last_message_at, COUNT(*) AS message_count,
-                 (SELECT sender_name FROM messages n WHERE n.chat_id = m.chat_id AND n.direction = 'in' AND n.sender_name IS NOT NULL
-                  ORDER BY n.timestamp DESC LIMIT 1) AS name
-          FROM messages m GROUP BY m.chat_id ORDER BY last_message_at DESC`,
-        (rows) =>
-          rows.map(
-            (row): ChatSummary => ({
-              chatId: ChatId.make(row.chat_id),
-              ...(row.name === null ? {} : { name: row.name }),
-              isGroup: row.is_group === 1,
-              lastMessageAt: at(row.last_message_at),
-              messageCount: row.message_count,
-            }),
-          ),
-      ),
-    )
-
-    const raw = (chatId: ChatId, messageId: MessageId) =>
-      enabled
-        ? run(
-            "raw",
-            Effect.map(
-              sql<{ raw: Uint8Array | null }>`SELECT raw FROM messages WHERE chat_id = ${chatId} AND message_id = ${messageId}`,
-              (rows) => Option.fromNullishOr(rows[0]?.raw),
+    const upsertContacts = (contacts: ReadonlyArray<ContactUpsert>) =>
+      contacts.length === 0
+        ? Effect.void
+        : whenEnabled(
+            "upsertContacts",
+            sql.withTransaction(
+              Effect.forEach(
+                contacts,
+                (c) =>
+                  sql`INSERT INTO contacts (jid, lid, phone, name, push_name, updated_at)
+                      VALUES (${c.jid}, ${c.lid ?? null}, ${c.phone ?? null}, ${c.name ?? null}, ${c.pushName ?? null}, ${Date.now()})
+                      ON CONFLICT (jid) DO UPDATE SET
+                        lid = COALESCE(excluded.lid, contacts.lid),
+                        phone = COALESCE(excluded.phone, contacts.phone),
+                        name = COALESCE(excluded.name, contacts.name),
+                        push_name = COALESCE(excluded.push_name, contacts.push_name),
+                        updated_at = excluded.updated_at`,
+                { discard: true },
+              ),
             ),
           )
-        : Effect.succeed(Option.none<Uint8Array>())
+
+    const upsertChat = (chatId: ChatId, name: string | undefined, isGroup: boolean) =>
+      whenEnabled(
+        "upsertChat",
+        sql`INSERT INTO chats (chat_id, name, is_group, updated_at) VALUES (${chatId}, ${name ?? null}, ${isGroup ? 1 : 0}, ${Date.now()})
+            ON CONFLICT (chat_id) DO UPDATE SET name = COALESCE(excluded.name, chats.name), is_group = excluded.is_group, updated_at = excluded.updated_at`,
+      )
 
     const purgeBefore = (before: DateTime.Utc) =>
       requireEnabled(
@@ -444,8 +365,13 @@ export const StoreLive = Layer.effect(
       sent,
       forgetSent,
       recordTurn,
+      getState,
+      setState,
       recordInbound,
+      recordMessage,
+      recordBatch,
       recordOutbound,
+      recordCall,
       markEdited,
       markDeleted,
       recordReaction,
@@ -453,10 +379,16 @@ export const StoreLive = Layer.effect(
       attachMedia,
       markMediaEvicted,
       setTurn,
-      chats,
-      messages,
-      search,
-      raw,
+      upsertContacts,
+      upsertChat,
+      chats: requireEnabled("chats", reads.chats),
+      chatName: (chatId) => (enabled ? run("chatName", reads.chatName(chatId)) : Effect.succeed(Option.none<string>())),
+      messages: (chatId, options) => requireEnabled("messages", reads.messages(chatId, options)),
+      search: (query, options) => requireEnabled("search", reads.search(query, options)),
+      contacts: (query, limit) => requireEnabled("contacts", reads.contacts(query, limit)),
+      contactByPhone: (phone) => (enabled ? run("contactByPhone", reads.contactByPhone(phone)) : Effect.succeed(Option.none<ContactRecord>())),
+      contactByLid: (lid) => (enabled ? run("contactByLid", reads.contactByLid(lid)) : Effect.succeed(Option.none<ContactRecord>())),
+      raw: (chatId, messageId) => (enabled ? run("raw", reads.raw(chatId, messageId)) : Effect.succeed(Option.none<Uint8Array>())),
       purgeBefore,
     })
   }),

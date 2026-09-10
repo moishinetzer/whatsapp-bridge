@@ -8,13 +8,13 @@ import { BridgeStatus } from "../domain/status.ts"
 import { MediaStoreError } from "../engine/Media.ts"
 import { OutboundFileUnreadable, OutboundInvalid, OutboundTooLarge } from "../engine/Outbound.ts"
 import { OutboundMediaPayload, ReplyItem, exactlyOneSource } from "../domain/outbound.ts"
-import { ChatSummary, HistoryRow } from "../domain/history.ts"
+import { ChatSummary, ContactRecord, HistoryRow } from "../domain/history.ts"
 import { HistoryDisabled, StoreError } from "../store/Store.ts"
 import { ScheduledNotFound, ScheduledSend } from "../store/Scheduled.ts"
 import { TurnFailedError, TurnNotAwaitingReply, TurnNotFound, TurnNotOpen, TurnSummary, TurnSuperseded } from "../engine/Turns.ts"
+import { ChatInfo, ContextNotAllowed, ObserverUnavailable, TurnAccessKind } from "../engine/Context.ts"
 import {
   ContactInfo,
-  GroupInfo,
   LookupFailed,
   PresenceInfo,
   MediaDownloadFailed,
@@ -22,6 +22,7 @@ import {
   MediaUnavailable,
   MessageTooOld,
   MessageUnknown,
+  NotAllowlisted,
   NotConnected,
   SendFailed,
 } from "../whatsapp/WhatsApp.ts"
@@ -100,14 +101,20 @@ export const SearchQuery = Schema.Struct({
   limit: Schema.optionalKey(Schema.NumberFromString.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1)))),
 })
 
-/** `GET /chats/{chatId}`: what the bridge knows about one chat. */
-export const ChatInfo = Schema.Struct({
+export { ChatInfo }
+
+/** `GET /turns/{turnId}/context`: what this turn may read. */
+export const ContextSummary = Schema.Struct({
+  turnId: TurnId,
   chatId: ChatId,
-  isGroup: Schema.Boolean,
-  name: Schema.optionalKey(Schema.String),
-  lastMessageAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
-  messageCount: Schema.optionalKey(Schema.Number),
-  group: Schema.optionalKey(GroupInfo),
+  access: TurnAccessKind,
+  /** Whether a primary number is configured at all (`BRIDGE_OWNER`); the observer may still be down. */
+  primary: Schema.Boolean,
+})
+export const ContactsQuery = Schema.Struct({
+  /** Matches saved names, push names, phone digits and jids. Empty lists everyone with a name. */
+  q: Schema.optionalKey(Schema.String),
+  limit: Schema.optionalKey(Schema.NumberFromString.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1)))),
 })
 export const EditPayload = Schema.Struct({ text: Schema.String.pipe(Schema.check(Schema.isNonEmpty())) })
 export const SentMessage = Schema.Struct({ chatId: ChatId, messageId: MessageId })
@@ -175,38 +182,38 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
     params: chatParams,
     payload: SendTextPayload,
     success: SendOutcome,
-    error: [NotConnected, SendFailed, MessageUnknown, StoreError],
+    error: [NotConnected, SendFailed, MessageUnknown, StoreError, NotAllowlisted, LookupFailed],
   }),
   HttpApiEndpoint.post("sendLocation", "/chats/:chatId/location", {
     params: chatParams,
     payload: LocationPayload,
     success: SentMessage,
-    error: [NotConnected, SendFailed, MessageUnknown],
+    error: [NotConnected, SendFailed, MessageUnknown, NotAllowlisted, LookupFailed],
   }),
   HttpApiEndpoint.post("sendContacts", "/chats/:chatId/contacts", {
     params: chatParams,
     payload: ContactsPayload,
     success: SentMessage,
-    error: [NotConnected, SendFailed, MessageUnknown],
+    error: [NotConnected, SendFailed, MessageUnknown, NotAllowlisted, LookupFailed],
   }),
   HttpApiEndpoint.post("sendPoll", "/chats/:chatId/polls", {
     params: chatParams,
     payload: PollPayload,
     success: SentMessage,
-    error: [NotConnected, SendFailed, MessageUnknown],
+    error: [NotConnected, SendFailed, MessageUnknown, NotAllowlisted, LookupFailed],
   }),
   HttpApiEndpoint.post("sendAlbum", "/chats/:chatId/album", {
     params: chatParams,
     payload: AlbumPayload,
     success: SentAlbum,
-    error: [NotConnected, SendFailed, MessageUnknown, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge],
+    error: [NotConnected, SendFailed, MessageUnknown, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge, NotAllowlisted, LookupFailed],
   }),
   HttpApiEndpoint.get("presence", "/chats/:chatId/presence", { params: chatParams, success: PresenceInfo, error: NotConnected }),
   HttpApiEndpoint.post("forward", "/chats/:chatId/forward", {
     params: chatParams,
     payload: ForwardPayload,
     success: SentMessage,
-    error: [NotConnected, SendFailed, MessageUnknown],
+    error: [NotConnected, SendFailed, MessageUnknown, NotAllowlisted, LookupFailed],
   }),
   HttpApiEndpoint.patch("edit", "/chats/:chatId/messages/:messageId", {
     params: messageParams,
@@ -221,7 +228,7 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
     params: chatParams,
     payload: SendMediaPayload,
     success: SendOutcome,
-    error: [NotConnected, SendFailed, MessageUnknown, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge, StoreError],
+    error: [NotConnected, SendFailed, MessageUnknown, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge, StoreError, NotAllowlisted, LookupFailed],
   }),
   HttpApiEndpoint.post("react", "/chats/:chatId/messages/:messageId/reactions", {
     params: messageParams,
@@ -249,17 +256,62 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
   }),
 )
 
-export const HistoryGroup = HttpApiGroup.make("history").add(
-  HttpApiEndpoint.get("chats", "/chats", { success: Schema.Array(ChatSummary), error: [HistoryDisabled, StoreError] }),
-  HttpApiEndpoint.get("chat", "/chats/:chatId", { params: chatParams, success: ChatInfo, error: [StoreError, NotConnected, LookupFailed] }),
-  HttpApiEndpoint.get("chatMessages", "/chats/:chatId/messages", {
-    params: chatParams,
+/** Live lookups, not stored context: nothing here reads the history. */
+export const ContactsGroup = HttpApiGroup.make("contacts").add(
+  HttpApiEndpoint.get("contact", "/contacts/:jid", { params: { jid: Schema.String }, success: ContactInfo, error: [NotConnected, LookupFailed] }),
+)
+
+const contextChatParams = { turnId: TurnId, chatId: ChatId }
+const contextMessageParams = { turnId: TurnId, chatId: ChatId, messageId: MessageId }
+const gate = [TurnNotFound, TurnNotOpen, ContextNotAllowed] as const
+const lineErrors = [...gate, HistoryDisabled, StoreError] as const
+const primaryErrors = [...gate, ObserverUnavailable] as const
+
+/**
+ * Stored context, readable only through an open turn. `line` is the personal
+ * line's history; `primary` is the observer's. A turn in the owner's DM may
+ * read everything; any other turn only its own chat on the line.
+ */
+export const ContextGroup = HttpApiGroup.make("context").add(
+  HttpApiEndpoint.get("summary", "/turns/:turnId/context", { params: turnParams, success: ContextSummary, error: [TurnNotFound, TurnNotOpen] }),
+  HttpApiEndpoint.get("lineChats", "/turns/:turnId/context/line/chats", { params: turnParams, success: Schema.Array(ChatSummary), error: lineErrors }),
+  HttpApiEndpoint.get("lineChat", "/turns/:turnId/context/line/chats/:chatId", {
+    params: contextChatParams,
+    success: ChatInfo,
+    error: [...gate, StoreError, NotConnected, LookupFailed],
+  }),
+  HttpApiEndpoint.get("lineMessages", "/turns/:turnId/context/line/chats/:chatId/messages", {
+    params: contextChatParams,
     query: HistoryQuery,
     success: Schema.Array(HistoryRow),
-    error: [HistoryDisabled, StoreError],
+    error: lineErrors,
   }),
-  HttpApiEndpoint.get("search", "/messages", { query: SearchQuery, success: Schema.Array(HistoryRow), error: [HistoryDisabled, StoreError] }),
-  HttpApiEndpoint.get("contact", "/contacts/:jid", { params: { jid: Schema.String }, success: ContactInfo, error: [NotConnected, LookupFailed] }),
+  HttpApiEndpoint.get("lineSearch", "/turns/:turnId/context/line/messages", { params: turnParams, query: SearchQuery, success: Schema.Array(HistoryRow), error: lineErrors }),
+  HttpApiEndpoint.get("primaryChats", "/turns/:turnId/context/primary/chats", { params: turnParams, success: Schema.Array(ChatSummary), error: primaryErrors }),
+  HttpApiEndpoint.get("primaryChat", "/turns/:turnId/context/primary/chats/:chatId", { params: contextChatParams, success: ChatInfo, error: primaryErrors }),
+  HttpApiEndpoint.get("primaryMessages", "/turns/:turnId/context/primary/chats/:chatId/messages", {
+    params: contextChatParams,
+    query: HistoryQuery,
+    success: Schema.Array(HistoryRow),
+    error: primaryErrors,
+  }),
+  HttpApiEndpoint.get("primarySearch", "/turns/:turnId/context/primary/messages", {
+    params: turnParams,
+    query: SearchQuery,
+    success: Schema.Array(HistoryRow),
+    error: primaryErrors,
+  }),
+  HttpApiEndpoint.get("primaryContacts", "/turns/:turnId/context/primary/contacts", {
+    params: turnParams,
+    query: ContactsQuery,
+    success: Schema.Array(ContactRecord),
+    error: primaryErrors,
+  }),
+  HttpApiEndpoint.get("primaryMedia", "/turns/:turnId/context/primary/chats/:chatId/messages/:messageId/media", {
+    params: contextMessageParams,
+    success: MediaFile,
+    error: [...primaryErrors, MediaUnavailable, MediaTooLarge, MediaDownloadFailed, MediaStoreError],
+  }),
 )
 
 export const ScheduledGroup = HttpApiGroup.make("scheduled").add(
@@ -295,11 +347,11 @@ export const TurnsGroup = HttpApiGroup.make("turns").add(
  * `/docs` are generated from the same definition.
  */
 export const BridgeApi = HttpApi.make("whatsapp-bridge")
-  .add(HealthGroup, EventsGroup, ChatsGroup, HistoryGroup, ScheduledGroup, TurnsGroup)
+  .add(HealthGroup, EventsGroup, ChatsGroup, ContactsGroup, ContextGroup, ScheduledGroup, TurnsGroup)
   .annotateMerge(
     OpenApi.annotations({
       title: "whatsapp-bridge",
       version: VERSION,
-      description: "Local API of the WhatsApp ↔ Intro bridge. Events stream over SSE from /events; replies go to /turns/{id}/reply.",
+      description: "Local API of the WhatsApp ↔ Intro bridge. Events stream over SSE from /events; replies go to /turns/{id}/reply; stored context is read through /turns/{id}/context.",
     }),
   )

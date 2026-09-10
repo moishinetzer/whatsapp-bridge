@@ -1,17 +1,18 @@
 import { NodeServices } from "@effect/platform-node"
-import { Console, Context, DateTime, Duration, Effect, FileSystem, Layer, Option, Path, Schema, Stream } from "effect"
+import { Console, Context, DateTime, Duration, Effect, FileSystem, Layer, Option, Path, References, Schema, Stream } from "effect"
 import { Command, Flag, Prompt } from "effect/unstable/cli"
 import { HttpClientError } from "effect/unstable/http"
-import { AmbientLive, EnvLive, acceptanceFile, coreLayer, daemonLayer, linkLayer } from "./app.ts"
-import { BridgeConfig, BridgeConfigLive, bridgeUrl } from "./config.ts"
+import { AmbientLive, EnvLive, acceptanceFile, coreLayer, daemonLayer, linkLayer, observerAcceptanceFile, observerLayer, observerLinkLayer } from "./app.ts"
+import { BridgeConfig, BridgeConfigLive, bridgeUrl, forObserver, observerUrl } from "./config.ts"
 import { MessageId, TurnId, toChatId } from "./domain/ids.ts"
 import { Store, StoreWithDatabaseLive } from "./store/Store.ts"
 import { OutboundKind, type OutboundMediaPayload } from "./domain/outbound.ts"
 import { Events } from "./engine/Events.ts"
-import { bridgeClient } from "./http/Client.ts"
+import { bridgeClient, observerClient } from "./http/Client.ts"
 import { VERSION } from "./version.ts"
 import { AuthStore } from "./whatsapp/AuthStore.ts"
 import { WhatsApp } from "./whatsapp/WhatsApp.ts"
+import { Observer } from "./whatsapp/Observer.ts"
 
 class DaemonUnreachable extends Schema.TaggedError<DaemonUnreachable>()("DaemonUnreachable", {
   url: Schema.String,
@@ -217,7 +218,7 @@ const forward = Command.make(
 const contact = Command.make(
   "contact",
   { jid: Flag.string("jid").pipe(Flag.withDescription("A jid or a phone number with country code")) },
-  ({ jid }) => withClient((client) => client.history.contact({ params: { jid: jid.includes("@") ? jid : toChatId(jid) } })).pipe(Effect.flatMap(json)),
+  ({ jid }) => withClient((client) => client.contacts.contact({ params: { jid: jid.includes("@") ? jid : toChatId(jid) } })).pipe(Effect.flatMap(json)),
 ).pipe(Command.withDescription("Look a contact up: push name, phone, picture URL, whether the number is on WhatsApp"))
 
 const presence = Command.make("presence", { chat: Flag.string("chat") }, ({ chat }) =>
@@ -256,9 +257,25 @@ const location = Command.make(
     ).pipe(Effect.flatMap(json)),
 ).pipe(Command.withDescription("Send a location pin"))
 
-const chats = Command.make("chats", {}, () => withClient((client) => client.history.chats()).pipe(Effect.flatMap(json))).pipe(
-  Command.withDescription("List the chats in the history (needs BRIDGE_HISTORY)"),
-)
+/**
+ * The history commands read the database file directly: the API only serves
+ * stored context through an open turn. `--observer` reads the observer's file.
+ */
+const observerFlag = Flag.boolean("observer").pipe(Flag.withDescription("Read the observer's database (the primary number) instead of the personal line's"))
+
+const directStore = (observer: boolean) =>
+  StoreWithDatabaseLive.pipe(
+    Layer.provideMerge(
+      Layer.mergeAll(BridgeConfigLive(observer ? forObserver : { history: true }).pipe(Layer.provide(EnvLive)), NodeServices.layer),
+    ),
+  )
+
+/** The read commands print JSON on stdout; the store's own Info lines would land in it. */
+const quiet = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.provideService(References.MinimumLogLevel, "Warn"))
+
+const chats = Command.make("chats", { observer: observerFlag }, ({ observer }) =>
+  Store.use((s) => s.chats).pipe(Effect.flatMap(json), Effect.provide(directStore(observer)), quiet),
+).pipe(Command.withDescription("List the chats in the history, straight from the database file (needs BRIDGE_HISTORY, or --observer)"))
 
 const messages = Command.make(
   "messages",
@@ -267,21 +284,24 @@ const messages = Command.make(
     q: Flag.string("q").pipe(Flag.optional, Flag.withDescription("Full-text search within the chat")),
     before: Flag.string("before").pipe(Flag.optional, Flag.withDescription("Page back from this message id")),
     limit: Flag.integer("limit").pipe(Flag.withDefault(50)),
+    observer: observerFlag,
   },
-  ({ chat, q, before, limit }) =>
-    withClient((client) =>
-      client.history.chatMessages({
-        params: { chatId: toChatId(chat) },
-        query: { limit, ...(Option.isSome(q) ? { q: q.value } : {}), ...(Option.isSome(before) ? { before: MessageId.make(before.value) } : {}) },
-      }),
-    ).pipe(Effect.flatMap(json)),
-).pipe(Command.withDescription("Show a chat's history, newest first (needs BRIDGE_HISTORY)"))
+  ({ chat, q, before, limit, observer }) =>
+    Effect.gen(function* () {
+      const store = yield* Store
+      const chatId = toChatId(chat)
+      const cursor = Option.isSome(before) ? MessageId.make(before.value) : undefined
+      return Option.isSome(q)
+        ? yield* store.search(q.value, { chatId, before: cursor, limit })
+        : yield* store.messages(chatId, { before: cursor, limit })
+    }).pipe(Effect.flatMap(json), Effect.provide(directStore(observer)), quiet),
+).pipe(Command.withDescription("Show a chat's history, newest first, straight from the database file"))
 
 const search = Command.make(
   "search",
-  { q: Flag.string("q"), limit: Flag.integer("limit").pipe(Flag.withDefault(50)) },
-  ({ q, limit }) => withClient((client) => client.history.search({ query: { q, limit } })).pipe(Effect.flatMap(json)),
-).pipe(Command.withDescription("Full-text search across every chat (needs BRIDGE_HISTORY)"))
+  { q: Flag.string("q"), limit: Flag.integer("limit").pipe(Flag.withDefault(50)), observer: observerFlag },
+  ({ q, limit, observer }) => Store.use((s) => s.search(q, { limit })).pipe(Effect.flatMap(json), Effect.provide(directStore(observer)), quiet),
+).pipe(Command.withDescription("Full-text search across every chat, straight from the database file"))
 
 const scheduled = Command.make("scheduled", {}, () => withClient((client) => client.scheduled.list()).pipe(Effect.flatMap(json))).pipe(
   Command.withDescription("List scheduled sends: pending ones and those closed in the last day"),
@@ -453,6 +473,102 @@ const reply = Command.make(
     }).pipe(Effect.flatMap(json)),
 ).pipe(Command.withDescription("Answer an open turn (manual responder mode) with text, a file, or both"))
 
+// ---------------------------------------------------------------------------
+// The observer: a read-only linked device on the primary number.
+// ---------------------------------------------------------------------------
+
+const OBSERVER_ACCEPTANCE = `The observer links to YOUR OWN WhatsApp number as a read-only device, like WhatsApp Web,
+and records every message it sees: every DM and group, both directions, other people's
+messages included, plus reactions, edits, deletions (as tombstones), calls, the address book,
+and attachments per BRIDGE_MEDIA_AUTO. It never sends, never marks anything read, never goes online.
+Rows are kept for BRIDGE_OBSERVE_RETENTION (180 days) in plain text in the observer's SQLite file.
+The agent reads this history only while answering a DM from you on the personal line, and what it
+reads is sent to the model provider as part of its prompt. The device shows in your phone's
+Linked devices as "Intro Observer"; remove it there at any time.`
+
+const observeEnable = Command.make(
+  "enable",
+  { yes: Flag.boolean("yes").pipe(Flag.withDescription("Accept without the prompt (for scripts)")) },
+  ({ yes }) =>
+    Effect.gen(function* () {
+      const config = yield* BridgeConfig
+      const fs = yield* FileSystem.FileSystem
+      const path = yield* Path.Path
+      const file = path.resolve(observerAcceptanceFile(config.observerDir))
+      yield* Console.log(OBSERVER_ACCEPTANCE)
+      const accepted = yes ? true : yield* Prompt.run(Prompt.confirm({ message: "Record your primary number's messages on this machine?", initial: false }))
+      if (!accepted) return yield* Console.log("Not enabled. Nothing was written.")
+      yield* fs.makeDirectory(path.dirname(file), { recursive: true, mode: 0o700 }).pipe(Effect.ignore)
+      yield* fs.writeFileString(file, `${DateTime.formatIso(yield* DateTime.now)}\n`, { mode: 0o600 })
+      yield* Console.log(`Accepted: ${file}`)
+      yield* Console.log("Next: `bridge observe link` with your own phone, then `bridge observe run`.")
+    }).pipe(Effect.provide(Layer.mergeAll(BridgeConfigLive().pipe(Layer.provide(EnvLive)), NodeServices.layer))),
+).pipe(Command.withDescription("Accept, once, that the observer records your primary number; required before it runs"))
+
+const observeLink = Command.make(
+  "link",
+  {
+    phone: Flag.string("phone").pipe(Flag.optional, Flag.withDescription("Link with a pairing code for your number (digits, with country code) instead of a QR")),
+    timeout: Flag.string("timeout").pipe(
+      Flag.withSchema(Schema.DurationFromString),
+      Flag.withDefault(Duration.minutes(5)),
+      Flag.withDescription("Give up if the phone has not linked within this long"),
+    ),
+  },
+  ({ phone, timeout }) =>
+    Effect.gen(function* () {
+      const observer = yield* Observer
+      yield* Console.log("Linking the observer to YOUR number. Keep this terminal open until it says linked.")
+      const identity = yield* observer.linked.pipe(
+        Effect.timeout(timeout),
+        Effect.catchTag("TimeoutError", () => new LinkTimedOut({ after: Duration.format(timeout), hint: "the phone never completed the link; run `bridge observe link` again" })),
+      )
+      yield* Effect.sleep("2 seconds")
+      yield* Console.log(`\nObserver linked as ${identity.jid}${identity.name ? ` (${identity.name})` : ""}.`)
+      yield* Console.log("The session is saved. Start the observer with: npm run bridge -- observe run")
+    }).pipe(Effect.provide(observerLinkLayer(Option.getOrUndefined(phone)))),
+).pipe(Command.withDescription("Link the observer to your own number (QR by default, or a pairing code with --phone)"))
+
+const observeRun = Command.make("run", {}, () =>
+  Effect.gen(function* () {
+    yield* Effect.logInfo("whatsapp-bridge observer starting").pipe(Effect.annotateLogs({ version: VERSION }))
+    yield* Effect.never
+  }).pipe(Effect.provide(observerLayer())),
+).pipe(Command.withDescription("Run the observer daemon: read-only on the primary number, its own database and port"))
+
+const observeHealth = Command.make("health", {}, () =>
+  Effect.gen(function* () {
+    const url = yield* observerUrl
+    const client = yield* observerClient
+    return yield* client.health.status().pipe(Effect.mapError((e) => (HttpClientError.isHttpClientError(e) ? new DaemonUnreachable({ url, detail: e.message }) : e)))
+  }).pipe(
+    Effect.provide(EnvLive),
+    Effect.tap((status) => json(status)),
+    Effect.flatMap((status) => exitCode(status.state === "ok" ? 0 : 1)),
+    Effect.catchTag("DaemonUnreachable", (e) => json({ state: "stopped", detail: `observer not reachable at ${e.url}: ${e.detail}` }).pipe(Effect.andThen(exitCode(1)))),
+  ),
+).pipe(Command.withDescription("Print the observer's status as JSON; exit code 0 only when the state is ok"))
+
+const observePurge = Command.make(
+  "purge",
+  {
+    before: Flag.string("before").pipe(Flag.withSchema(Schema.DateTimeUtcFromString), Flag.withDescription("Delete observed history older than this instant (ISO-8601)")),
+    yes: Flag.boolean("yes").pipe(Flag.withDescription("Really delete")),
+  },
+  ({ before, yes }) =>
+    Effect.gen(function* () {
+      if (!yes) return yield* new ConfirmationRequired({ hint: "pass --yes to delete observed history" })
+      const store = yield* Store
+      const removed = yield* store.purgeBefore(before)
+      yield* Console.log(`Removed ${removed} message(s) older than ${DateTime.formatIso(before)} from the observer.`)
+    }).pipe(Effect.provide(StoreWithDatabaseLive.pipe(Layer.provideMerge(Layer.mergeAll(BridgeConfigLive(forObserver).pipe(Layer.provide(EnvLive)), NodeServices.layer))))),
+).pipe(Command.withDescription("Delete observed history older than a date (the observer may keep running)"))
+
+const observe = Command.make("observe").pipe(
+  Command.withDescription("The observer: a read-only linked device on your own number whose history the agent reads in your DM"),
+  Command.withSubcommands([observeEnable, observeLink, observeRun, observeHealth, observePurge]),
+)
+
 const unlink = Command.make(
   "unlink",
   { yes: Flag.boolean("yes").pipe(Flag.withDescription("Really delete the saved session")) },
@@ -467,7 +583,7 @@ const unlink = Command.make(
 
 const bridge = Command.make("bridge").pipe(
   Command.withDescription("WhatsApp ↔ Intro bridge on a dedicated number"),
-  Command.withSubcommands([link, run, harness, health, send, forward, poll, location, edit, del, react, unreact, media, contact, presence, chats, messages, search, scheduled, unschedule, turns, reply, progress, abandon, history, unlink]),
+  Command.withSubcommands([link, run, harness, health, send, forward, poll, location, edit, del, react, unreact, media, contact, presence, chats, messages, search, scheduled, unschedule, turns, reply, progress, abandon, history, observe, unlink]),
 )
 
 /** The whole CLI, needing only the Node platform services. */

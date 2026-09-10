@@ -16,6 +16,8 @@ export interface Extracted {
   readonly message: InboundMessage
   /** The full key WhatsApp needs to address a reaction at this message. */
   readonly key: WAMessageKey
+  /** True when the account itself sent it (only ever set with `keepOwn`). */
+  readonly fromMe: boolean
 }
 
 export const kindOf = (contentType: string | undefined): MessageKind | undefined => {
@@ -119,12 +121,13 @@ const contactsOf = (content: proto.IMessage): ReadonlyArray<SharedContact> | und
  * status/broadcast/newsletter traffic, protocol bookkeeping, and messages
  * without content.
  */
-export const extractInbound = (msg: WAMessage, now: DateTime.Utc): Option.Option<Extracted> => {
+export const extractInbound = (msg: WAMessage, now: DateTime.Utc, options: { readonly keepOwn?: boolean } = {}): Option.Option<Extracted> => {
   const key = msg.key
   const remoteJid = key.remoteJid ?? undefined
   const id = key.id ?? undefined
   if (!remoteJid || !id) return Option.none()
-  if (key.fromMe) return Option.none()
+  const fromMe = key.fromMe === true
+  if (fromMe && options.keepOwn !== true) return Option.none()
   if (isJidBroadcast(remoteJid) || isJidNewsletter(remoteJid) || remoteJid === "status@broadcast") return Option.none()
 
   const content = normalizeMessageContent(msg.message)
@@ -178,5 +181,5 @@ export const extractInbound = (msg: WAMessage, now: DateTime.Utc): Option.Option
     ...(contacts === undefined ? {} : { contacts }),
   })
 
-  return Option.some({ message, key })
+  return Option.some({ message, key, fromMe })
 }

@@ -123,6 +123,29 @@ const migrations = {
       SELECT chat_id, MAX(is_group) AS is_group, datetime(MAX(timestamp) / 1000, 'unixepoch') AS last_message_at, COUNT(*) AS message_count
       FROM messages GROUP BY chat_id`,
   ),
+  "0003_observer": statements(
+    // The address book: synced from the phone by the observer, learned from traffic by the personal line.
+    `CREATE TABLE contacts (
+      jid TEXT PRIMARY KEY,
+      lid TEXT,
+      phone TEXT,
+      name TEXT,
+      push_name TEXT,
+      updated_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX contacts_phone ON contacts (phone)`,
+    `CREATE INDEX contacts_lid ON contacts (lid)`,
+    // Chat names as WhatsApp reports them (group subjects, saved names on DMs).
+    `CREATE TABLE chats (
+      chat_id TEXT PRIMARY KEY,
+      name TEXT,
+      is_group INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`,
+    // Small facts a daemon wants back after a restart: who the account is, backfill progress.
+    `CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+    `CREATE VIEW contacts_v AS SELECT jid, lid, phone, name, push_name, datetime(updated_at / 1000, 'unixepoch') AS updated_at FROM contacts`,
+  ),
 }
 
 export const MigrationsLive = SqliteMigrator.layer({ loader: Migrator.fromRecord(migrations) })

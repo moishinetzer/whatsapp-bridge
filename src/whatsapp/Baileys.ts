@@ -3,11 +3,9 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
   decryptPollVote,
-  downloadMediaMessage,
   getAggregateVotesInPollMessage,
   getKeyAuthor,
   jidNormalizedUser,
-  extensionForMediaMessage,
   fetchLatestBaileysVersion,
   generateMessageIDV2,
   getContentType,
@@ -26,10 +24,6 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys"
 import { Cache, Cause, DateTime, Deferred, Duration, Effect, FiberSet, Layer, Option, Queue, Ref, Schedule, Schema, Stream } from "effect"
 
-/** protobuf's 64-bit numbers arrive as `Long` objects; only `toNumber` is needed here. */
-interface LongLike {
-  toNumber(): number
-}
 import qrcode from "qrcode-terminal"
 import { BridgeConfig } from "../config.ts"
 import { ChatId, MessageId, phoneOfJid, type TurnId } from "../domain/ids.ts"
@@ -40,11 +34,11 @@ import { Events } from "../engine/Events.ts"
 import { Health } from "../engine/Health.ts"
 import { AuthStore } from "./AuthStore.ts"
 import { isBaileysLogLevel, makeBaileysLogger } from "./BaileysLogger.ts"
+import { chatAllowed, messageAllowed, type AccessRule } from "./access.ts"
+import { downloadFromRaw, toNumber } from "./download.ts"
 import { extractInbound, kindOf, textOf, type Extracted } from "./extract.ts"
 import { Store, type SentEntry } from "../store/Store.ts"
 import {
-  MediaDownloadFailed,
-  MediaTooLarge,
   MediaUnavailable,
   LookupFailed,
   MessageTooOld,
@@ -54,7 +48,6 @@ import {
   WhatsApp,
   type ContactInfo,
   type ContactInput,
-  type DownloadedMedia,
   type GroupInfo,
   type InboundUpdate,
   type LocationInput,
@@ -85,8 +78,8 @@ type SocketEvent =
   | { readonly _tag: "Receipts"; readonly receipts: ReadonlyArray<{ readonly key: WAMessageKey; readonly receipt: proto.IUserReceipt }> }
   | { readonly _tag: "Presences"; readonly id: string; readonly presences: Record<string, { lastKnownPresence: string; lastSeen?: number | undefined }> }
 
-const encodeRaw = (raw: WAMessage): Uint8Array => proto.WebMessageInfo.encode(raw).finish()
-const decodeRaw = (bytes: Uint8Array): WAMessage => proto.WebMessageInfo.decode(bytes) as unknown as WAMessage
+export const encodeRaw = (raw: WAMessage): Uint8Array => proto.WebMessageInfo.encode(raw).finish()
+export const decodeRaw = (bytes: Uint8Array): WAMessage => proto.WebMessageInfo.decode(bytes) as unknown as WAMessage
 
 /** WhatsApp's own limits on touching a sent message. */
 const EDIT_WINDOW = Duration.minutes(15)
@@ -98,7 +91,7 @@ export type CloseOutcome =
   | { readonly _tag: "Linked" }
 
 /** Typed failure that drives the reconnect schedule: the socket closed soon after opening. */
-class ReconnectNeeded extends Schema.TaggedError<ReconnectNeeded>()("ReconnectNeeded", {
+export class ReconnectNeeded extends Schema.TaggedError<ReconnectNeeded>()("ReconnectNeeded", {
   detail: Schema.String,
   uptimeMs: Schema.Number,
 }) {
@@ -129,7 +122,7 @@ const statusCodeOf = (error: unknown): number | undefined => {
   return typeof output?.statusCode === "number" ? output.statusCode : undefined
 }
 
-const messageOf = (error: unknown): string =>
+export const messageOf = (error: unknown): string =>
   error instanceof Error ? error.message : error === undefined ? "connection closed" : String(error)
 
 /** What a socket close means for us. Exported for tests. */
@@ -157,7 +150,7 @@ const SEND_TIMEOUT = Duration.seconds(30)
 /** A file has to be encrypted and uploaded first; large documents take a while. */
 const MEDIA_SEND_TIMEOUT = Duration.minutes(3)
 
-const reconnectSchedule: Schedule.Schedule<Duration.Duration, ReconnectNeeded> = Schedule.exponential("1 second", 2).pipe(
+export const reconnectSchedule: Schedule.Schedule<Duration.Duration, ReconnectNeeded> = Schedule.exponential("1 second", 2).pipe(
   Schedule.jittered,
   Schedule.modifyDelay(({ duration }) => Effect.succeed(Duration.min(duration, Duration.seconds(60)))),
   Schedule.tap(({ input, attempt, duration }) =>
@@ -168,14 +161,14 @@ const reconnectSchedule: Schedule.Schedule<Duration.Duration, ReconnectNeeded> =
 )
 
 /** A connection that stayed up this long counts as healthy: its close starts a fresh backoff. */
-const healthyUptime = Duration.seconds(30)
+export const healthyUptime = Duration.seconds(30)
 
 /** "Restart required" closes reconnect at once, but only this many times in a row before backing off. */
-const MAX_IMMEDIATE_RECONNECTS = 3
+export const MAX_IMMEDIATE_RECONNECTS = 3
 
-const notInterrupted = (cause: Cause.Cause<unknown>): boolean => !Cause.hasInterrupts(cause)
+export const notInterrupted = (cause: Cause.Cause<unknown>): boolean => !Cause.hasInterrupts(cause)
 
-const dedupeKey = (chatId: ChatId, messageId: MessageId): string => `${chatId}:${messageId}`
+export const dedupeKey = (chatId: ChatId, messageId: MessageId): string => `${chatId}:${messageId}`
 
 /** Errors thrown by the socket's promise API, turned into `SendFailed`. */
 const sendFailed = (operation: string, chatId: ChatId) => (cause: unknown) =>
@@ -259,7 +252,67 @@ export const BaileysLive = (options: BaileysOptions) =>
         if (config.allowedSenders.length === 0) return true
         return config.allowedSenders.some((s) => s === senderId || s === chatId || (senderNumber !== undefined && s === senderNumber))
       }
-      const allowed = (message: InboundMessage): boolean => allowedSender(message.senderId, message.chatId, message.senderNumber)
+      // ---- the owner and the access rule -----------------------------------
+      const ownerDigits = Option.getOrUndefined(config.owner)
+      const rule: AccessRule = { ownerDigits, allowedSenders: config.allowedSenders }
+      /** Jids known to be the owner's: the phone form, plus lids learned from the library's mapping. */
+      const ownerJids = yield* Ref.make(new Set<string>(ownerDigits === undefined ? [] : [`${ownerDigits}@s.whatsapp.net`]))
+
+      /** The phone digits behind a jid: direct for phone jids, through the library's lid mapping for lids. */
+      const phoneBehind = (jid: string) =>
+        Effect.gen(function* () {
+          const direct = phoneOfJid(jid)
+          if (direct !== undefined) return direct
+          if (!jid.endsWith("@lid")) return undefined
+          const sock = yield* Ref.get(socket)
+          if (Option.isNone(sock)) return undefined
+          const pn = yield* Effect.tryPromise(() => sock.value.signalRepository.lidMapping.getPNForLID(jid)).pipe(Effect.orElseSucceed(() => null))
+          return pn ? phoneOfJid(pn) : undefined
+        })
+
+      const isOwnerSender = (senderId: string, senderNumber: string | undefined) =>
+        Effect.gen(function* () {
+          if (ownerDigits === undefined) return false
+          if (senderNumber === ownerDigits) return true
+          if ((yield* Ref.get(ownerJids)).has(jidNormalizedUser(senderId))) return true
+          if (!senderId.endsWith("@lid")) return false
+          const phone = yield* phoneBehind(senderId)
+          if (phone !== ownerDigits) return false
+          yield* Ref.update(ownerJids, (set) => new Set(set).add(jidNormalizedUser(senderId)))
+          return true
+        })
+
+      /** Is the owner in this group? From the group's member list, cached for a few minutes. */
+      const groupHasOwner = (chatId: ChatId) =>
+        Effect.gen(function* () {
+          if (ownerDigits === undefined) return false
+          const info = yield* groupInfo(chatId)
+          const known = yield* Ref.get(ownerJids)
+          return info.participants.some((p) => p.phone === ownerDigits || known.has(jidNormalizedUser(p.jid)))
+        })
+
+      const probes = {
+        isOwner: isOwnerSender,
+        groupHasOwner: (chatId: string) => groupHasOwner(ChatId.make(chatId)),
+      }
+
+      /** The access rule for an inbound message. A failed group lookup counts as outside the rule. */
+      const allowed = (message: InboundMessage): Effect.Effect<boolean> =>
+        messageAllowed(rule, { chatId: message.chatId, isGroup: message.isGroup, senderId: message.senderId, senderNumber: message.senderNumber }, probes).pipe(
+          Effect.catch((e) =>
+            Effect.logWarning("could not check the group's members; treating as outside the rule").pipe(
+              Effect.annotateLogs({ chatId: message.chatId, reason: e.message }),
+              Effect.as(false),
+            ),
+          ),
+        )
+
+      /** The same rule for a chat the agent wants to send to. Lookup failures surface so the API can say why. */
+      const chatAllowedFor = Effect.fn("WhatsApp.chatAllowed")(function* (chatId: ChatId) {
+        const phone = yield* phoneBehind(chatId)
+        const isOwnerJid = (yield* Ref.get(ownerJids)).has(jidNormalizedUser(chatId))
+        return yield* chatAllowed(rule, { chatId, isGroup: isJidGroup(chatId) === true, phone, isOwnerJid }, probes)
+      })
 
       const decode = (raw: WAMessage, now: DateTime.Utc) =>
         Effect.try({ try: () => extractInbound(raw, now), catch: (e) => e }).pipe(
@@ -330,6 +383,7 @@ export const BaileysLive = (options: BaileysOptions) =>
             ...base,
             ...((yield* mentionsMe(base.mentionedIds)) ? { mentionsMe: true } : {}),
             ...((yield* quotesMe(base.chatId, base.quotedMessageId)) ? { quotesMe: true } : {}),
+            ...((yield* isOwnerSender(base.senderId, base.senderNumber)) ? { fromOwner: true } : {}),
           }
           const log = Effect.annotateLogs({ chatId: message.chatId, messageId: message.messageId, type })
 
@@ -344,8 +398,8 @@ export const BaileysLive = (options: BaileysOptions) =>
             yield* Effect.logDebug("ignoring group message (BRIDGE_GROUPS=false)").pipe(log)
             return
           }
-          if (!allowed(message)) {
-            yield* Effect.logInfo("ignoring message from a sender outside BRIDGE_ALLOWED_SENDERS").pipe(log)
+          if (!(yield* allowed(message))) {
+            yield* Effect.logInfo(ownerDigits === undefined ? "ignoring message from a sender outside BRIDGE_ALLOWED_SENDERS" : "ignoring message from a chat outside the access rule").pipe(log)
             return
           }
           const id = dedupeKey(message.chatId, message.messageId)
@@ -940,7 +994,7 @@ export const BaileysLive = (options: BaileysOptions) =>
         yield* remember(sent, options?.turnId)
         const content = normalizeMessageContent(original.message)
         const kind = content ? (kindOf(getContentType(content)) ?? "other") : "other"
-        yield* recordOutbound(sent, { kind: kind === "sticker" || kind === "location" || kind === "contact" ? "other" : kind, text: content ? textOf(content) : undefined }, options)
+        yield* recordOutbound(sent, { kind: kind === "sticker" || kind === "location" || kind === "contact" || kind === "call" ? "other" : kind, text: content ? textOf(content) : undefined }, options)
         yield* health.touch("outbound")
         yield* Effect.logInfo("forwarded message").pipe(Effect.annotateLogs({ from: fromChatId, to: toChatId, messageId, sentAs: id }))
         return id as MessageId
@@ -1129,12 +1183,6 @@ export const BaileysLive = (options: BaileysOptions) =>
         yield* withSocket("presence", chatId, (s) => s.sendPresenceUpdate(composing ? "composing" : "paused", chatId))
       })
 
-      const toNumber = (n: number | LongLike | null | undefined): number | undefined => {
-        if (n === null || n === undefined) return undefined
-        if (typeof n === "number") return n
-        return typeof n === "object" && "toNumber" in n && typeof n.toNumber === "function" ? n.toNumber() : undefined
-      }
-
       const downloadMedia = Effect.fn("WhatsApp.downloadMedia")(function* (
         chatId: ChatId,
         messageId: MessageId,
@@ -1144,34 +1192,8 @@ export const BaileysLive = (options: BaileysOptions) =>
         if (Option.isNone(cached)) {
           return yield* new MediaUnavailable({ chatId, messageId, reason: "not a media message seen this run (the bridge may have restarted)" })
         }
-        const { raw, message } = cached.value
-        const content = normalizeMessageContent(raw.message)
-        const contentType = content === undefined ? undefined : getContentType(content)
-        const media = content && contentType ? (content[contentType] as { mimetype?: string | null; fileLength?: number | LongLike | null } | null) : null
-        if (!media || typeof media !== "object") {
-          return yield* new MediaUnavailable({ chatId, messageId, reason: "message carries no downloadable media" })
-        }
-        const declared = toNumber(media.fileLength)
-        if (declared !== undefined && declared > options.maxBytes) {
-          return yield* new MediaTooLarge({ chatId, messageId, size: declared, maxBytes: options.maxBytes })
-        }
         const sock = yield* Ref.get(socket)
-        const context = Option.isSome(sock) ? { reuploadRequest: (m: WAMessage) => sock.value.updateMediaMessage(m), logger } : undefined
-        const bytes = yield* Effect.tryPromise({
-          try: () => downloadMediaMessage(raw, "buffer", {}, context),
-          catch: (e) => new MediaDownloadFailed({ chatId, messageId, detail: messageOf(e) }),
-        }).pipe(
-          Effect.timeout("60 seconds"),
-          Effect.catchTag("TimeoutError", () => new MediaDownloadFailed({ chatId, messageId, detail: "timed out after 60 seconds" })),
-        )
-        if (bytes.byteLength > options.maxBytes) {
-          return yield* new MediaTooLarge({ chatId, messageId, size: bytes.byteLength, maxBytes: options.maxBytes })
-        }
-        const mimetype = (media.mimetype ?? message.mimetype ?? "application/octet-stream").split(";")[0] ?? "application/octet-stream"
-        const extension = (content ? extensionForMediaMessage(content) : undefined) ?? mimetype.split("/")[1] ?? "bin"
-        yield* Effect.logInfo("media downloaded").pipe(Effect.annotateLogs({ chatId, messageId, bytes: bytes.byteLength, mimetype }))
-        const result: DownloadedMedia = { bytes: new Uint8Array(bytes), mimetype, extension: extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "bin", kind: message.kind }
-        return result
+        return yield* downloadFromRaw(cached.value.raw, cached.value.message, { maxBytes: options.maxBytes, socket: Option.getOrUndefined(sock), logger })
       })
 
       return WhatsApp.of({
@@ -1186,6 +1208,7 @@ export const BaileysLive = (options: BaileysOptions) =>
         forward,
         contact,
         groupInfo,
+        chatAllowed: chatAllowedFor,
         presence,
         watchPresence,
         presenceUpdates: Stream.fromQueue(presenceUpdates),

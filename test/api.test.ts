@@ -349,65 +349,107 @@ const HistoryServerLayer = Layer.unwrap(
 )
 
 describe("HTTP API v0.5", () => {
-  it.effect("status names the database, history answers 409 when off", () =>
+  it.effect("status names the database and the access rule; a turn without history answers 409 on its own chat and 403 beyond it", () =>
     Effect.gen(function* () {
       const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
       const status = yield* api.health.status()
       expect(status.databasePath).toBe(":memory:")
       expect(status.history).toBe(false)
-      const off = yield* api.history.chats().pipe(Effect.flip)
+      expect(status.access).toBe("open")
+      expect(status.observerUrl).toBeUndefined()
+
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      yield* wa.deliver(message("hi"))
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      // No owner configured: every turn is chat-scoped, and history is off, so its own chat is 409.
+      expect(yield* api.context.summary({ params: { turnId: call.turnId } })).toEqual({ turnId: call.turnId, chatId: chat, access: "chat", primary: false })
+      const off = yield* api.context.lineMessages({ params: { turnId: call.turnId, chatId: chat }, query: {} }).pipe(Effect.flip)
       expect(off._tag).toBe("HistoryDisabled")
-      const info = yield* api.history.chat({ params: { chatId: chat } })
+      const beyond = yield* api.context.lineChats({ params: { turnId: call.turnId } }).pipe(Effect.flip)
+      expect(beyond._tag).toBe("ContextNotAllowed")
+      const primary = yield* api.context.primaryChats({ params: { turnId: call.turnId } }).pipe(Effect.flip)
+      expect(primary._tag).toBe("ContextNotAllowed")
+      const info = yield* api.context.lineChat({ params: { turnId: call.turnId, chatId: chat } })
       expect(info).toEqual({ chatId: chat, isGroup: false })
+      const unknown = yield* api.context.summary({ params: { turnId: TurnId.make("turn_nope") } }).pipe(Effect.flip)
+      expect(unknown._tag).toBe("TurnNotFound")
     }).pipe(Effect.provide(ServerTestLayer)),
   )
 
-  it.effect("records the conversation and serves it back with paging, search and reactions", () =>
+  it.effect("records the conversation and serves it back through the open turn, with paging, search and reactions", () =>
     Effect.gen(function* () {
       const api = yield* client(true)
       const wa = yield* FakeWhatsApp
       const responder = yield* TestResponder
       yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
-      const m1 = message("what time is the dentist?")
-      // The fake transport never writes history itself (the real one does before the engine sees a message); do it here.
       const store = yield* Store
-      yield* store.recordInbound(m1, new Uint8Array([1]))
+      // An earlier exchange, as the real transport and engine would have recorded it.
+      const earlier = message("what time is the dentist?")
+      yield* store.recordInbound(earlier, new Uint8Array([1]))
+      const answered = MessageId.make("out_earlier")
+      yield* store.recordOutbound({
+        chatId: chat,
+        messageId: answered,
+        kind: "text",
+        text: "Ten tomorrow.",
+        turnId: TurnId.make("turn_earlier"),
+        at: DateTime.makeUnsafe(DateTime.toEpochMillis(earlier.timestamp) + 1),
+        raw: new Uint8Array([2]),
+      })
+      yield* store.recordReaction(chat, answered, chat, "👍")
+
+      const m1 = { ...message("and the address?"), timestamp: DateTime.makeUnsafe(DateTime.toEpochMillis(earlier.timestamp) + 2) }
+      yield* store.recordInbound(m1, new Uint8Array([3]))
       yield* wa.deliver(m1)
       yield* takeSoon(wa.reactions)
       const call = yield* takeSoon(responder.calls)
       yield* settle
-      yield* api.turns.reply({ params: { turnId: call.turnId }, payload: { text: "Ten tomorrow." } })
-      const out = yield* takeSoon(wa.sent)
-      yield* store.recordOutbound({
-        chatId: chat,
-        messageId: out.messageId,
-        kind: "text",
-        text: out.text,
-        turnId: call.turnId,
-        at: DateTime.makeUnsafe(DateTime.toEpochMillis(m1.timestamp) + 1),
-        raw: new Uint8Array([2]),
-      })
-      yield* wa.inject({ _tag: "Reaction", chatId: chat, messageId: out.messageId, senderId: chat, emoji: "👍", onOurMessage: true })
-      yield* store.recordReaction(chat, out.messageId, chat, "👍")
+      const turnId = call.turnId
 
-      const chats = yield* api.history.chats()
-      expect(chats.map((c) => [c.chatId, c.messageCount])).toEqual([[chat, 2]])
-      const page = yield* api.history.chatMessages({ params: { chatId: chat }, query: { limit: 1 } })
-      expect(page.map((r) => r.messageId)).toEqual([out.messageId])
-      expect(page[0]).toMatchObject({ direction: "out", turnId: call.turnId, reactions: [{ emoji: "👍" }] })
-      const older = yield* api.history.chatMessages({ params: { chatId: chat }, query: { before: out.messageId } })
-      expect(older.map((r) => r.messageId)).toEqual([m1.messageId])
-      expect(older[0]?.turnId).toBe(call.turnId)
-      const hits = yield* api.history.search({ query: { q: "dent" } })
-      expect(hits.length).toBe(1)
-      expect(hits[0]?.snippet).toContain("[dentist]")
-      const scoped = yield* api.history.chatMessages({ params: { chatId: chat }, query: { q: "tomorrow" } })
-      expect(scoped.map((r) => r.messageId)).toEqual([out.messageId])
-      const info = yield* api.history.chat({ params: { chatId: chat } })
-      expect(info).toMatchObject({ chatId: chat, isGroup: false, name: "Moishi", messageCount: 2 })
+      const page = yield* api.context.lineMessages({ params: { turnId, chatId: chat }, query: { limit: 2 } })
+      expect(page.map((r) => r.messageId)).toEqual([m1.messageId, answered])
+      expect(page[1]).toMatchObject({ direction: "out", turnId: "turn_earlier", reactions: [{ emoji: "👍" }] })
+      expect(page[0]?.turnId).toBe(turnId)
+      const older = yield* api.context.lineMessages({ params: { turnId, chatId: chat }, query: { before: answered } })
+      expect(older.map((r) => r.messageId)).toEqual([earlier.messageId])
+      const scoped = yield* api.context.lineMessages({ params: { turnId, chatId: chat }, query: { q: "dent" } })
+      expect(scoped.length).toBe(1)
+      expect(scoped[0]?.snippet).toContain("[dentist]")
+      const info = yield* api.context.lineChat({ params: { turnId, chatId: chat } })
+      expect(info).toMatchObject({ chatId: chat, isGroup: false, name: "Moishi", messageCount: 3 })
       const status = yield* api.health.status()
       expect(status.history).toBe(true)
+
+      yield* api.turns.reply({ params: { turnId }, payload: { text: "Sent you the pin." } })
+      yield* takeSoon(wa.sent)
+      const closed = yield* api.context.lineMessages({ params: { turnId, chatId: chat }, query: {} }).pipe(Effect.flip)
+      expect(closed._tag).toBe("TurnNotOpen")
     }).pipe(Effect.provide(HistoryServerLayer)),
+  )
+
+  it.effect("sends outside the access rule are refused before anything goes out", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+      const stranger = ChatId.make("447700900999@s.whatsapp.net")
+      yield* Ref.set(wa.disallowed, new Set([stranger]))
+      const refused = yield* api.chats.send({ params: { chatId: stranger }, payload: { text: "hello?" } }).pipe(Effect.flip)
+      expect(refused._tag).toBe("NotAllowlisted")
+      const file = yield* api.chats.sendMedia({ params: { chatId: stranger }, payload: { data: new Uint8Array([1]), mimetype: "image/png" } }).pipe(Effect.flip)
+      expect(file._tag).toBe("NotAllowlisted")
+      const pin = yield* api.chats.sendLocation({ params: { chatId: stranger }, payload: { latitude: 1, longitude: 2 } }).pipe(Effect.flip)
+      expect(pin._tag).toBe("NotAllowlisted")
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
+      expect(Option.isNone(yield* Queue.poll(wa.sentMedia))).toBe(true)
+      expect(Option.isNone(yield* Queue.poll(wa.locations))).toBe(true)
+      const ok = asSent(yield* api.chats.send({ params: { chatId: chat }, payload: { text: "hello" } }))
+      expect(ok.chatId).toBe(chat)
+    }).pipe(Effect.provide(ServerTestLayer)),
   )
 
   it.effect("schedules, lists and cancels sends; forwards and looks contacts up", () =>
@@ -436,15 +478,10 @@ describe("HTTP API v0.5", () => {
       expect(unknown._tag).toBe("MessageUnknown")
 
       yield* Ref.set(wa.contacts, new Map([[chat, { jid: chat, phone: "447700900123", name: "Moishi", onWhatsApp: true }]]))
-      const known = yield* api.history.contact({ params: { jid: chat } })
+      const known = yield* api.contacts.contact({ params: { jid: chat } })
       expect(known).toMatchObject({ name: "Moishi", onWhatsApp: true })
-      const nobody = yield* api.history.contact({ params: { jid: "1@s.whatsapp.net" } })
+      const nobody = yield* api.contacts.contact({ params: { jid: "1@s.whatsapp.net" } })
       expect(nobody.onWhatsApp).toBe(false)
-
-      const group = ChatId.make("123-456@g.us")
-      yield* Ref.set(wa.groups, new Map([[group, { chatId: group, subject: "Family", participants: [{ jid: chat, admin: true }] }]]))
-      const info = yield* api.history.chat({ params: { chatId: group } })
-      expect(info).toMatchObject({ isGroup: true, name: "Family", group: { subject: "Family" } })
     }).pipe(Effect.provide(ServerTestLayer)),
   )
 })

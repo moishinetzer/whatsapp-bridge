@@ -11,6 +11,8 @@ export const MessageKind = Schema.Literals([
   "location",
   "contact",
   "other",
+  /** A call the observer saw; `text` says voice or video and how it ended. */
+  "call",
 ])
 export type MessageKind = typeof MessageKind.Type
 
@@ -83,5 +85,7 @@ export const InboundMessage = Schema.Struct({
   quotesMe: Schema.optionalKey(Schema.Boolean),
   location: Schema.optionalKey(Location),
   contacts: Schema.optionalKey(Schema.Array(SharedContact)),
+  /** True when the sender is the configured owner (`BRIDGE_OWNER`), by number or lid. */
+  fromOwner: Schema.optionalKey(Schema.Boolean),
 })
 export type InboundMessage = typeof InboundMessage.Type

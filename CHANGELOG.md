@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here. Intro pins on a tag.
 
+## v0.7.0 — 2026-09-10
+
+Two numbers: the observer, and context as a capability. The design is `docs/spec/observer.md`.
+
+- **The observer.** A second process of the same daemon (`bridge observe enable`, `observe link`, `observe run`) linked to the owner's own number as a read-only device. No send methods exist in that mode; it never marks anything read, never goes online, never reacts. It stores every DM and group both ways, reactions, edits, tombstones, calls (`kind: "call"`), the address book and chat names, and attachments per `BRIDGE_MEDIA_AUTO`, in its own directory, database and port. Backfill is the recent slice WhatsApp pushes at link time, refused before download past `BRIDGE_OBSERVE_BACKFILL_DAYS` (30), 20 chunks or 8 MB each, written in batched transactions; retention `BRIDGE_OBSERVE_RETENTION` (180 days) purged daily; `BRIDGE_OBSERVE_EXCLUDE` chats are never written. A one-time acceptance file gates it; `/status` and a weekly log line keep it visible. `observe health` and `observe purge`.
+- **Context is turn-scoped.** History is read only through an open turn: `GET /turns/{id}/context/line/...` (the personal line) and `.../primary/...` (the observer). The engine builds the capability per turn as an Effect service: `OwnerContext` for a DM whose every message is from `BRIDGE_OWNER` (both lines, contacts, primary attachments), `ChatContext` for everything else (that chat on the line, nothing more). It ends with the turn (`409 TurnNotOpen`); reads beyond it are `403 ContextNotAllowed`; a missing observer is `503 ObserverUnavailable` while the line keeps working. `TurnOpened`, `TurnSummary` and `TurnPayload` carry `access`; inbound messages carry `fromOwner`. Every read is logged with its turn id.
+- **Removed:** `GET /chats`, `GET /chats/{id}`, `GET /chats/{id}/messages`, `GET /messages`. The CLI's `chats`, `messages` and `search` read the database file directly (`--observer` for the observer's). `GET /contacts/{jid}` stays (a live lookup, not stored context).
+- **The access rule.** With `BRIDGE_OWNER` set, the line answers the owner's DM, groups the owner is a member of (from the group's members, cached), and `BRIDGE_ALLOWED_SENDERS`; a listed person unlocks their DM only, a group must be listed as a group. Sends anywhere else are `403 NotAllowlisted`. The owner is recognised by number or by a lid the library maps to it. Without `BRIDGE_OWNER` nothing changes.
+- Store: `contacts`, `chats` and `state` tables (migration `0003_observer`), batched inserts, calls as rows, contact merge and search, chat names with precedence (WhatsApp's, then the address book, then the last push name), a shared read side usable over a read-only client.
+- The media store now depends on a `MediaSource` (download only), which both transports provide; the download itself is shared code.
+- Effect notes: two traps (a layer object memoized by identity across nested provides; read-only `node:sqlite` opens fail as defects).
+- Tests: the access rule, the chunk filter, contact mapping, the observer's store side, turn-scoped reads against a real observer database on disk (owner turn, group turn, friend's turn, closed turn, missing observer), sends refused by the rule. 118 in total.
+- Event schema stays v1; `access` and `fromOwner` are additive.
+
 ## v0.6.0 — 2026-09-10
 
 The long tail: the third and last push from `docs/spec/agent-surface.md`.

@@ -25,6 +25,7 @@ import { WhatsApp, type InboundUpdate, type MessageError, type WhatsAppError } f
 import { Events } from "./Events.ts"
 import { MediaStore, type MediaError } from "./Media.ts"
 import { Store } from "../store/Store.ts"
+import { ContextSource, type TurnAccess } from "./Context.ts"
 import { Responder, type TurnPayload } from "./Responder.ts"
 import { prepareOutgoing } from "./text.ts"
 
@@ -57,6 +58,8 @@ export const TurnSummary = Schema.Struct({
   failure: Schema.optionalKey(Schema.String),
   /** Groups: what was said in the chat just before this turn, oldest first. */
   context: Schema.optionalKey(Schema.Array(InboundMessage)),
+  /** What `/turns/{id}/context` may read while the turn is open: `owner` (both lines) or `chat` (this chat only). */
+  access: Schema.optionalKey(Schema.Literals(["owner", "chat"])),
 })
 export type TurnSummary = typeof TurnSummary.Type
 
@@ -198,6 +201,8 @@ interface TurnRecord {
   readonly typingUntil: Ref.Ref<DateTime.Utc>
   /** The last interim bubble sent through `progress`, for `replaceProgress`. */
   readonly progressMessageId: Option.Option<MessageId>
+  /** The turn's context capability, present only while the turn is open. Gone at commit, failure, cancel, supersede. */
+  readonly access: Option.Option<TurnAccess>
   /** Bumped on every write; see `ChatState.generation` for why structural equality bites here. */
   readonly revision: number
 }
@@ -228,8 +233,11 @@ export interface TurnRegistryShape {
   /** Give up on an open turn: it fails with `reason`; `text` replaces the configured failure text. */
   readonly abandon: (turnId: TurnId, reason: string, text?: string) => Effect.Effect<void, TurnNotFound | TurnNotOpen>
 
+  /** The turn's capability, while it is open. */
+  readonly access: (turnId: TurnId) => Effect.Effect<TurnAccess, TurnNotFound | TurnNotOpen>
+
   // Engine side.
-  readonly open: (summary: TurnSummary) => Effect.Effect<void>
+  readonly open: (summary: TurnSummary, access: TurnAccess) => Effect.Effect<void>
   readonly setState: (turnId: TurnId, state: TurnState) => Effect.Effect<void>
   /** Marks the turn `awaiting` and waits for `reply`, the deadline, or `abandon`. Interruptible. */
   readonly await: (turnId: TurnId) => Effect.Effect<ReplyRequest, TurnTimedOut | TurnAbandoned>
@@ -299,7 +307,7 @@ export const TurnRegistryLive = Layer.effect(
         ),
       )
 
-    const open = Effect.fn("TurnRegistry.open")(function* (summary: TurnSummary) {
+    const open = Effect.fn("TurnRegistry.open")(function* (summary: TurnSummary, access: TurnAccess) {
       const done = yield* Deferred.make<ReadonlyArray<MessageId>, TurnFailedError>()
       const abandon = yield* Deferred.make<AbandonRequest>()
       const deadline = yield* Ref.make(DateTime.addDuration(summary.openedAt, config.turnTimeout))
@@ -314,6 +322,7 @@ export const TurnRegistryLive = Layer.effect(
           deadline: Option.match(existing, { onNone: () => deadline, onSome: (r) => r.deadline }),
           typingUntil: Option.match(existing, { onNone: () => typingUntil, onSome: (r) => r.typingUntil }),
           progressMessageId: Option.match(existing, { onNone: () => Option.none(), onSome: (r) => r.progressMessageId }),
+          access: Option.some(access),
           revision: Option.match(existing, { onNone: () => 0, onSome: (r) => r.revision + 1 }),
         })
         return prune(HashMap.set(map, summary.turnId, record))
@@ -322,6 +331,14 @@ export const TurnRegistryLive = Layer.effect(
     })
 
     const setState = (turnId: TurnId, state: TurnState) => Effect.andThen(patch(turnId, { state }), persist(turnId))
+
+    const access = (turnId: TurnId) =>
+      Effect.flatMap(getRecord(turnId), (r) =>
+        Option.match(r.access, {
+          onNone: () => Effect.fail(new TurnNotOpen({ turnId, state: r.summary.state })),
+          onSome: Effect.succeed,
+        }),
+      )
 
     const abandonRequested = (turnId: TurnId) => Effect.flatMap(getRecord(turnId).pipe(Effect.orDie), (r) => Deferred.await(r.abandon))
 
@@ -397,6 +414,7 @@ export const TurnRegistryLive = Layer.effect(
       yield* update(turnId, (r) => ({
         ...r,
         awaiting: Option.none(),
+        access: Option.none(),
         summary: { ...r.summary, state: "committed", sentMessageIds: sent },
       }))
       const record = yield* getRecord(turnId).pipe(Effect.option)
@@ -405,19 +423,19 @@ export const TurnRegistryLive = Layer.effect(
     })
 
     const supersede = Effect.fn("TurnRegistry.supersede")(function* (turnId: TurnId, by: TurnId) {
-      yield* update(turnId, (r) => ({ ...r, awaiting: Option.none(), summary: { ...r.summary, state: "superseded", supersededBy: by } }))
+      yield* update(turnId, (r) => ({ ...r, awaiting: Option.none(), access: Option.none(), summary: { ...r.summary, state: "superseded", supersededBy: by } }))
       yield* persist(turnId)
     })
 
     const fail = Effect.fn("TurnRegistry.fail")(function* (turnId: TurnId, reason: string) {
-      yield* update(turnId, (r) => ({ ...r, awaiting: Option.none(), summary: { ...r.summary, state: "failed", failure: reason } }))
+      yield* update(turnId, (r) => ({ ...r, awaiting: Option.none(), access: Option.none(), summary: { ...r.summary, state: "failed", failure: reason } }))
       const record = yield* getRecord(turnId).pipe(Effect.option)
       if (Option.isSome(record)) yield* Deferred.fail(record.value.done, new TurnFailedError({ turnId, reason }))
       yield* persist(turnId)
     })
 
     const cancel = Effect.fn("TurnRegistry.cancel")(function* (turnId: TurnId, reason: string) {
-      yield* update(turnId, (r) => ({ ...r, awaiting: Option.none(), summary: { ...r.summary, state: "cancelled" } }))
+      yield* update(turnId, (r) => ({ ...r, awaiting: Option.none(), access: Option.none(), summary: { ...r.summary, state: "cancelled" } }))
       const record = yield* getRecord(turnId).pipe(Effect.option)
       if (Option.isSome(record)) yield* Deferred.fail(record.value.done, new TurnFailedError({ turnId, reason: `cancelled: ${reason}` }))
       yield* persist(turnId)
@@ -463,6 +481,7 @@ export const TurnRegistryLive = Layer.effect(
       reply,
       progress,
       abandon,
+      access,
       open,
       setState,
       await: awaitReply,
@@ -562,6 +581,7 @@ export const TurnEngineLive = Layer.effectDiscard(
     const responder = yield* Responder
     const mediaStore = yield* MediaStore
     const store = yield* Store
+    const contextSource = yield* ContextSource
     const scope = yield* Effect.scope
     const chats = yield* Ref.make(HashMap.empty<ChatId, ChatState>())
     // Groups: the last few messages per chat, handled or not, so a turn can say what was being discussed.
@@ -782,9 +802,10 @@ export const TurnEngineLive = Layer.effectDiscard(
         }
         const messages = yield* withMedia(pending)
         const context = opened.isGroup ? yield* contextFor(opened.chatId, messages) : []
-        const turn: TurnSummary = { ...opened, messages, ...(context.length === 0 ? {} : { context }) }
+        const access = contextSource.forTurn({ chatId: opened.chatId, isGroup: opened.isGroup, messages })
+        const turn: TurnSummary = { ...opened, messages, access: access.kind, ...(context.length === 0 ? {} : { context }) }
         yield* Ref.set(phase, "responding")
-        yield* registry.open(turn)
+        yield* registry.open(turn, access)
         yield* registry.setState(turn.turnId, "responding")
         yield* events.publish({
           _tag: "TurnOpened",
@@ -794,6 +815,7 @@ export const TurnEngineLive = Layer.effectDiscard(
           messages: turn.messages,
           ...(turn.supersedes === undefined ? {} : { supersedes: turn.supersedes }),
           ...(turn.context === undefined ? {} : { context: turn.context }),
+          access: access.kind,
         })
         yield* store.setTurn(turn.chatId, turn.messages.map((m) => m.messageId), turn.turnId).pipe(Effect.ignore)
         const typingFiber = yield* keepTyping(turn.turnId, turn.chatId)
@@ -940,7 +962,8 @@ export const TurnEngineLive = Layer.effectDiscard(
           ...(carry.supersedes === undefined ? {} : { supersedes: carry.supersedes }),
           openedAt: yield* DateTime.now,
         }
-        yield* registry.open(turn)
+        // Provisional while batching (a DM's sender never changes, so it only firms up); settled again when the turn opens.
+        yield* registry.open(turn, contextSource.forTurn({ chatId, isGroup: first.message.isGroup, messages: turn.messages }))
         const phase = yield* Ref.make<Phase>("batching")
 
         // Typed failures stay typed; only defects (bugs, throwing responders) become `TurnCrashed`.

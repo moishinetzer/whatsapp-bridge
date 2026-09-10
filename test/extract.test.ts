@@ -74,8 +74,16 @@ describe("extractInbound", () => {
     expect(result.value.message.senderNumber).toBe("447700900999")
   })
 
-  it("ignores our own messages (no reply loops)", () => {
-    expect(Option.isNone(extractInbound(dm({ key: { remoteJid: "447700900123@s.whatsapp.net", fromMe: true, id: "MINE" } }), now))).toBe(true)
+  it("ignores our own messages (no reply loops), unless asked to keep them", () => {
+    const mine = dm({ key: { remoteJid: "447700900123@s.whatsapp.net", fromMe: true, id: "MINE" } })
+    expect(Option.isNone(extractInbound(mine, now))).toBe(true)
+    const kept = extractInbound(mine, now, { keepOwn: true })
+    expect(Option.isSome(kept)).toBe(true)
+    if (Option.isNone(kept)) return
+    expect(kept.value.fromMe).toBe(true)
+    expect(kept.value.message.messageId).toBe("MINE")
+    const theirs = extractInbound(dm(), now, { keepOwn: true })
+    expect(Option.isSome(theirs) && theirs.value.fromMe).toBe(false)
   })
 
   it("ignores status broadcasts, protocol messages and reactions", () => {

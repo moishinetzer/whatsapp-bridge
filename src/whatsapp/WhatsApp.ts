@@ -145,6 +145,13 @@ export const PresenceInfo = Schema.Struct({
 export type PresenceInfo = typeof PresenceInfo.Type
 
 /** WhatsApp refused a lookup, or the id is not something it knows. */
+/** The chat is outside the access rule: not the owner's DM, not a group the owner is in, not on the allowlist. */
+export class NotAllowlisted extends Schema.TaggedError<NotAllowlisted>()("NotAllowlisted", { chatId: ChatId }, { httpApiStatus: 403 }) {
+  override get message() {
+    return `${this.chatId} is outside the access rule (the owner's DM, a group the owner is in, or BRIDGE_ALLOWED_SENDERS)`
+  }
+}
+
 export class LookupFailed extends Schema.TaggedError<LookupFailed>()(
   "LookupFailed",
   { subject: Schema.String, detail: Schema.String },
@@ -210,6 +217,12 @@ export interface WhatsAppShape {
   readonly forward: (toChatId: ChatId, fromChatId: ChatId, messageId: MessageId, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError | MessageUnknown>
   readonly contact: (jid: string) => Effect.Effect<ContactInfo, NotConnected | LookupFailed>
   readonly groupInfo: (chatId: ChatId) => Effect.Effect<GroupInfo, NotConnected | LookupFailed>
+  /**
+   * Whether the access rule lets the bridge talk to this chat. Without an
+   * owner, always true. With one: the owner's DM, a group the owner is a
+   * member of (looked up, cached), or a chat on `BRIDGE_ALLOWED_SENDERS`.
+   */
+  readonly chatAllowed: (chatId: ChatId) => Effect.Effect<boolean, NotConnected | LookupFailed>
   /** Subscribes to the chat's presence (once) and returns the last known state. */
   readonly presence: (chatId: ChatId) => Effect.Effect<PresenceInfo, NotConnected>
   /** Like `presence`, and from now on `PresenceChanged` events flow for this chat. */
