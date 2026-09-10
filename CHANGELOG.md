@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here. Intro pins on a tag.
 
+## v0.4.0 — 2026-09-10
+
+How the line feels: the first of three pushes from the design session recorded in `docs/spec/agent-surface.md`.
+
+- The eye moves. One message per chat carries the 👀: the previous one loses it before the new one gets it, and it comes off when the turn completes. Every accepted message is also marked read (`BRIDGE_READ_RECEIPTS`, default on).
+- Failure text. When a turn fails, times out or is abandoned, the eye comes off and the bridge replies to the newest message, quoting it, with `BRIDGE_FAILURE_TEXT` (default "Something went wrong."; empty disables).
+- `POST /turns/{id}/progress {text?, extendBy?}` keeps typing alive, moves the reply deadline (never past one hour after opening) and can send an interim bubble; `replaceProgress: true` on the reply edits that bubble into the answer. `POST /turns/{id}/abandon {reason, text?}` fails a turn deliberately, aborting a running `http` handler call.
+- Typing is re-sent every 8 seconds while a turn is open, for at most `BRIDGE_TYPING_MAX` (3 minutes), re-armed by progress.
+- Inbound edits and deletes: `MessageEdited` and `MessageDeleted` events; a pending message is corrected or dropped in place while batching, an edit supersedes an open turn with the corrected text, and a delete that empties a turn ends it in the new state `cancelled` with a `TurnCancelled` event.
+- Own edits and deletes: `PATCH` and `DELETE /chats/{id}/messages/{messageId}` for messages the bridge sent this run, refused with `409 MessageTooOld` past WhatsApp's windows (15 minutes, about 2 days) and `404 MessageUnknown` otherwise.
+- Quoting: `quoteMessageId` on text and media sends and on turn replies (top level for the first bubble, `{text, quoteMessageId}` entries in `replies`, per attachment). Unknown ids fail a proactive send with `404 MessageUnknown`; on a turn reply the bubble goes out unquoted with a warning.
+- `ReactionReceived` events for reactions in handled chats, the bridge's own excluded.
+- CLI: `edit`, `delete`, `progress`, `abandon`; `--quote` on `send` and `reply`, `--replace-progress` on `reply`.
+- Event schema stays v1; the new events and fields are additive.
+
 ## v0.3.0 — 2026-09-09
 
 Intro can send images and files.

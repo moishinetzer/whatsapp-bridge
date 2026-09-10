@@ -1,9 +1,9 @@
 import { describe, expect, it } from "@effect/vitest"
 import { NodeHttpServer } from "@effect/platform-node"
-import { Effect, Fiber, Layer, Option, Queue, Redacted, Ref, Stream } from "effect"
+import { Duration, Effect, Fiber, Layer, Option, Queue, Redacted, Ref, Stream } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiClient } from "effect/unstable/httpapi"
-import { toChatId } from "../src/domain/ids.ts"
+import { MessageId, toChatId } from "../src/domain/ids.ts"
 import { Events } from "../src/engine/Events.ts"
 import { Health } from "../src/engine/Health.ts"
 import { TurnId } from "../src/domain/ids.ts"
@@ -258,6 +258,72 @@ describe("HTTP API outbound media", () => {
       expect(file.media).toMatchObject({ kind: "image", mimetype: "image/jpeg", caption: "Q3" })
       expect(file.messageId).toBe(result.sentMessageIds[1])
       expect((yield* takeSoon(wa.reactions)).emoji).toBe("")
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+})
+
+describe("HTTP API v0.4", () => {
+  it.effect("quotes, edits and deletes the bridge's own messages", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+      const quoted = yield* api.chats.send({ params: { chatId: chat }, payload: { text: "re: that", quoteMessageId: MessageId.make("in_42") } })
+      expect(yield* takeSoon(wa.sent)).toMatchObject({ messageId: quoted.messageId, quoteMessageId: "in_42" })
+      yield* Ref.set(wa.unknownQuotes, new Set([MessageId.make("gone")]))
+      const unknown = yield* api.chats.send({ params: { chatId: chat }, payload: { text: "x", quoteMessageId: MessageId.make("gone") } }).pipe(Effect.flip)
+      expect(unknown._tag).toBe("MessageUnknown")
+      yield* api.chats.edit({ params: { chatId: chat, messageId: quoted.messageId }, payload: { text: "re: this" } })
+      expect(yield* takeSoon(wa.edits)).toEqual({ chatId: chat, messageId: quoted.messageId, text: "re: this" })
+      yield* api.chats.deleteMessage({ params: { chatId: chat, messageId: quoted.messageId } })
+      expect(yield* takeSoon(wa.deletes)).toEqual({ chatId: chat, messageId: quoted.messageId })
+    }).pipe(Effect.provide(ServerTestLayer)),
+  )
+
+  it.effect("progress sends an interim bubble the reply can replace; abandon fails the turn", () =>
+    Effect.gen(function* () {
+      const api = yield* client(true)
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const events = yield* Events
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+
+      const m1 = message("find the invoice")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+
+      const progress = yield* api.turns.progress({ params: { turnId: call.turnId }, payload: { text: "Looking…", extendBy: Duration.minutes(20) } })
+      const interim = yield* takeSoon(wa.sent)
+      expect(interim.text).toBe("Looking…")
+      expect(progress.progressMessageId).toBe(interim.messageId)
+      expect(progress.turnId).toBe(call.turnId)
+
+      const result = yield* api.turns.reply({
+        params: { turnId: call.turnId },
+        payload: { replies: [{ text: "Here it is.", quoteMessageId: m1.messageId }], text: "Paid in March.", replaceProgress: true },
+      })
+      expect(yield* takeSoon(wa.edits)).toEqual({ chatId: chat, messageId: interim.messageId, text: "Here it is." })
+      expect(yield* takeSoon(wa.sent)).toMatchObject({ text: "Paid in March." })
+      expect(result.sentMessageIds[0]).toBe(interim.messageId)
+
+      const closed = yield* api.turns.progress({ params: { turnId: call.turnId }, payload: {} }).pipe(Effect.flip)
+      expect(closed._tag).toBe("TurnNotOpen")
+
+      const m2 = message("and the receipt")
+      yield* wa.deliver(m2)
+      yield* takeSoon(wa.reactions)
+      yield* takeSoon(wa.reactions)
+      const second = yield* takeSoon(responder.calls)
+      yield* settle
+      const failedEvent = yield* events.stream.pipe(Stream.filter((e) => e._tag === "TurnFailed"), Stream.take(1), Stream.runCollect, Effect.forkScoped)
+      yield* api.turns.abandon({ params: { turnId: second.turnId }, payload: { reason: "cannot find it", text: "" } })
+      const [failed] = Array.from(yield* Fiber.join(failedEvent))
+      expect(failed).toMatchObject({ _tag: "TurnFailed", turnId: second.turnId, reason: "abandoned: cannot find it" })
+      expect((yield* api.turns.get({ params: { turnId: second.turnId } })).state).toBe("failed")
+      yield* settle
+      // An empty abandon text sends nothing.
+      expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
     }).pipe(Effect.provide(ServerTestLayer)),
   )
 })

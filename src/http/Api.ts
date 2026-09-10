@@ -7,9 +7,9 @@ import { MediaFile } from "../domain/message.ts"
 import { BridgeStatus } from "../domain/status.ts"
 import { MediaStoreError } from "../engine/Media.ts"
 import { OutboundFileUnreadable, OutboundInvalid, OutboundTooLarge } from "../engine/Outbound.ts"
-import { OutboundMediaPayload } from "../domain/outbound.ts"
-import { TurnFailedError, TurnNotAwaitingReply, TurnNotFound, TurnSummary, TurnSuperseded } from "../engine/Turns.ts"
-import { MediaDownloadFailed, MediaTooLarge, MediaUnavailable, NotConnected, SendFailed } from "../whatsapp/WhatsApp.ts"
+import { OutboundMediaPayload, ReplyItem } from "../domain/outbound.ts"
+import { TurnFailedError, TurnNotAwaitingReply, TurnNotFound, TurnNotOpen, TurnSummary, TurnSuperseded } from "../engine/Turns.ts"
+import { MediaDownloadFailed, MediaTooLarge, MediaUnavailable, MessageTooOld, MessageUnknown, NotConnected, SendFailed } from "../whatsapp/WhatsApp.ts"
 
 /** `GET /health` answers 503 with the same body when the bridge is not `ok`. */
 export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", { status: BridgeStatus }, { httpApiStatus: 503 }) {
@@ -18,17 +18,45 @@ export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", { st
   }
 }
 
-export const SendTextPayload = Schema.Struct({ text: Schema.String.pipe(Schema.check(Schema.isNonEmpty())) })
+export const SendTextPayload = Schema.Struct({
+  text: Schema.String.pipe(Schema.check(Schema.isNonEmpty())),
+  /** Send as a reply to this message (one the bridge saw or sent this run). */
+  quoteMessageId: Schema.optionalKey(MessageId),
+})
+export const EditPayload = Schema.Struct({ text: Schema.String.pipe(Schema.check(Schema.isNonEmpty())) })
 export const SentMessage = Schema.Struct({ chatId: ChatId, messageId: MessageId })
 export const ReactionPayload = Schema.Struct({ emoji: Schema.String.pipe(Schema.check(Schema.isNonEmpty())) })
 export const TypingPayload = Schema.Struct({ composing: Schema.Boolean })
 export const ReplyPayload = Schema.Struct({
   text: Schema.optionalKey(Schema.String),
-  replies: Schema.optionalKey(Schema.Array(Schema.String)),
+  /** Bubbles sent before `text`; a string, or `{text, quoteMessageId}` to quote a message. */
+  replies: Schema.optionalKey(Schema.Array(ReplyItem)),
   /** Files to send after the text bubbles, in order. */
   attachments: Schema.optionalKey(Schema.Array(OutboundMediaPayload)),
+  /** Quote this message with the first bubble (unless that bubble carries its own quote). */
+  quoteMessageId: Schema.optionalKey(MessageId),
+  /** Edit the last progress bubble into the first text bubble instead of sending a new message. */
+  replaceProgress: Schema.optionalKey(Schema.Boolean),
 })
 export const ReplyResult = Schema.Struct({ turnId: TurnId, sentMessageIds: Schema.Array(MessageId) })
+
+export const ProgressPayload = Schema.Struct({
+  /** An interim bubble ("still checking"). The reply can edit it later with `replaceProgress`. */
+  text: Schema.optionalKey(Schema.String.pipe(Schema.check(Schema.isNonEmpty()))),
+  /** Push the reply deadline this far out from now (default `BRIDGE_TURN_TIMEOUT`), never past one hour after opening. */
+  extendBy: Schema.optionalKey(Schema.DurationFromString),
+})
+export const ProgressResult = Schema.Struct({
+  turnId: TurnId,
+  deadline: Schema.DateTimeUtcFromString,
+  typingUntil: Schema.DateTimeUtcFromString,
+  progressMessageId: Schema.optionalKey(MessageId),
+})
+export const AbandonPayload = Schema.Struct({
+  reason: Schema.String.pipe(Schema.check(Schema.isNonEmpty())),
+  /** Replaces `BRIDGE_FAILURE_TEXT` for this turn. An empty string sends nothing. */
+  text: Schema.optionalKey(Schema.String),
+})
 
 const chatParams = { chatId: ChatId }
 const messageParams = { chatId: ChatId, messageId: MessageId }
@@ -57,13 +85,22 @@ export const ChatsGroup = HttpApiGroup.make("chats").add(
     params: chatParams,
     payload: SendTextPayload,
     success: SentMessage,
-    error: [NotConnected, SendFailed],
+    error: [NotConnected, SendFailed, MessageUnknown],
+  }),
+  HttpApiEndpoint.patch("edit", "/chats/:chatId/messages/:messageId", {
+    params: messageParams,
+    payload: EditPayload,
+    error: [NotConnected, SendFailed, MessageUnknown, MessageTooOld],
+  }),
+  HttpApiEndpoint.delete("deleteMessage", "/chats/:chatId/messages/:messageId", {
+    params: messageParams,
+    error: [NotConnected, SendFailed, MessageUnknown, MessageTooOld],
   }),
   HttpApiEndpoint.post("sendMedia", "/chats/:chatId/media", {
     params: chatParams,
     payload: OutboundMediaPayload,
     success: SentMessage,
-    error: [NotConnected, SendFailed, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge],
+    error: [NotConnected, SendFailed, MessageUnknown, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge],
   }),
   HttpApiEndpoint.post("react", "/chats/:chatId/messages/:messageId/reactions", {
     params: messageParams,
@@ -99,6 +136,17 @@ export const TurnsGroup = HttpApiGroup.make("turns").add(
     payload: ReplyPayload,
     success: ReplyResult,
     error: [TurnNotFound, TurnSuperseded, TurnNotAwaitingReply, TurnFailedError, OutboundInvalid, OutboundFileUnreadable, OutboundTooLarge],
+  }),
+  HttpApiEndpoint.post("progress", "/turns/:turnId/progress", {
+    params: turnParams,
+    payload: ProgressPayload,
+    success: ProgressResult,
+    error: [TurnNotFound, TurnNotOpen, NotConnected, SendFailed],
+  }),
+  HttpApiEndpoint.post("abandon", "/turns/:turnId/abandon", {
+    params: turnParams,
+    payload: AbandonPayload,
+    error: [TurnNotFound, TurnNotOpen],
   }),
 )
 

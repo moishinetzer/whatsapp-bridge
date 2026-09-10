@@ -42,8 +42,24 @@ export const BridgeEvent = Schema.TaggedUnion({
   TurnSuperseded: { ...envelope, turnId: TurnId, chatId: ChatId, by: TurnId },
   /** The reply went out and the 👀 reactions were cleared. */
   TurnCompleted: { ...envelope, turnId: TurnId, chatId: ChatId, sentMessageIds: Schema.Array(MessageId) },
-  /** The turn could not be answered (responder failed, timed out, or sending failed). 👀 stays. */
+  /** The turn could not be answered (responder failed, timed out, sending failed, or the agent abandoned it). The eye comes off and the failure text goes out. */
   TurnFailed: { ...envelope, turnId: TurnId, chatId: ChatId, reason: Schema.String },
+  /** Every message of the turn was deleted by its sender before it was answered. Nothing is sent. */
+  TurnCancelled: { ...envelope, turnId: TurnId, chatId: ChatId, reason: Schema.String },
+  /** Someone reacted to a message in a handled chat. Empty `emoji` means the reaction was removed. Never opens a turn. */
+  ReactionReceived: {
+    ...envelope,
+    chatId: ChatId,
+    messageId: MessageId,
+    senderId: Schema.String,
+    emoji: Schema.String,
+    /** True when the reacted-to message is one the bridge sent. */
+    onOurMessage: Schema.Boolean,
+  },
+  /** The sender edited a message the bridge had accepted. `text` is the new body. */
+  MessageEdited: { ...envelope, chatId: ChatId, messageId: MessageId, text: Schema.String },
+  /** The sender deleted a message the bridge had accepted ("delete for everyone"). */
+  MessageDeleted: { ...envelope, chatId: ChatId, messageId: MessageId },
   /** Connection state changed; mirrors `GET /health`. */
   ConnectionChanged: { ...envelope, state: BridgeState, detail: Schema.optionalKey(Schema.String) },
 })

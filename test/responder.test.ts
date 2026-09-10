@@ -48,8 +48,8 @@ describe("http responder", () => {
       expect(answer._tag).toBe("Replies")
       if (answer._tag !== "Replies") return
       expect(answer.replies.length).toBe(3)
-      expect(answer.replies[0]).toBe("first")
-      expect(answer.replies[1]).toBe("second")
+      expect(answer.replies[0]).toEqual({ text: "first" })
+      expect(answer.replies[1]).toEqual({ text: "second" })
       const file = answer.replies[2]
       expect(file !== undefined && isMedia(file) && file.kind === "image" && file.caption === "third").toBe(true)
       const posted = yield* Ref.get(handler.requests)

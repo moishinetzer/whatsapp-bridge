@@ -1,7 +1,9 @@
 import { describe, expect, it } from "@effect/vitest"
-import { Deferred, Duration, Effect, Fiber, Latch, Option, Queue, Ref, Stream } from "effect"
+import { DateTime, Deferred, Duration, Effect, Fiber, Latch, Option, Queue, Ref, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import type { BridgeEvent } from "../src/domain/events.ts"
+import { outgoing, text } from "../src/domain/outbound.ts"
+import { MessageId } from "../src/domain/ids.ts"
 import { Events } from "../src/engine/Events.ts"
 import { HandlerFailed } from "../src/engine/Responder.ts"
 import { MediaStore } from "../src/engine/Media.ts"
@@ -64,9 +66,13 @@ describe("TurnEngine", () => {
       const m1 = message("first")
       const m2 = message("second")
       yield* wa.deliver(m1)
-      expect((yield* takeSoon(wa.reactions)).emoji).toBe("👀")
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "👀" })
+      expect(yield* takeSoon(wa.reads)).toMatchObject({ messageId: m1.messageId })
       yield* wa.deliver(m2)
-      expect((yield* takeSoon(wa.reactions)).emoji).toBe("👀")
+      // The eye moves: off the first message, onto the newest.
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "" })
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m2.messageId, emoji: "👀" })
+      expect(yield* takeSoon(wa.reads)).toMatchObject({ messageId: m2.messageId })
       yield* settle
       expect(Option.isNone(yield* Queue.poll(responder.calls))).toBe(true)
 
@@ -77,11 +83,9 @@ describe("TurnEngine", () => {
       expect(call.supersedes).toBeUndefined()
 
       yield* takeSoon(wa.sent)
-      const cleared = [yield* takeSoon(wa.reactions), yield* takeSoon(wa.reactions)]
-      expect(cleared.map((r) => [r.messageId, r.emoji])).toEqual([
-        [m1.messageId, ""],
-        [m2.messageId, ""],
-      ])
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m2.messageId, emoji: "" })
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.reactions))).toBe(true)
     }).pipe(Effect.provide(EngineTestLayer({ batchWindow: Duration.seconds(1) }))),
   )
 
@@ -102,7 +106,8 @@ describe("TurnEngine", () => {
 
       const m2 = message("actually, the other thing")
       yield* wa.deliver(m2)
-      expect((yield* takeSoon(wa.reactions)).emoji).toBe("👀")
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "" })
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m2.messageId, emoji: "👀" })
 
       const second = yield* takeSoon(responder.calls)
       expect(second.turnId).not.toBe(first.turnId)
@@ -118,8 +123,7 @@ describe("TurnEngine", () => {
       expect(sent.text).toBe("late answer")
       yield* settle
       expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
-      const cleared = [yield* takeSoon(wa.reactions), yield* takeSoon(wa.reactions)]
-      expect(cleared.map((r) => r.messageId).sort()).toEqual([m1.messageId, m2.messageId].sort())
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m2.messageId, emoji: "" })
 
       const seen = yield* events
       expect(seen.map((e) => e._tag)).toEqual(["TurnOpened", "TurnSuperseded", "TurnOpened", "TurnCompleted"])
@@ -143,7 +147,8 @@ describe("TurnEngine", () => {
 
       const m2 = message("two")
       yield* wa.deliver(m2)
-      expect((yield* takeSoon(wa.reactions)).emoji).toBe("👀")
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "" })
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m2.messageId, emoji: "👀" })
       yield* settle
       expect(Option.isNone(yield* Queue.poll(responder.calls))).toBe(true)
 
@@ -151,7 +156,6 @@ describe("TurnEngine", () => {
       yield* latch.open
 
       expect((yield* takeSoon(wa.sent)).text).toBe("pong")
-      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "" })
 
       const second = yield* takeSoon(responder.calls)
       expect(second.turnId).not.toBe(first.turnId)
@@ -166,7 +170,7 @@ describe("TurnEngine", () => {
     }).pipe(Effect.provide(EngineTestLayer())),
   )
 
-  it.effect("a failed responder fails the turn, leaves 👀 on, and the next message starts clean", () =>
+  it.effect("a failed responder fails the turn, takes the eye off, sends the failure text, and the next message starts clean", () =>
     Effect.gen(function* () {
       const wa = yield* FakeWhatsApp
       const responder = yield* TestResponder
@@ -184,6 +188,9 @@ describe("TurnEngine", () => {
       const failed = seen[1]
       expect(failed?._tag === "TurnFailed" && failed.reason).toBe("responder failed: boom")
       expect((yield* registry.get(call.turnId)).state).toBe("failed")
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "" })
+      const apology = yield* takeSoon(wa.sent)
+      expect(apology).toMatchObject({ text: "Something went wrong.", quoteMessageId: m1.messageId })
       yield* settle
       expect(Option.isNone(yield* Queue.poll(wa.reactions))).toBe(true)
       expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
@@ -251,7 +258,7 @@ describe("TurnEngine", () => {
       const responder = yield* TestResponder
       const registry = yield* TurnRegistry
       const chart = png()
-      yield* Ref.set(responder.behaviour, () => Effect.succeed({ _tag: "Replies", replies: ["here is the chart", chart, "and a note"] } as const))
+      yield* Ref.set(responder.behaviour, () => Effect.succeed({ _tag: "Replies", replies: outgoing(["here is the chart", chart, "and a note"]) } as const))
 
       const m1 = message("chart please")
       yield* wa.deliver(m1)
@@ -360,6 +367,7 @@ describe("TurnEngine hardening", () => {
       // typing was switched off again
       const typing = yield* Ref.get(wa.typing)
       expect(typing.at(-1)?.composing).toBe(false)
+      expect((yield* takeSoon(wa.sent)).text).toBe("Something went wrong.")
 
       yield* Ref.set(responder.behaviour, () => Effect.succeed(replies("alive")))
       yield* wa.deliver(message("still there?"))
@@ -538,5 +546,237 @@ describe("TurnEngine media", () => {
       expect(call.messages[0]?.media).toBeUndefined()
       expect(yield* Ref.get(wa.downloads)).toBe(0)
     }).pipe(Effect.provide(EngineTestLayer({ mediaAuto: "none" }))),
+  )
+})
+
+describe("TurnEngine: edits, deletes, reactions", () => {
+  it.effect("an edit while batching reaches the responder as the corrected text", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const events = yield* collectEvents(1)
+      const m1 = message("teh calendar")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      yield* wa.inject({ _tag: "Edited", chatId: chat, messageId: m1.messageId, text: "the calendar" })
+      expect((yield* events).map((e) => e._tag)).toEqual(["MessageEdited"])
+      yield* TestClock.adjust("1 second")
+      const call = yield* takeSoon(responder.calls)
+      expect(call.messages.map((m) => m.text)).toEqual(["the calendar"])
+      yield* takeSoon(wa.sent)
+    }).pipe(Effect.provide(EngineTestLayer({ batchWindow: Duration.seconds(1) }))),
+  )
+
+  it.effect("an edit while awaiting supersedes the turn with the corrected text", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      const m1 = message("book tuesday")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const first = yield* takeSoon(responder.calls)
+      yield* settle
+      yield* wa.inject({ _tag: "Edited", chatId: chat, messageId: m1.messageId, text: "book thursday" })
+      const second = yield* takeSoon(responder.calls)
+      expect(second.supersedes).toBe(first.turnId)
+      expect(second.messages.map((m) => m.text)).toEqual(["book thursday"])
+      expect((yield* registry.get(first.turnId)).state).toBe("superseded")
+      yield* settle
+      const refused = yield* registry.reply(first.turnId, ["tuesday it is"]).pipe(Effect.flip)
+      expect(refused._tag).toBe("TurnSuperseded")
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("deleting the only message of an open turn cancels it without a failure text", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      const events = yield* collectEvents(3)
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      const m1 = message("never mind")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      yield* wa.inject({ _tag: "Deleted", chatId: chat, messageId: m1.messageId })
+      const seen = yield* events
+      expect(seen.map((e) => e._tag)).toEqual(["TurnOpened", "MessageDeleted", "TurnCancelled"])
+      expect((yield* registry.get(call.turnId)).state).toBe("cancelled")
+      expect(yield* registry.openCount).toBe(0)
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.sent))).toBe(true)
+      expect(Option.isNone(yield* Queue.poll(wa.reactions))).toBe(true)
+      const late = yield* registry.reply(call.turnId, ["too late"]).pipe(Effect.flip)
+      expect(late._tag).toBe("TurnNotAwaitingReply")
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("deleting the newest message while batching moves the eye back and folds the rest", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const m1 = message("first")
+      const m2 = message("second")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      yield* wa.deliver(m2)
+      yield* takeSoon(wa.reactions)
+      yield* takeSoon(wa.reactions)
+      yield* wa.inject({ _tag: "Deleted", chatId: chat, messageId: m2.messageId })
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "👀" })
+      yield* TestClock.adjust("1 second")
+      const call = yield* takeSoon(responder.calls)
+      expect(call.messages.map((m) => m.text)).toEqual(["first"])
+      yield* takeSoon(wa.sent)
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "" })
+    }).pipe(Effect.provide(EngineTestLayer({ batchWindow: Duration.seconds(1) }))),
+  )
+
+  it.effect("a reaction becomes an event and opens nothing", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      const events = yield* collectEvents(1)
+      yield* wa.inject({ _tag: "Reaction", chatId: chat, messageId: MessageId.make("out_9"), senderId: chat, emoji: "👍", onOurMessage: true })
+      const seen = yield* events
+      expect(seen[0]).toMatchObject({ _tag: "ReactionReceived", emoji: "👍", onOurMessage: true, messageId: "out_9" })
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(responder.calls))).toBe(true)
+      expect(yield* registry.openCount).toBe(0)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("read receipts can be switched off", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      yield* wa.deliver(message("hi"))
+      yield* takeSoon(wa.reactions)
+      yield* takeSoon(responder.calls)
+      yield* takeSoon(wa.sent)
+      yield* settle
+      expect(Option.isNone(yield* Queue.poll(wa.reads))).toBe(true)
+    }).pipe(Effect.provide(EngineTestLayer({ readReceipts: false }))),
+  )
+})
+
+describe("TurnEngine: progress, abandon, quoting", () => {
+  it.effect("abandon fails the turn with the reason and the agent's own text", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      const events = yield* collectEvents(2)
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      const m1 = message("do something impossible")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      yield* registry.abandon(call.turnId, "needs the app", "This needs the app.")
+      const seen = yield* events
+      expect(seen[1]).toMatchObject({ _tag: "TurnFailed", reason: "abandoned: needs the app" })
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "" })
+      expect(yield* takeSoon(wa.sent)).toMatchObject({ text: "This needs the app.", quoteMessageId: m1.messageId })
+      expect((yield* registry.get(call.turnId)).state).toBe("failed")
+      const again = yield* registry.abandon(call.turnId, "twice").pipe(Effect.flip)
+      expect(again._tag).toBe("TurnNotOpen")
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("progress pushes the reply deadline out, but never past an hour", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      const events = yield* collectEvents(2)
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      yield* wa.deliver(message("slow one"))
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      // The turn timeout is one minute in tests. At 50 s the agent reports progress for another minute.
+      yield* TestClock.adjust("50 seconds")
+      const before = yield* registry.progress(call.turnId, { extendBy: Duration.minutes(1) })
+      yield* TestClock.adjust("40 seconds")
+      expect((yield* registry.get(call.turnId)).state).toBe("awaiting")
+      // A request for a day is capped at one hour after opening.
+      const capped = yield* registry.progress(call.turnId, { extendBy: Duration.days(1) })
+      expect(DateTime.toEpochMillis(capped.deadline) - DateTime.toEpochMillis(before.deadline)).toBeLessThanOrEqual(Duration.toMillis(Duration.hours(1)))
+      yield* TestClock.adjust("61 minutes")
+      const seen = yield* events
+      expect(seen[1]).toMatchObject({ _tag: "TurnFailed" })
+      expect(seen[1]?._tag === "TurnFailed" && seen[1].reason).toContain("no reply within")
+      yield* takeSoon(wa.reactions)
+      yield* takeSoon(wa.sent)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("replaceProgress edits the interim bubble into the first reply bubble", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      const m1 = message("look this up")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      yield* registry.progress(call.turnId, { progressMessageId: MessageId.make("progress_1") })
+      const ids = yield* registry.reply(call.turnId, [text("Found it: Tuesday."), text("Anything else?")], { replaceProgress: true })
+      expect(yield* takeSoon(wa.edits)).toEqual({ chatId: chat, messageId: "progress_1", text: "Found it: Tuesday." })
+      expect((yield* takeSoon(wa.sent)).text).toBe("Anything else?")
+      expect(ids[0]).toBe("progress_1")
+      expect(ids.length).toBe(2)
+      expect(yield* takeSoon(wa.reactions)).toMatchObject({ messageId: m1.messageId, emoji: "" })
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("keeps the typing indicator alive every 8 seconds until the turn ends", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      yield* wa.deliver(message("thinking time"))
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      const composing = () => Effect.map(Ref.get(wa.typing), (t) => t.filter((e) => e.composing).length)
+      expect(yield* composing()).toBe(1)
+      yield* TestClock.adjust("20 seconds")
+      expect(yield* composing()).toBe(3)
+      yield* registry.reply(call.turnId, ["done"])
+      yield* takeSoon(wa.sent)
+      yield* settle
+      const typing = yield* Ref.get(wa.typing)
+      expect(typing.at(-1)?.composing).toBe(false)
+    }).pipe(Effect.provide(EngineTestLayer())),
+  )
+
+  it.effect("a reply can quote a message; an unknown quote is dropped rather than failing the turn", () =>
+    Effect.gen(function* () {
+      const wa = yield* FakeWhatsApp
+      const responder = yield* TestResponder
+      const registry = yield* TurnRegistry
+      yield* Ref.set(responder.behaviour, () => Effect.succeed(external))
+      yield* Ref.set(wa.unknownQuotes, new Set([MessageId.make("gone")]))
+      const m1 = message("which one?")
+      yield* wa.deliver(m1)
+      yield* takeSoon(wa.reactions)
+      const call = yield* takeSoon(responder.calls)
+      yield* settle
+      const ids = yield* registry.reply(call.turnId, [text("this one", m1.messageId), text("not that", MessageId.make("gone"))])
+      expect(yield* takeSoon(wa.sent)).toMatchObject({ text: "this one", quoteMessageId: m1.messageId })
+      const second = yield* takeSoon(wa.sent)
+      expect(second.text).toBe("not that")
+      expect(second.quoteMessageId).toBeUndefined()
+      expect(ids.length).toBe(2)
+    }).pipe(Effect.provide(EngineTestLayer())),
   )
 })

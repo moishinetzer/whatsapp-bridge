@@ -155,10 +155,18 @@ const fileFlags = {
   ),
 }
 
-const attachment = (file: string, caption: Option.Option<string>, as: Option.Option<OutboundKind>): OutboundMediaPayload => ({
+const quoteFlag = Flag.string("quote").pipe(Flag.optional, Flag.withDescription("Send as a reply to this message id"))
+
+const attachment = (
+  file: string,
+  caption: Option.Option<string>,
+  as: Option.Option<OutboundKind>,
+  quote: Option.Option<string> = Option.none(),
+): OutboundMediaPayload => ({
   path: file,
   ...(Option.isSome(caption) ? { caption: caption.value } : {}),
   ...(Option.isSome(as) ? { kind: as.value } : {}),
+  ...(Option.isSome(quote) ? { quoteMessageId: MessageId.make(quote.value) } : {}),
 })
 
 const send = Command.make(
@@ -167,17 +175,72 @@ const send = Command.make(
     to: Flag.string("to").pipe(Flag.withDescription("Chat jid or phone number with country code")),
     text: Flag.string("text").pipe(Flag.optional, Flag.withDescription("The message; with --file, use --caption instead")),
     ...fileFlags,
+    quote: quoteFlag,
   },
-  ({ to, text, file, caption, as }) =>
+  ({ to, text, file, caption, as, quote }) =>
     Effect.gen(function* () {
       const chatId = toChatId(to)
       if (Option.isSome(file)) {
-        return yield* withClient((client) => client.chats.sendMedia({ params: { chatId }, payload: attachment(file.value, caption, as) }))
+        return yield* withClient((client) => client.chats.sendMedia({ params: { chatId }, payload: attachment(file.value, caption, as, quote) }))
       }
-      if (Option.isSome(text)) return yield* withClient((client) => client.chats.send({ params: { chatId }, payload: { text: text.value } }))
+      if (Option.isSome(text)) {
+        const payload = { text: text.value, ...(Option.isSome(quote) ? { quoteMessageId: MessageId.make(quote.value) } : {}) }
+        return yield* withClient((client) => client.chats.send({ params: { chatId }, payload }))
+      }
       return yield* new NothingToSend({ hint: "pass --text or --file" })
     }).pipe(Effect.flatMap(json)),
 ).pipe(Command.withDescription("Send a text message or a file to a chat"))
+
+const edit = Command.make(
+  "edit",
+  { chat: Flag.string("chat"), message: Flag.string("message").pipe(Flag.withDescription("Id of a message the bridge sent")), text: Flag.string("text") },
+  ({ chat, message, text }) =>
+    withClient((client) =>
+      client.chats.edit({ params: { chatId: toChatId(chat), messageId: MessageId.make(message) }, payload: { text } }),
+    ).pipe(Effect.andThen(json({ ok: true }))),
+).pipe(Command.withDescription("Edit a message the bridge sent (WhatsApp allows it for 15 minutes)"))
+
+const del = Command.make(
+  "delete",
+  { chat: Flag.string("chat"), message: Flag.string("message").pipe(Flag.withDescription("Id of a message the bridge sent")) },
+  ({ chat, message }) =>
+    withClient((client) => client.chats.deleteMessage({ params: { chatId: toChatId(chat), messageId: MessageId.make(message) } })).pipe(
+      Effect.andThen(json({ ok: true })),
+    ),
+).pipe(Command.withDescription("Delete for everyone a message the bridge sent (WhatsApp allows it for about 2 days)"))
+
+const progress = Command.make(
+  "progress",
+  {
+    turn: Flag.string("turn"),
+    text: Flag.string("text").pipe(Flag.optional, Flag.withDescription("An interim bubble, e.g. \"still checking\"")),
+    extend: Flag.string("extend").pipe(
+      Flag.withSchema(Schema.DurationFromString),
+      Flag.optional,
+      Flag.withDescription("Push the reply deadline this far out, e.g. \"20 minutes\""),
+    ),
+  },
+  ({ turn, text, extend }) =>
+    withClient((client) =>
+      client.turns.progress({
+        params: { turnId: TurnId.make(turn) },
+        payload: { ...(Option.isSome(text) ? { text: text.value } : {}), ...(Option.isSome(extend) ? { extendBy: extend.value } : {}) },
+      }),
+    ).pipe(Effect.flatMap(json)),
+).pipe(Command.withDescription("Tell the bridge a turn is still being worked on: keeps typing alive and extends the deadline"))
+
+const abandon = Command.make(
+  "abandon",
+  {
+    turn: Flag.string("turn"),
+    reason: Flag.string("reason"),
+    text: Flag.string("text").pipe(Flag.optional, Flag.withDescription("What the user is told instead of BRIDGE_FAILURE_TEXT")),
+  },
+  ({ turn, reason, text }) =>
+    withClient((client) =>
+      client.turns.abandon({ params: { turnId: TurnId.make(turn) }, payload: { reason, ...(Option.isSome(text) ? { text: text.value } : {}) } }),
+    ).pipe(Effect.andThen(json({ ok: true }))),
+).pipe(Command.withDescription("Give up on an open turn: it fails with the reason and the user gets the failure text"))
 
 const react = Command.make(
   "react",
@@ -223,13 +286,17 @@ const reply = Command.make(
     turn: Flag.string("turn"),
     text: Flag.string("text").pipe(Flag.optional, Flag.withDescription("The reply text; omit it to answer with just the file")),
     ...fileFlags,
+    quote: quoteFlag,
+    replaceProgress: Flag.boolean("replace-progress").pipe(Flag.withDescription("Edit the last progress bubble into the reply instead of sending a new one")),
   },
-  ({ turn, text, file, caption, as }) =>
+  ({ turn, text, file, caption, as, quote, replaceProgress }) =>
     Effect.gen(function* () {
       if (Option.isNone(text) && Option.isNone(file)) return yield* new NothingToSend({ hint: "pass --text and/or --file" })
       const payload = {
         ...(Option.isSome(text) ? { text: text.value } : {}),
         ...(Option.isSome(file) ? { attachments: [attachment(file.value, caption, as)] } : {}),
+        ...(Option.isSome(quote) ? { quoteMessageId: MessageId.make(quote.value) } : {}),
+        ...(replaceProgress ? { replaceProgress: true } : {}),
       }
       return yield* withClient((client) => client.turns.reply({ params: { turnId: TurnId.make(turn) }, payload }))
     }).pipe(Effect.flatMap(json)),
@@ -249,7 +316,7 @@ const unlink = Command.make(
 
 const bridge = Command.make("bridge").pipe(
   Command.withDescription("WhatsApp ↔ Intro bridge on a dedicated number"),
-  Command.withSubcommands([link, run, harness, health, send, react, unreact, media, turns, reply, unlink]),
+  Command.withSubcommands([link, run, harness, health, send, edit, del, react, unreact, media, turns, reply, progress, abandon, unlink]),
 )
 
 /** The whole CLI, needing only the Node platform services. */

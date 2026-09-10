@@ -1,4 +1,13 @@
-import { getContentType, isJidBroadcast, isJidGroup, isJidNewsletter, normalizeMessageContent, type WAMessage, type WAMessageKey } from "@whiskeysockets/baileys"
+import {
+  getContentType,
+  isJidBroadcast,
+  isJidGroup,
+  isJidNewsletter,
+  normalizeMessageContent,
+  type WAMessage,
+  type WAMessageKey,
+  type proto,
+} from "@whiskeysockets/baileys"
 import { DateTime, Option } from "effect"
 import { ChatId, MessageId, phoneOfJid } from "../domain/ids.ts"
 import { InboundMessage, type MessageKind } from "../domain/message.ts"
@@ -53,6 +62,15 @@ const toMillis = (ts: WAMessage["messageTimestamp"]): number | undefined => {
   return undefined
 }
 
+/** The body of a message, or the caption of its attachment. */
+export const textOf = (content: proto.IMessage): string | undefined =>
+  content.conversation ??
+  content.extendedTextMessage?.text ??
+  content.imageMessage?.caption ??
+  content.videoMessage?.caption ??
+  content.documentMessage?.caption ??
+  undefined
+
 /**
  * Turns a raw WhatsApp message into the bridge's `InboundMessage`, or `None`
  * when it is not something Intro should ever see: our own sends (echoes),
@@ -73,13 +91,7 @@ export const extractInbound = (msg: WAMessage, now: DateTime.Utc): Option.Option
   const kind = kindOf(contentType)
   if (kind === undefined) return Option.none()
 
-  const text =
-    content.conversation ??
-    content.extendedTextMessage?.text ??
-    content.imageMessage?.caption ??
-    content.videoMessage?.caption ??
-    content.documentMessage?.caption ??
-    undefined
+  const text = textOf(content)
 
   const mimetype =
     content.imageMessage?.mimetype ??

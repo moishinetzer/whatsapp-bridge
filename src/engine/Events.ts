@@ -44,6 +44,13 @@ const describe = (event: BridgeEvent): Record<string, unknown> => {
       return { turnId: event.turnId, chatId: event.chatId, reason: event.reason }
     case "ConnectionChanged":
       return { state: event.state, detail: event.detail }
+    case "TurnCancelled":
+      return { turnId: event.turnId, chatId: event.chatId, reason: event.reason }
+    case "ReactionReceived":
+      return { chatId: event.chatId, messageId: event.messageId, senderId: event.senderId, emoji: event.emoji, onOurMessage: event.onOurMessage }
+    case "MessageEdited":
+    case "MessageDeleted":
+      return { chatId: event.chatId, messageId: event.messageId }
   }
 }
 

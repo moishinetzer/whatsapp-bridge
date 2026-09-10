@@ -35,6 +35,12 @@ export const splitText = (text: string, limit: number = MAX_MESSAGE_CHARS): Read
 export const prepareReplies = (replies: ReadonlyArray<string>, limit: number = MAX_MESSAGE_CHARS): ReadonlyArray<string> =>
   replies.flatMap((r) => splitText(r, limit))
 
-/** The same for a mixed reply: text bubbles are cleaned and split, files pass through in place. */
+/** The same for a mixed reply: text bubbles are cleaned and split (the first chunk keeps the quote), files pass through in place. */
 export const prepareOutgoing = (items: ReadonlyArray<Outgoing>, limit: number = MAX_MESSAGE_CHARS): ReadonlyArray<Outgoing> =>
-  items.flatMap((item): ReadonlyArray<Outgoing> => (isMedia(item) ? [item] : splitText(item, limit)))
+  items.flatMap((item): ReadonlyArray<Outgoing> =>
+    isMedia(item)
+      ? [item]
+      : splitText(item.text, limit).map((text, i) =>
+          i === 0 && item.quoteMessageId !== undefined ? { text, quoteMessageId: item.quoteMessageId } : { text },
+        ),
+  )

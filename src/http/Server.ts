@@ -10,8 +10,9 @@ import { Health } from "../engine/Health.ts"
 import { MediaStore, MediaStoreError } from "../engine/Media.ts"
 import { Outbound } from "../engine/Outbound.ts"
 import type { Outgoing } from "../domain/outbound.ts"
-import { TurnRegistry } from "../engine/Turns.ts"
-import { WhatsApp } from "../whatsapp/WhatsApp.ts"
+import type { MessageId } from "../domain/ids.ts"
+import { TurnNotOpen, TurnRegistry } from "../engine/Turns.ts"
+import { SendFailed, WhatsApp } from "../whatsapp/WhatsApp.ts"
 import { EVENT_SCHEMA_VERSION, type BridgeEvent } from "../domain/events.ts"
 import { BridgeApi, Unhealthy } from "./Api.ts"
 
@@ -63,10 +64,12 @@ export const ChatsGroupLive = HttpApiBuilder.group(BridgeApi, "chats", (handlers
     .handle("send", ({ params, payload }) =>
       Effect.gen(function* () {
         const whatsapp = yield* WhatsApp
-        const messageId = yield* whatsapp.sendText(params.chatId, payload.text)
+        const messageId = yield* whatsapp.sendText(params.chatId, payload.text, { quoteMessageId: payload.quoteMessageId })
         return { chatId: params.chatId, messageId }
       }),
     )
+    .handle("edit", ({ params, payload }) => WhatsApp.use((w) => w.editText(params.chatId, params.messageId, payload.text)))
+    .handle("deleteMessage", ({ params }) => WhatsApp.use((w) => w.deleteMessage(params.chatId, params.messageId)))
     .handle("sendMedia", ({ params, payload }) =>
       Effect.gen(function* () {
         const outbound = yield* Outbound
@@ -102,11 +105,41 @@ export const TurnsGroupLive = HttpApiBuilder.group(BridgeApi, "turns", (handlers
         // Files are read and checked before the turn is touched, so a bad path is a 4xx and the turn stays open.
         yield* registry.get(params.turnId)
         const files = yield* Effect.forEach(payload.attachments ?? [], outbound.load)
-        const replies: ReadonlyArray<Outgoing> = [...(payload.replies ?? []), ...(payload.text ? [payload.text] : []), ...files]
-        const sentMessageIds = yield* registry.reply(params.turnId, replies)
+        const bubbles: Array<Outgoing> = [
+          ...(payload.replies ?? []).map((item): Outgoing => (typeof item === "string" ? { text: item } : item)),
+          ...(payload.text ? [{ text: payload.text }] : []),
+        ]
+        // The reply-level quote goes on the first bubble unless that bubble brought its own.
+        const first = bubbles[0]
+        if (payload.quoteMessageId !== undefined && first !== undefined && !("bytes" in first) && first.quoteMessageId === undefined) {
+          bubbles[0] = { ...first, quoteMessageId: payload.quoteMessageId }
+        }
+        const sentMessageIds = yield* registry.reply(params.turnId, [...bubbles, ...files], { replaceProgress: payload.replaceProgress })
         return { turnId: params.turnId, sentMessageIds }
       }),
-    ),
+    )
+    .handle("progress", ({ params, payload }) =>
+      Effect.gen(function* () {
+        const registry = yield* TurnRegistry
+        const whatsapp = yield* WhatsApp
+        const turn = yield* registry.get(params.turnId)
+        if (turn.state !== "responding" && turn.state !== "awaiting") return yield* new TurnNotOpen({ turnId: params.turnId, state: turn.state })
+        let progressMessageId: MessageId | undefined
+        if (payload.text !== undefined) {
+          progressMessageId = yield* whatsapp
+            .sendText(turn.chatId, payload.text)
+            .pipe(Effect.catchTag("MessageUnknown", (e) => new SendFailed({ operation: "progress", chatId: turn.chatId, detail: e.message })))
+        }
+        const result = yield* registry.progress(params.turnId, { extendBy: payload.extendBy, progressMessageId })
+        return {
+          turnId: params.turnId,
+          deadline: result.deadline,
+          typingUntil: result.typingUntil,
+          ...(progressMessageId === undefined ? {} : { progressMessageId }),
+        }
+      }),
+    )
+    .handle("abandon", ({ params, payload }) => TurnRegistry.use((r) => r.abandon(params.turnId, payload.reason, payload.text))),
 )
 
 /**

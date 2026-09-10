@@ -9,10 +9,13 @@ import makeWASocket, {
   getContentType,
   normalizeMessageContent,
   isJidBroadcast,
+  isJidGroup,
   isJidNewsletter,
   type ConnectionState,
+  WAMessageStubType,
   type WAMessage,
   type WAMessageKey,
+  type WAMessageUpdate,
   type WASocket,
   type WAVersion,
   type proto,
@@ -25,7 +28,7 @@ interface LongLike {
 }
 import qrcode from "qrcode-terminal"
 import { BridgeConfig } from "../config.ts"
-import { phoneOfJid, type ChatId, type MessageId } from "../domain/ids.ts"
+import { ChatId, MessageId, phoneOfJid } from "../domain/ids.ts"
 import type { InboundMessage } from "../domain/message.ts"
 import type { OutboundMedia } from "../domain/outbound.ts"
 import type { LinkedIdentity } from "../domain/status.ts"
@@ -33,15 +36,18 @@ import { Events } from "../engine/Events.ts"
 import { Health } from "../engine/Health.ts"
 import { AuthStore } from "./AuthStore.ts"
 import { isBaileysLogLevel, makeBaileysLogger } from "./BaileysLogger.ts"
-import { extractInbound, type Extracted } from "./extract.ts"
+import { extractInbound, textOf, type Extracted } from "./extract.ts"
 import {
   MediaDownloadFailed,
   MediaTooLarge,
   MediaUnavailable,
+  MessageTooOld,
+  MessageUnknown,
   NotConnected,
   SendFailed,
   WhatsApp,
   type DownloadedMedia,
+  type InboundUpdate,
   type SendOptions,
 } from "./WhatsApp.ts"
 
@@ -61,6 +67,12 @@ type SocketEvent =
   | { readonly _tag: "Connection"; readonly update: Partial<ConnectionState> }
   | { readonly _tag: "Creds" }
   | { readonly _tag: "Messages"; readonly messages: ReadonlyArray<WAMessage>; readonly type: "append" | "notify" }
+  | { readonly _tag: "Updates"; readonly updates: ReadonlyArray<WAMessageUpdate> }
+  | { readonly _tag: "Reactions"; readonly reactions: ReadonlyArray<{ readonly key: WAMessageKey; readonly reaction: proto.IReaction }> }
+
+/** WhatsApp's own limits on touching a sent message. */
+const EDIT_WINDOW = Duration.minutes(15)
+const DELETE_WINDOW = Duration.days(2)
 
 export type CloseOutcome =
   | { readonly _tag: "Reconnect"; readonly immediate: boolean; readonly detail: string; readonly uptime: Duration.Duration }
@@ -171,12 +183,13 @@ export const BaileysLive = (options: BaileysOptions) =>
       yield* auth.lock
 
       const inbound = yield* Queue.unbounded<InboundMessage>()
+      const updates = yield* Queue.unbounded<InboundUpdate>()
       const socket = yield* Ref.make<Option.Option<WASocket>>(Option.none())
       const linked = yield* Deferred.make<LinkedIdentity>()
-      // Reaction keys must carry `participant` / `fromMe`; remember the ones we saw.
-      const keys = yield* Cache.make<string, WAMessageKey>({
+      // Every accepted inbound message, raw: reactions need the full key, quoting and reading need the message.
+      const inboundRaw = yield* Cache.make<string, WAMessage>({
         capacity: 5_000,
-        lookup: (key) => Effect.die(`no key cached for ${key}`),
+        lookup: (key) => Effect.die(`no message cached for ${key}`),
       })
       // Idempotency: one 👀 and one turn per message, even if WhatsApp re-delivers.
       const seen = yield* Cache.make<string, true>({ capacity: 20_000, lookup: () => Effect.succeed(true) })
@@ -185,8 +198,8 @@ export const BaileysLive = (options: BaileysOptions) =>
         capacity: 2_000,
         lookup: (key) => Effect.die(`no media message cached for ${key}`),
       })
-      // What we sent recently, so WhatsApp's "resend this" requests can be honoured instead of leaving a phone on "waiting for this message".
-      const outbox = yield* Cache.make<string, proto.IMessage>({
+      // What we sent recently: answers WhatsApp's "resend this" requests, and is what edits, deletes and quotes of our own messages need.
+      const outbox = yield* Cache.make<string, { readonly raw: WAMessage; readonly sentAt: DateTime.Utc }>({
         capacity: 1_000,
         lookup: (id) => Effect.die(`not in outbox: ${id}`),
       })
@@ -207,12 +220,11 @@ export const BaileysLive = (options: BaileysOptions) =>
         ),
       )
 
-      const allowed = (message: InboundMessage): boolean => {
+      const allowedSender = (senderId: string, chatId: string, senderNumber: string | undefined): boolean => {
         if (config.allowedSenders.length === 0) return true
-        return config.allowedSenders.some(
-          (s) => s === message.senderId || s === message.chatId || (message.senderNumber !== undefined && s === message.senderNumber),
-        )
+        return config.allowedSenders.some((s) => s === senderId || s === chatId || (senderNumber !== undefined && s === senderNumber))
       }
+      const allowed = (message: InboundMessage): boolean => allowedSender(message.senderId, message.chatId, message.senderNumber)
 
       const decode = (raw: WAMessage, now: DateTime.Utc) =>
         Effect.try({ try: () => extractInbound(raw, now), catch: (e) => e }).pipe(
@@ -229,7 +241,7 @@ export const BaileysLive = (options: BaileysOptions) =>
           const now = yield* DateTime.now
           const extracted = yield* decode(raw, now)
           if (Option.isNone(extracted)) return
-          const { message, key } = extracted.value
+          const { message } = extracted.value
           const log = Effect.annotateLogs({ chatId: message.chatId, messageId: message.messageId, type })
 
           if (type === "append") {
@@ -253,13 +265,62 @@ export const BaileysLive = (options: BaileysOptions) =>
             return
           }
           yield* Cache.set(seen, id, true)
-          yield* Cache.set(keys, id, key)
+          yield* Cache.set(inboundRaw, id, raw)
           if (message.hasMedia) yield* Cache.set(rawMedia, id, { raw, message })
           yield* health.touch("inbound")
           yield* Effect.logInfo("inbound message").pipe(log, Effect.annotateLogs({ kind: message.kind, isGroup: message.isGroup }))
           if (config.logBodies) yield* Effect.logDebug("inbound body").pipe(log, Effect.annotateLogs({ text: message.text }))
           yield* events.publish({ _tag: "MessageReceived", message })
           yield* Queue.offer(inbound, message)
+        })
+
+      /** Edits and deletes of messages we accepted. Anything else (our own messages, unknown chats) is ignored. */
+      const acceptUpdate = (u: WAMessageUpdate) =>
+        Effect.gen(function* () {
+          const id = u.key.id ?? undefined
+          const chat = u.key.remoteJid ?? undefined
+          if (!id || !chat || u.key.fromMe) return
+          const cached = yield* Cache.getOption(inboundRaw, dedupeKey(ChatId.make(chat), MessageId.make(id)))
+          if (Option.isNone(cached)) return
+          const chatId = ChatId.make(chat)
+          const messageId = MessageId.make(id)
+          const log = Effect.annotateLogs({ chatId, messageId })
+          if (u.update.message === null || u.update.messageStubType === WAMessageStubType.REVOKE) {
+            yield* Effect.logInfo("message deleted by its sender").pipe(log)
+            yield* Queue.offer(updates, { _tag: "Deleted", chatId, messageId })
+            return
+          }
+          const edited = u.update.message?.editedMessage?.message ?? undefined
+          if (edited) {
+            const content = normalizeMessageContent(edited)
+            const text = content ? (textOf(content) ?? "") : ""
+            yield* Cache.set(inboundRaw, dedupeKey(chatId, messageId), { ...cached.value, message: edited })
+            yield* Effect.logInfo("message edited by its sender").pipe(log)
+            if (config.logBodies) yield* Effect.logDebug("edited body").pipe(log, Effect.annotateLogs({ text }))
+            yield* Queue.offer(updates, { _tag: "Edited", chatId, messageId, text })
+          }
+        })
+
+      /** Reactions in handled chats, ours excluded (the seen reaction comes back as an event too). */
+      const acceptReaction = (item: { readonly key: WAMessageKey; readonly reaction: proto.IReaction }) =>
+        Effect.gen(function* () {
+          const target = item.key
+          const reactor = item.reaction.key ?? undefined
+          const chat = target.remoteJid ?? undefined
+          const id = target.id ?? undefined
+          if (!chat || !id || reactor?.fromMe) return
+          if (isJidBroadcast(chat) || isJidNewsletter(chat)) return
+          const isGroup = isJidGroup(chat) === true
+          if (isGroup && !config.groups) return
+          const senderId = reactor?.participant ?? reactor?.remoteJid ?? chat
+          if (!allowedSender(senderId, chat, phoneOfJid(senderId))) return
+          const chatId = ChatId.make(chat)
+          const messageId = MessageId.make(id)
+          const emoji = item.reaction.text ?? ""
+          yield* Effect.logInfo(emoji === "" ? "reaction removed" : "reaction received").pipe(
+            Effect.annotateLogs({ chatId, messageId, senderId, emoji, onOurMessage: target.fromMe === true }),
+          )
+          yield* Queue.offer(updates, { _tag: "Reaction", chatId, messageId, senderId, emoji, onOurMessage: target.fromMe === true })
         })
 
       const showQr = (qr: string) =>
@@ -275,7 +336,7 @@ export const BaileysLive = (options: BaileysOptions) =>
         const id = key.id ?? undefined
         if (!id) return undefined
         const found = await Effect.runPromise(Cache.getOption(outbox, id))
-        return Option.getOrUndefined(found)
+        return Option.isSome(found) ? (found.value.raw.message ?? undefined) : undefined
       }
 
       /** One socket lifetime: connect, pump events, resolve when it closes (or, in link mode, when linked). */
@@ -317,6 +378,8 @@ export const BaileysLive = (options: BaileysOptions) =>
         sock.ev.on("connection.update", (update) => Queue.offerUnsafe(socketEvents, { _tag: "Connection", update }))
         sock.ev.on("creds.update", () => Queue.offerUnsafe(socketEvents, { _tag: "Creds" }))
         sock.ev.on("messages.upsert", ({ messages, type }) => Queue.offerUnsafe(socketEvents, { _tag: "Messages", messages, type }))
+        sock.ev.on("messages.update", (items) => Queue.offerUnsafe(socketEvents, { _tag: "Updates", updates: items }))
+        sock.ev.on("messages.reaction", (items) => Queue.offerUnsafe(socketEvents, { _tag: "Reactions", reactions: items }))
 
         const saveCreds = Effect.tryPromise(() => loaded.saveCreds()).pipe(
           Effect.retry({ schedule: Schedule.exponential("100 millis").pipe(Schedule.upTo({ times: 3 })) }),
@@ -406,6 +469,10 @@ export const BaileysLive = (options: BaileysOptions) =>
               return onConnection(event.update)
             case "Messages":
               return Effect.forEach(event.messages, (m) => acceptMessage(m, event.type), { discard: true })
+            case "Updates":
+              return Effect.forEach(event.updates, acceptUpdate, { discard: true })
+            case "Reactions":
+              return Effect.forEach(event.reactions, acceptReaction, { discard: true })
           }
         }
 
@@ -524,21 +591,60 @@ export const BaileysLive = (options: BaileysOptions) =>
         })
 
       const keyFor = (chatId: ChatId, messageId: MessageId) =>
-        Cache.getOption(keys, dedupeKey(chatId, messageId)).pipe(
-          Effect.map(Option.getOrElse((): WAMessageKey => ({ remoteJid: chatId, id: messageId, fromMe: false }))),
+        Cache.getOption(inboundRaw, dedupeKey(chatId, messageId)).pipe(
+          Effect.map(Option.match({ onNone: (): WAMessageKey => ({ remoteJid: chatId, id: messageId, fromMe: false }), onSome: (m) => m.key })),
         )
+
+      /** A message we saw or sent this run, for quoting. */
+      const rawFor = (chatId: ChatId, messageId: MessageId) =>
+        Effect.gen(function* () {
+          const theirs = yield* Cache.getOption(inboundRaw, dedupeKey(chatId, messageId))
+          if (Option.isSome(theirs)) return theirs.value
+          const ours = yield* Cache.getOption(outbox, messageId)
+          if (Option.isSome(ours) && ours.value.raw.key.remoteJid === chatId) return ours.value.raw
+          return yield* new MessageUnknown({ chatId, messageId, reason: "not a message the bridge saw or sent this run" })
+        })
+
+      const quoteFor = (chatId: ChatId, options?: SendOptions) =>
+        options?.quoteMessageId === undefined
+          ? Effect.succeed({} as { quoted?: WAMessage })
+          : Effect.map(rawFor(chatId, options.quoteMessageId), (quoted) => ({ quoted }))
+
+      /** One of our own messages, still inside WhatsApp's window for `operation`. */
+      const ownMessage = (chatId: ChatId, messageId: MessageId, operation: string, window: Duration.Duration) =>
+        Effect.gen(function* () {
+          const entry = yield* Cache.getOption(outbox, messageId)
+          if (Option.isNone(entry) || entry.value.raw.key.remoteJid !== chatId) {
+            return yield* new MessageUnknown({ chatId, messageId, reason: "not a message the bridge sent this run" })
+          }
+          const now = yield* DateTime.now
+          const ageMs = DateTime.toEpochMillis(now) - DateTime.toEpochMillis(entry.value.sentAt)
+          if (ageMs > Duration.toMillis(window)) {
+            return yield* new MessageTooOld({ chatId, messageId, operation, limitMs: Duration.toMillis(window), ageMs })
+          }
+          return entry.value.raw
+        })
+
+      const remember = (sent: WAMessage) =>
+        Effect.gen(function* () {
+          const id = sent.key.id ?? undefined
+          if (!id) return
+          const sentAt = yield* DateTime.now
+          yield* Cache.set(outbox, id, { raw: sent, sentAt })
+        })
 
       const newOutboundId = Effect.map(Ref.get(socket), (s) =>
         generateMessageIDV2(Option.isSome(s) ? s.value.user?.id : undefined) as MessageId,
       )
 
       const sendText = Effect.fn("WhatsApp.sendText")(function* (chatId: ChatId, text: string, options?: SendOptions) {
+        const quote = yield* quoteFor(chatId, options)
         const sent = yield* withSocket("sendText", chatId, (s) =>
-          s.sendMessage(chatId, { text }, options?.messageId === undefined ? {} : { messageId: options.messageId }),
+          s.sendMessage(chatId, { text }, { ...quote, ...(options?.messageId === undefined ? {} : { messageId: options.messageId }) }),
         )
         const id = sent?.key?.id
         if (!id) return yield* new SendFailed({ operation: "sendText", chatId, detail: "WhatsApp returned no message id" })
-        if (sent.message) yield* Cache.set(outbox, id, sent.message)
+        yield* remember(sent)
         yield* health.touch("outbound")
         yield* Effect.logInfo("sent text").pipe(Effect.annotateLogs({ chatId, messageId: id }))
         if (config.logBodies) yield* Effect.logDebug("outbound body").pipe(Effect.annotateLogs({ chatId, text }))
@@ -562,11 +668,13 @@ export const BaileysLive = (options: BaileysOptions) =>
       }
 
       const sendMedia = Effect.fn("WhatsApp.sendMedia")(function* (chatId: ChatId, media: OutboundMedia, options?: SendOptions) {
+        const quote = yield* quoteFor(chatId, { ...options, quoteMessageId: options?.quoteMessageId ?? media.quoteMessageId })
         const sent = yield* withSocket(
           `send${media.kind[0]?.toUpperCase()}${media.kind.slice(1)}`,
           chatId,
           (s) =>
             s.sendMessage(chatId, mediaContent(media), {
+              ...quote,
               mediaUploadTimeoutMs: Duration.toMillis(MEDIA_SEND_TIMEOUT),
               ...(options?.messageId === undefined ? {} : { messageId: options.messageId }),
             }),
@@ -574,7 +682,7 @@ export const BaileysLive = (options: BaileysOptions) =>
         )
         const id = sent?.key?.id
         if (!id) return yield* new SendFailed({ operation: `send ${media.kind}`, chatId, detail: "WhatsApp returned no message id" })
-        if (sent.message) yield* Cache.set(outbox, id, sent.message)
+        yield* remember(sent)
         yield* health.touch("outbound")
         yield* Effect.logInfo("sent media").pipe(
           Effect.annotateLogs({ chatId, messageId: id, kind: media.kind, mimetype: media.mimetype, bytes: media.bytes.byteLength }),
@@ -590,6 +698,39 @@ export const BaileysLive = (options: BaileysOptions) =>
       })
 
       const unreact = (chatId: ChatId, messageId: MessageId) => react(chatId, messageId, "")
+
+      const editText = Effect.fn("WhatsApp.editText")(function* (chatId: ChatId, messageId: MessageId, text: string) {
+        const original = yield* ownMessage(chatId, messageId, "edit", EDIT_WINDOW)
+        const sent = yield* withSocket("edit", chatId, (s) => s.sendMessage(chatId, { text, edit: original.key }))
+        // Keep the edited body so a later quote or resend shows the new text.
+        if (sent?.message) yield* Cache.set(outbox, messageId, { raw: { ...original, message: sent.message }, sentAt: yield* sentAtOf(messageId) })
+        yield* health.touch("outbound")
+        yield* Effect.logInfo("edited message").pipe(Effect.annotateLogs({ chatId, messageId }))
+      })
+
+      const sentAtOf = (messageId: MessageId) =>
+        Cache.getOption(outbox, messageId).pipe(
+          Effect.flatMap(Option.match({ onNone: () => DateTime.now, onSome: (e) => Effect.succeed(e.sentAt) })),
+        )
+
+      const deleteMessage = Effect.fn("WhatsApp.deleteMessage")(function* (chatId: ChatId, messageId: MessageId) {
+        const original = yield* ownMessage(chatId, messageId, "delete", DELETE_WINDOW)
+        yield* withSocket("delete", chatId, (s) => s.sendMessage(chatId, { delete: original.key }))
+        yield* Cache.invalidate(outbox, messageId)
+        yield* health.touch("outbound")
+        yield* Effect.logInfo("deleted message").pipe(Effect.annotateLogs({ chatId, messageId }))
+      })
+
+      const markRead = Effect.fn("WhatsApp.markRead")(function* (chatId: ChatId, messageIds: ReadonlyArray<MessageId>) {
+        const keys: Array<WAMessageKey> = []
+        for (const messageId of messageIds) {
+          const cached = yield* Cache.getOption(inboundRaw, dedupeKey(chatId, messageId))
+          if (Option.isSome(cached)) keys.push(cached.value.key)
+        }
+        if (keys.length === 0) return
+        yield* withSocket("read", chatId, (s) => s.readMessages(keys))
+        yield* Effect.logDebug("marked read").pipe(Effect.annotateLogs({ chatId, count: keys.length }))
+      })
 
       const setTyping = Effect.fn("WhatsApp.setTyping")(function* (chatId: ChatId, composing: boolean) {
         yield* withSocket("presence", chatId, (s) => s.sendPresenceUpdate(composing ? "composing" : "paused", chatId))
@@ -646,10 +787,14 @@ export const BaileysLive = (options: BaileysOptions) =>
         newOutboundId,
         sendText,
         sendMedia,
+        editText,
+        deleteMessage,
+        markRead,
         react,
         unreact,
         setTyping,
         downloadMedia,
+        updates: Stream.fromQueue(updates),
       })
     }),
   )

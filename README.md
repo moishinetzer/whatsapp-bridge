@@ -89,13 +89,14 @@ inbound message ──▶ 👀 within seconds ──▶ batch window (1.5 s) ─
                                                                                          a new turn carries all pending messages)
 ```
 
-- **Seen acknowledgment.** Every accepted inbound message gets the 👀 reaction (retried with backoff). If the reaction cannot be applied after retries, a warning is logged; set `BRIDGE_SEEN_FALLBACK_TEXT` to send a short text instead.
+- **Seen acknowledgment.** Every accepted inbound message is marked read (blue ticks, `BRIDGE_READ_RECEIPTS`) and gets the 👀 reaction within seconds, retried with backoff. One message per chat carries the eye: when the next message arrives, the eye comes off the previous one and goes onto the new one. If the reaction cannot be applied after retries, a warning is logged; set `BRIDGE_SEEN_FALLBACK_TEXT` to send a short text instead.
 - **Batching.** Messages from the same chat that arrive within `BRIDGE_BATCH_WINDOW` of each other are one turn. A message that arrives during the window restarts it, but a turn always opens within `BRIDGE_BATCH_MAX_WAIT` of its oldest message, so a steady trickle cannot postpone a reply forever.
-- **Interrupts.** If a message arrives while the responder is working (or while Intro is composing a reply in manual mode), the turn is *superseded*: the responder call is interrupted (an HTTP handler sees its request aborted), a `TurnSuperseded` event names the replacement, and a new `TurnOpened` carries every unanswered message. A reply posted for the old turn is refused with 409 so a stale answer is never sent.
+- **Interrupts.** If a message arrives while the responder is working (or while Intro is composing a reply in manual mode), the turn is *superseded*: the responder call is interrupted (an HTTP handler sees its request aborted), a `TurnSuperseded` event names the replacement, and a new `TurnOpened` carries every unanswered message. A reply posted for the old turn is refused with 409 so a stale answer is never sent. An edit of a pending message does the same with the corrected text; a delete drops the message, and a turn with nothing left is `cancelled`.
 - **Commit is atomic.** Once the responder has answered, the send-and-clear step cannot be interrupted: the reply goes out, the 👀 come off, then any newer message starts a fresh turn of its own.
 - **Idempotency.** Each WhatsApp message id is handled once per daemon run: one 👀, one turn. Echoes of the bridge's own messages are ignored (no reply loops).
-- **Typing.** "typing…" is shown while a turn is being answered (`BRIDGE_TYPING=false` to disable). It is a courtesy, never the seen signal.
-- **Failure.** If the responder fails, times out (`BRIDGE_TURN_TIMEOUT` in manual mode), or the send fails after retries, the turn is `failed`, a `TurnFailed` event says why, and the 👀 stays on as the visible "not handled" marker. The next message starts clean.
+- **Typing.** "typing…" is re-sent every 8 seconds while a turn is being answered, for at most `BRIDGE_TYPING_MAX` (3 minutes), re-armed by each progress call (`BRIDGE_TYPING=false` to disable). It is a courtesy, never the seen signal.
+- **Progress.** A long turn can say "still working": `POST /turns/{id}/progress` extends the deadline, re-arms typing, and can send an interim bubble that the final reply edits into its own text.
+- **Failure.** If the responder fails, times out (`BRIDGE_TURN_TIMEOUT` in manual mode), is abandoned by the agent, or the send fails after retries, the turn is `failed`, a `TurnFailed` event says why, the eye comes off, and the bridge replies to the newest message with `BRIDGE_FAILURE_TEXT` ("Something went wrong."). The next message starts clean.
 
 ## Integrating Intro
 
@@ -107,6 +108,7 @@ The integration style is **A: local daemon + API**. Intro never touches the What
 2. Generate the reply.
 3. `POST /turns/{turnId}/reply` with `{"text": "..."}` (or `{"replies": ["...", "..."]}` for several bubbles, plus `"attachments": [{"path": "/tmp/chart.png", "caption": "..."}]` for files). The call returns once the messages are sent and the 👀 cleared, with the sent message ids.
 4. On `409 TurnSuperseded`, drop the stale answer; the event stream already carries the replacement turn (`currentTurnId`).
+5. Taking a while? `POST /turns/{turnId}/progress {"text": "Checking…"}` keeps the typing indicator alive, pushes the deadline out, and the final reply can pass `replaceProgress: true` to edit that bubble instead of adding one. Giving up? `POST /turns/{turnId}/abandon {"reason": "..."}`.
 
 `examples/manual-loop.mjs` implements exactly this loop, including reconnecting with `?since=<last seq>` so nothing is missed.
 
@@ -182,6 +184,8 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | Text limits | A turn reply longer than 4000 characters is split at paragraph, line, sentence or space boundaries into several messages; whitespace-only replies are dropped. `POST /chats/{chatId}/messages` sends its text as **one** message and does not split, so keep it short. |
 | Files | Outgoing files are described by an [`OutboundMediaPayload`](#outboundmediapayload): a local `path` (preferred, the bridge reads it) or base64 `data` with a `mimetype`. `BRIDGE_MEDIA_MAX_BYTES` (25 MB) applies in both directions. Files are read and checked before anything is sent, so a bad path is a 4xx and nothing goes out. |
 | Idempotency | Sending a message twice sends it twice. A turn accepts exactly one reply; the second gets `409 TurnNotAwaitingReply` with `state: "committed"`. Inbound messages are deduplicated by id inside the bridge. |
+| Quoting | Any send can quote a message with `quoteMessageId`: a message the bridge saw or sent this run. On a proactive send an unknown id is `404 MessageUnknown`; on a turn reply the bubble goes out unquoted and a warning is logged, so a stale id never sinks the answer. |
+| Own messages | The bridge can edit (`PATCH`) or delete (`DELETE`) a message it sent this run, within WhatsApp's windows: 15 minutes to edit, about 2 days to delete. Past that: `409 MessageTooOld`. After a restart: `404 MessageUnknown`. |
 | Schema version | Every event carries `v: 1`. The version only changes on an incompatible change; new optional fields do not bump it. |
 
 ### Endpoints
@@ -192,6 +196,8 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | GET | [`/status`](#get-status) | The same body, always 200 |
 | GET | [`/events`](#get-events) | Server-sent events: turns, completions, connection changes |
 | POST | [`/chats/{chatId}/messages`](#post-chatschatidmessages) | Send a text |
+| PATCH | [`/chats/{chatId}/messages/{messageId}`](#patch-chatschatidmessagesmessageid) | Edit a message the bridge sent |
+| DELETE | [`/chats/{chatId}/messages/{messageId}`](#delete-chatschatidmessagesmessageid) | Delete for everyone a message the bridge sent |
 | POST | [`/chats/{chatId}/media`](#post-chatschatidmedia) | Send an image, video, audio or document |
 | POST | [`/chats/{chatId}/messages/{messageId}/reactions`](#post-chatschatidmessagesmessageidreactions) | React to a message |
 | DELETE | [`/chats/{chatId}/messages/{messageId}/reactions`](#delete-chatschatidmessagesmessageidreactions) | Remove our reaction |
@@ -201,6 +207,8 @@ Everything Intro can call, with exact shapes. The daemon also serves this as Ope
 | GET | [`/turns`](#get-turns) | Turns still waiting for a reply |
 | GET | [`/turns/{turnId}`](#get-turnsturnid) | One turn, open or finished |
 | POST | [`/turns/{turnId}/reply`](#post-turnsturnidreply) | Answer a turn |
+| POST | [`/turns/{turnId}/progress`](#post-turnsturnidprogress) | "Still working": extend the deadline, keep typing, send an interim bubble |
+| POST | [`/turns/{turnId}/abandon`](#post-turnsturnidabandon) | Give up on a turn with a reason |
 | GET | `/openapi.json`, `/docs` | The OpenAPI document and a browser UI for it (no token needed) |
 
 #### `GET /health`
@@ -277,8 +285,26 @@ Content-Type: application/json
 | Field | Type | Rule |
 |---|---|---|
 | `text` | string | non-empty, else `400 InvalidRequest` |
+| `quoteMessageId` | string, optional | Send as a reply to that message. `404 MessageUnknown` if the bridge never saw or sent it this run. |
 
-Errors: `503 NotConnected`, `502 SendFailed`. Direct sends are **not** retried by the bridge (turn replies are); a single attempt is capped at 30 seconds. On `NotConnected` with `state: "connecting"` wait and retry; on `SendFailed` retry once after a pause, then give up and tell the user another way.
+Errors: `503 NotConnected`, `502 SendFailed`, `404 MessageUnknown`. Direct sends are **not** retried by the bridge (turn replies are); a single attempt is capped at 30 seconds. On `NotConnected` with `state: "connecting"` wait and retry; on `SendFailed` retry once after a pause, then give up and tell the user another way.
+
+#### `PATCH /chats/{chatId}/messages/{messageId}`
+
+Replace the text of a message the bridge sent this run. WhatsApp shows it as edited.
+
+```http
+PATCH /chats/447700900123@s.whatsapp.net/messages/3EB0A1B2C3D4E5F60718
+Content-Type: application/json
+
+{"text": "Correction: the dentist is at 11, not 10."}
+```
+
+`204` with an empty body. Errors: `404 MessageUnknown` (not sent by the bridge this run), `409 MessageTooOld` (WhatsApp allows edits for 15 minutes; `ageMs` and `limitMs` say by how much), `503 NotConnected`, `502 SendFailed`. Captions of files can be edited the same way.
+
+#### `DELETE /chats/{chatId}/messages/{messageId}`
+
+Delete for everyone a message the bridge sent this run. `204` with an empty body. Errors: `404 MessageUnknown`, `409 MessageTooOld` (about 2 days), `503 NotConnected`, `502 SendFailed`.
 
 #### `POST /chats/{chatId}/media`
 
@@ -401,8 +427,10 @@ Content-Type: application/json
 | Field | Type | Rule |
 |---|---|---|
 | `text` | string, optional | One reply bubble. |
-| `replies` | string[], optional | Several bubbles, sent in order. When both are given, `replies` go first, then `text`. |
-| `attachments` | [`OutboundMediaPayload`](#outboundmediapayload)[], optional | Files, sent after the text bubbles, in order. Each may carry its own `caption`. |
+| `replies` | (string or `{text, quoteMessageId?}`)[], optional | Several bubbles, sent in order. When both are given, `replies` go first, then `text`. An object form quotes a message with that bubble. |
+| `attachments` | [`OutboundMediaPayload`](#outboundmediapayload)[], optional | Files, sent after the text bubbles, in order. Each may carry its own `caption` and `quoteMessageId`. |
+| `quoteMessageId` | string, optional | Quote this message with the first bubble, unless that bubble carries its own. Unknown ids are dropped with a warning, never a failure. |
+| `replaceProgress` | boolean, optional | Edit the last interim bubble sent through `progress` into the first text bubble instead of sending a new message. Ignored when there is no interim bubble. |
 
 Everything may be omitted: `{}` completes the turn **without sending anything** (the 👀 still clear, `sentMessageIds` is `[]`). Use that when the messages need no answer. Whitespace-only strings are dropped; strings over 4000 characters are split. `sentMessageIds` has one id per bubble and per file, in the order they went out.
 
@@ -414,11 +442,46 @@ Everything may be omitted: `{}` completes the turn **without sending anything** 
 |---|---|---|---|
 | 404 | `TurnNotFound` | Unknown turn id (or the daemon restarted). | Drop the answer. |
 | 409 | `TurnSuperseded` | Newer messages replaced this turn. `currentTurnId` names the replacement. | Drop the answer; answer `currentTurnId` instead (its `TurnOpened` carries every unanswered message). |
-| 409 | `TurnNotAwaitingReply` | The turn is not waiting for an external reply; `state` says what it is doing. `responding`: the `http` handler call is still running. `committed`: it was already answered. `failed`: it failed before your reply arrived. `batching`: it has not opened yet. | Nothing to send. |
+| 409 | `TurnNotAwaitingReply` | The turn is not waiting for an external reply; `state` says what it is doing. `responding`: the `http` handler call is still running. `committed`: it was already answered. `failed`: it failed before your reply arrived. `cancelled`: the user deleted every message of it. `batching`: it has not opened yet. | Nothing to send. |
 | 502 | `TurnFailedError` | The reply was accepted but sending failed after retries, or took over 90 seconds. `reason` explains. | The 👀 stays on. Tell the user through a fresh `POST /chats/{chatId}/messages` if the line is back, or wait for their next message. |
 | 400 / 404 / 413 | `OutboundInvalid` / `OutboundFileUnreadable` / `OutboundTooLarge` | An attachment could not be read or is too big. Checked **before** the turn is touched: it stays `awaiting`. | Fix the file and post the reply again. |
 
-In manual mode a turn waits `BRIDGE_TURN_TIMEOUT` (10 minutes) for this call; after that it fails with `TurnFailed` and a late reply gets `409 TurnNotAwaitingReply{state:"failed"}`.
+In manual mode a turn waits `BRIDGE_TURN_TIMEOUT` (10 minutes) for this call, counted from when it opened; `progress` pushes that out. After the deadline it fails with `TurnFailed`, the eye comes off, the failure text goes out, and a late reply gets `409 TurnNotAwaitingReply{state:"failed"}`.
+
+#### `POST /turns/{turnId}/progress`
+
+"Still working." Re-arms the typing indicator for another `BRIDGE_TYPING_MAX`, pushes the reply deadline out, and optionally sends an interim bubble. Call it as often as you like; each call resets typing and can only ever move the deadline later, never past one hour after the turn opened.
+
+```http
+POST /turns/turn_1f3c9e2ab7d04c6e8a1b/progress
+Content-Type: application/json
+
+{"text": "Checking both calendars…", "extendBy": "15 minutes"}
+```
+
+```json
+200 {"turnId":"turn_1f3c9e2ab7d04c6e8a1b","deadline":"2026-09-10T10:31:00.000Z","typingUntil":"2026-09-10T10:19:00.000Z","progressMessageId":"3EB0A1B2C3D4E5F60720"}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `text` | string, optional | Sent as its own bubble now. The reply can edit it into the answer with `replaceProgress: true`; otherwise it stays. |
+| `extendBy` | duration string, optional | How far from now the deadline moves (`"15 minutes"`, `"2 hours"` is capped). Default `BRIDGE_TURN_TIMEOUT`. |
+
+Errors: `404 TurnNotFound`, `409 TurnNotOpen` (`state` is not `responding` or `awaiting`), and for the interim bubble `503 NotConnected`, `502 SendFailed`. Works in both responder modes; in `http` mode only typing and the deadline of a later `{"async": true}` wait are affected.
+
+#### `POST /turns/{turnId}/abandon`
+
+Give up on an open turn. It fails at once with `reason` (visible as `abandoned: <reason>` in `TurnFailed` and `failure`), the eye comes off, and the user gets a quoted reply with `text`, or `BRIDGE_FAILURE_TEXT` when `text` is absent. An empty `text` sends nothing.
+
+```http
+POST /turns/turn_1f3c9e2ab7d04c6e8a1b/abandon
+Content-Type: application/json
+
+{"reason": "needs the app", "text": "This needs the app: open Grok Bot → approve the Link spend."}
+```
+
+`204` with an empty body. Errors: `404 TurnNotFound`, `409 TurnNotOpen`. In `http` mode the running handler request is aborted.
 
 ### Events
 
@@ -432,7 +495,11 @@ Every event is a JSON object with the envelope `{"_tag", "v": 1, "seq", "at"}` p
 | `TurnOpened` | `turnId`, `chatId`, `isGroup`, `messages[]`, `supersedes?` | The batch window closed; these messages want one reply. |
 | `TurnSuperseded` | `turnId`, `chatId`, `by` | Newer messages arrived mid-turn; stop working on `turnId`. The `TurnOpened` for `by` follows and carries everything. |
 | `TurnCompleted` | `turnId`, `chatId`, `sentMessageIds[]` | The reply went out and the 👀 were cleared. Empty `sentMessageIds` means the turn was completed with nothing to send. |
-| `TurnFailed` | `turnId`, `chatId`, `reason` | No reply could be sent; the 👀 stays on. |
+| `TurnFailed` | `turnId`, `chatId`, `reason` | No reply could be sent, or the agent abandoned the turn; the eye came off and the failure text went out. |
+| `TurnCancelled` | `turnId`, `chatId`, `reason` | The user deleted every message of the turn before it was answered. Nothing was sent. |
+| `ReactionReceived` | `chatId`, `messageId`, `senderId`, `emoji`, `onOurMessage` | Someone reacted in a handled chat. Empty `emoji` means removed. `onOurMessage` is true when the target is a message the bridge sent. Informational; never opens a turn. |
+| `MessageEdited` | `chatId`, `messageId`, `text` | The sender edited an accepted message; `text` is the new body. A pending message is corrected in place (batching) or its turn is superseded (responding, awaiting). |
+| `MessageDeleted` | `chatId`, `messageId` | The sender deleted an accepted message for everyone. A pending message is dropped; a turn left empty is cancelled. |
 | `ConnectionChanged` | `state`, `detail?` | The WhatsApp connection changed state; same values as `/health`. |
 
 ```json
@@ -463,9 +530,20 @@ Every event is a JSON object with the envelope `{"_tag", "v": 1, "seq", "at"}` p
 {"_tag":"ConnectionChanged","v":1,"seq":47,"at":"2026-09-09T10:30:00.000Z","state":"connecting","detail":"Connection Terminated (428)"}
 ```
 
-`TurnFailed.reason` is one of `responder failed: <detail>`, `no reply within <duration>`, `sending failed: <detail>`, `not connected: <detail>`, `crashed: <detail>`.
+```json
+{"_tag":"ReactionReceived","v":1,"seq":48,"at":"2026-09-10T10:32:00.000Z","chatId":"447700900123@s.whatsapp.net",
+ "messageId":"3EB0A1B2C3D4E5F60718","senderId":"447700900123@s.whatsapp.net","emoji":"👍","onOurMessage":true}
 
-A chat's lifecycle on the stream is always `MessageReceived`* → `TurnOpened` → (`TurnSuperseded` → `TurnOpened`)* → `TurnCompleted` | `TurnFailed`. A `TurnOpened` follows the first `MessageReceived` within `BRIDGE_BATCH_MAX_WAIT`, plus up to `BRIDGE_MEDIA_WAIT` when an attachment is being downloaded for it.
+{"_tag":"MessageEdited","v":1,"seq":49,"at":"2026-09-10T10:33:00.000Z","chatId":"447700900123@s.whatsapp.net",
+ "messageId":"3EB0C8F1A2B3C4D5E6F7","text":"can you check the calendar for thursday?"}
+
+{"_tag":"TurnCancelled","v":1,"seq":50,"at":"2026-09-10T10:34:00.000Z","turnId":"turn_0a1b2c3d4e5f60718293",
+ "chatId":"447700900123@s.whatsapp.net","reason":"every message was deleted by its sender"}
+```
+
+`TurnFailed.reason` is one of `responder failed: <detail>`, `no reply within <duration>`, `abandoned: <reason>`, `sending failed: <detail>`, `not connected: <detail>`, `crashed: <detail>`.
+
+A chat's lifecycle on the stream is always `MessageReceived`* → `TurnOpened` → (`TurnSuperseded` → `TurnOpened`)* → `TurnCompleted` | `TurnFailed` | `TurnCancelled`, with `MessageEdited`, `MessageDeleted` and `ReactionReceived` possible at any point. A `TurnOpened` follows the first `MessageReceived` within `BRIDGE_BATCH_MAX_WAIT`, plus up to `BRIDGE_MEDIA_WAIT` when an attachment is being downloaded for it.
 
 ### Objects
 
@@ -525,9 +603,10 @@ What `GET /turns` and `GET /turns/{turnId}` return.
 | `awaiting` | yes | Waiting for `POST /turns/{turnId}/reply` (manual mode, or an `http` handler that answered `{"async": true}`). |
 | `committed` | no | Replied; `sentMessageIds` set. |
 | `superseded` | no | Replaced by `supersededBy`. |
-| `failed` | no | `failure` says why; the 👀 stays on. |
+| `failed` | no | `failure` says why; the eye came off and the failure text went out. |
+| `cancelled` | no | Every message was deleted by its sender before an answer went out. |
 
-Transitions: `batching` → `responding` → (`awaiting`) → `committed`, with `superseded` possible from any open state and `failed` from `responding` or `awaiting`.
+Transitions: `batching` → `responding` → (`awaiting`) → `committed`, with `superseded` possible from any open state (a newer message or an edit), `failed` from `responding` or `awaiting`, and `cancelled` from any open state (a delete that left nothing).
 
 #### `TurnPayload`
 
@@ -591,6 +670,9 @@ Every error body is `{"_tag": "...", ...fields}`. The status code is fixed per t
 | 401 | `Unauthorized` | `message` | Bearer token missing or wrong. | Send the configured token. |
 | 404 | `RouteNotFound` | `method`, `path` | No such endpoint (also an empty path segment, e.g. `/turns//reply`). | Check the path. |
 | 404 | `TurnNotFound` | `turnId` | Unknown or pruned turn, or the daemon restarted. | Drop the answer. |
+| 404 | `MessageUnknown` | `chatId`, `messageId`, `reason` | The message to quote, edit or delete is not one the bridge saw or sent this run. | Check the id; after a restart, only new messages are known. |
+| 409 | `MessageTooOld` | `chatId`, `messageId`, `operation`, `limitMs`, `ageMs` | WhatsApp's window for the edit (15 minutes) or delete (about 2 days) has passed. | Send a correction as a new message instead. |
+| 409 | `TurnNotOpen` | `turnId`, `state` | `progress` or `abandon` on a turn that is not `responding` or `awaiting`. | Nothing to do. |
 | 404 | `MediaUnavailable` | `chatId`, `messageId`, `reason` | No media on that message, or not seen this run and nothing on disk. | Say so in the reply rather than pretending the attachment was seen. |
 | 404 | `OutboundFileUnreadable` | `path`, `detail` | The file to send does not exist, is a directory, or is not readable by the daemon. | Check the path (absolute, on the bridge machine). |
 | 400 | `OutboundInvalid` | `detail` | Raw `data` without a `mimetype`, or an empty file. | Fix the payload. |
@@ -611,7 +693,7 @@ Every error body is `{"_tag": "...", ...fields}`. The status code is fixed per t
 
 `BRIDGE_RESPONDER` decides who answers a turn. The events, the turn registry and every endpoint above behave the same in all three modes.
 
-**`manual`** (default). The bridge does nothing on its own: on `TurnOpened` the turn is `awaiting` and waits `BRIDGE_TURN_TIMEOUT` (10 minutes) for `POST /turns/{turnId}/reply`. Intro drives the loop from `GET /events`. When the timeout passes, `TurnFailed` with `no reply within 10 minutes` and the 👀 stays on.
+**`manual`** (default). The bridge does nothing on its own: on `TurnOpened` the turn is `awaiting` and waits `BRIDGE_TURN_TIMEOUT` (10 minutes) for `POST /turns/{turnId}/reply`, longer with `progress`. Intro drives the loop from `GET /events`. When the deadline passes, `TurnFailed` with `no reply within ...`, the eye comes off, and the failure text goes out.
 
 **`http`**. The bridge POSTs each turn to `INTRO_HANDLER_URL` and sends back what the handler returns.
 
@@ -638,12 +720,16 @@ The client commands (`health`, `send`, `react`, `unreact`, `media`, `turns`, `re
 | `run` | | The daemon: WhatsApp connection, turn engine, HTTP API. Long-lived; Ctrl-C stops it after in-flight replies finish. | Logs |
 | `harness` | `--slow <duration>` (0), `--once` | `run` with the `pong` responder. `--once` exits after the first completed turn. | Logs |
 | `health` | | `GET /status` | The `BridgeStatus`; **exit code 0 only when `state` is `ok`**, 1 otherwise. Unreachable daemon: `{"state":"stopped","detail":"daemon not reachable at ..."}` and exit 1. |
-| `send` | `--to <jid or phone>`, then `--text <text>` or `--file <path>` (with `--caption`, `--as <image\|video\|audio\|document>`) | `POST /chats/{chatId}/messages` or `POST /chats/{chatId}/media`. A phone number in any format is converted to a jid. | `{"chatId","messageId"}` |
+| `send` | `--to <jid or phone>`, then `--text <text>` or `--file <path>` (with `--caption`, `--as <image\|video\|audio\|document>`), `--quote <messageId>` | `POST /chats/{chatId}/messages` or `POST /chats/{chatId}/media`. A phone number in any format is converted to a jid. | `{"chatId","messageId"}` |
+| `edit` | `--chat`, `--message <id>`, `--text` | `PATCH /chats/{chatId}/messages/{messageId}` | `{"ok":true}` |
+| `delete` | `--chat`, `--message <id>` | `DELETE /chats/{chatId}/messages/{messageId}` | `{"ok":true}` |
 | `react` | `--chat <jid or phone>`, `--message <id>`, `--emoji <emoji>` (👀) | `POST .../reactions` | `{"ok":true}` |
 | `unreact` | `--chat`, `--message` | `DELETE .../reactions` | `{"ok":true}` |
 | `media` | `--chat`, `--message` | `GET .../media`: downloads if needed. | The `MediaFile` |
 | `turns` | | `GET /turns` | The open `TurnSummary[]` |
-| `reply` | `--turn <turnId>`, `--text <text>` and/or `--file <path>` (`--caption`, `--as`) | `POST /turns/{turnId}/reply`; the file goes after the text. | `{"turnId","sentMessageIds"}` |
+| `reply` | `--turn <turnId>`, `--text <text>` and/or `--file <path>` (`--caption`, `--as`), `--quote <messageId>`, `--replace-progress` | `POST /turns/{turnId}/reply`; the file goes after the text. | `{"turnId","sentMessageIds"}` |
+| `progress` | `--turn <turnId>`, `--text <text>`, `--extend <duration>` | `POST /turns/{turnId}/progress` | `{"turnId","deadline","typingUntil","progressMessageId"?}` |
+| `abandon` | `--turn <turnId>`, `--reason <text>`, `--text <text>` | `POST /turns/{turnId}/abandon` | `{"ok":true}` |
 | `unlink` | `--yes` (required) | Deletes the saved session so the next `link` starts clean. Without `--yes` it refuses. | `Removed <dir>.` |
 
 Durations on the CLI use the same format as the configuration: `"15 seconds"`, `"10 minutes"`.
@@ -652,7 +738,17 @@ Durations on the CLI use the same format as the configuration: `"15 seconds"`, `
 
 **Answer a turn (manual mode).** Read `TurnOpened.messages` (oldest first, one burst from one chat). Produce one reply for the whole burst. `POST /turns/{turnId}/reply {"text"}`. On `200`, done: the bridge cleared the 👀. On `409 TurnSuperseded`, discard and wait for (or look up) `currentTurnId`. On `409 TurnNotAwaitingReply`, discard. On `502 TurnFailedError`, the reply was not delivered; decide whether a fresh `POST /chats/{chatId}/messages` is appropriate once `GET /health` is `ok`.
 
-**Nothing to say.** `POST /turns/{turnId}/reply {}` completes the turn silently and clears the 👀. Do this rather than leaving the turn to time out: a timed-out turn leaves the 👀 on, which the user reads as "not handled".
+**Nothing to say.** `POST /turns/{turnId}/reply {}` completes the turn silently and clears the eye. Do this rather than leaving the turn to time out: a timed-out turn sends the failure text.
+
+**Taking a while.** Within the first minutes, `POST /turns/{turnId}/progress {"text": "Checking…"}`. Typing stays on, the deadline moves, and the user sees a bubble. Answer with `replaceProgress: true` so that bubble becomes the answer, or leave it and add a new one. Repeat progress calls as needed; the hard cap is one hour after the turn opened.
+
+**Cannot do it.** `POST /turns/{turnId}/abandon {"reason": "needs the app", "text": "This needs the app: …"}`. The turn fails with your reason, the eye comes off, the user gets your text quoted on their message.
+
+**Correct yourself.** `PATCH /chats/{chatId}/messages/{messageId} {"text": "..."}` within 15 minutes of sending; `DELETE` within about 2 days. Both only for messages the bridge sent since it started.
+
+**The user edited or deleted something.** Nothing to do: a pending message is corrected or dropped for you, and the turn is superseded or cancelled with an event. If the edit arrives after you answered, `MessageEdited` is your cue to answer again if it matters.
+
+**Watch the reactions.** `ReactionReceived` with `onOurMessage: true` is feedback on an answer: a 👍 needs nothing, a ❌ or 👎 is worth a follow-up in the same chat.
 
 **Keep the stream alive.** Open `GET /events?since=<last seq>` (omit `since` the very first time). Parse `data:` frames. Store `seq` from every frame. If no frame arrives for 60 seconds, reconnect. On reconnect the replay fills the gap; if the first replayed `seq` is more than `last seq + 1`, or smaller than it (daemon restart), call `GET /turns` and answer whatever is open.
 
@@ -691,6 +787,9 @@ Environment variables, with `.env` in the working directory as a fallback (`.env
 | `BRIDGE_TURN_TIMEOUT` | `10 minutes` | How long a turn waits for `POST /turns/{id}/reply` |
 | `BRIDGE_SEEN_EMOJI` | `👀` | The seen reaction |
 | `BRIDGE_SEEN_FALLBACK_TEXT` | unset | Text ack if the reaction fails |
+| `BRIDGE_READ_RECEIPTS` | `true` | Mark accepted messages as read (blue ticks, subject to the phone's privacy setting) |
+| `BRIDGE_FAILURE_TEXT` | `Something went wrong.` | Quoted reply sent when a turn fails or is abandoned; empty disables |
+| `BRIDGE_TYPING_MAX` | `3 minutes` | How long "typing…" is kept alive per turn, re-armed by progress |
 | `BRIDGE_GROUPS` | `false` | Handle group chats |
 | `BRIDGE_ALLOWED_SENDERS` | unset (anyone) | Comma-separated numbers/jids allowed to talk to the line |
 | `BRIDGE_OFFLINE_WINDOW` | `0 seconds` | Handle messages replayed after downtime that are younger than this |
@@ -747,7 +846,9 @@ The bridge is built so that every failure is either recovered automatically or r
 | A message cannot be decoded | Logged with the reason, skipped; everything else flows. |
 | WhatsApp re-delivers a message | Ignored: one 👀 and one turn per message id, checked in the transport and again in the engine. |
 | Messages keep trickling in | The turn opens at `BRIDGE_BATCH_MAX_WAIT` regardless. |
-| The responder fails, times out, or throws | `TurnFailed` with the reason, 👀 left on, typing cleared; the worker moves on to the next message. |
+| The responder fails, times out, throws, or the agent abandons the turn | `TurnFailed` with the reason, the eye taken off, typing cleared, the failure text sent as a quoted reply; the worker moves on to the next message. |
+| The user edits or deletes a message the bridge is handling | Batching: corrected or dropped in place. Answering: the turn is superseded with the corrected text, or cancelled when nothing is left. Events say which. |
+| A quote names a message the bridge does not know | Proactive send: `404 MessageUnknown`. Turn reply: sent without the quote, warning logged. |
 | Sending the reply fails | Retried 5 times with backoff (about 30 s, enough for a reconnect); then `TurnFailed`. The message id is fixed before the first attempt, so a send that timed out but went through is never delivered twice. |
 | A reply is very long or empty | Text over 4000 characters is split at paragraph, line or sentence boundaries into several messages; blank replies are dropped. |
 | An attachment fails to download | The turn still opens (without `media`) after `BRIDGE_MEDIA_WAIT`; the failure is logged; the on-demand endpoint retries (failures are never cached). |
@@ -772,7 +873,7 @@ The bridge is built so that every failure is either recovered automatically or r
 
 ```sh
 npm run typecheck     # tsc, strict
-npm test              # vitest: engine (batching, interrupts, atomic commit, failures, manual replies), API, media in and out, the http responder, extraction
+npm test              # vitest: engine (batching, interrupts, edits and deletes, progress, abandon, quoting, typing), API, media in and out, the http responder, extraction
 npm run check         # both
 npm run build         # dist/ + bin/bridge.js
 ```

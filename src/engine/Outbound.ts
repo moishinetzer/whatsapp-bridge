@@ -134,6 +134,7 @@ export const OutboundLive = Layer.effect(
         ...(payload.caption === undefined || payload.caption.length === 0 ? {} : { caption: payload.caption }),
         ...(kind === "document" ? { fileName } : {}),
         ...(kind === "audio" && payload.voiceNote === true ? { voiceNote: true } : {}),
+        ...(payload.quoteMessageId === undefined ? {} : { quoteMessageId: payload.quoteMessageId }),
       }
       return media
     })

@@ -27,6 +27,12 @@ export interface BridgeConfigShape {
   readonly turnTimeout: Duration.Duration
   readonly seenEmoji: string
   readonly seenFallbackText: Option.Option<string>
+  /** Mark accepted messages as read (blue ticks) on acceptance. */
+  readonly readReceipts: boolean
+  /** Sent as a quoted reply to a turn's newest message when the turn fails. `None` disables it. */
+  readonly failureText: Option.Option<string>
+  /** The typing indicator is re-sent every few seconds while a turn is open, for at most this long (re-armed by progress). */
+  readonly typingMax: Duration.Duration
   readonly groups: boolean
   /** Normalized to digits (for numbers) or full jids. Empty means everyone. */
   readonly allowedSenders: ReadonlyArray<string>
@@ -83,6 +89,15 @@ const knobs = {
   turnTimeout: knob("BRIDGE_TURN_TIMEOUT", Config.duration("BRIDGE_TURN_TIMEOUT").pipe(Config.withDefault(Duration.minutes(10)))),
   seenEmoji: knob("BRIDGE_SEEN_EMOJI", Config.string("BRIDGE_SEEN_EMOJI").pipe(Config.withDefault("👀"))),
   seenFallbackText: knob("BRIDGE_SEEN_FALLBACK_TEXT", Config.option(Config.string("BRIDGE_SEEN_FALLBACK_TEXT"))),
+  readReceipts: knob("BRIDGE_READ_RECEIPTS", Config.boolean("BRIDGE_READ_RECEIPTS").pipe(Config.withDefault(true))),
+  failureText: knob(
+    "BRIDGE_FAILURE_TEXT",
+    Config.string("BRIDGE_FAILURE_TEXT").pipe(
+      Config.withDefault("Something went wrong."),
+      Config.map((s) => (s.trim().length === 0 ? Option.none<string>() : Option.some(s))),
+    ),
+  ),
+  typingMax: knob("BRIDGE_TYPING_MAX", Config.duration("BRIDGE_TYPING_MAX").pipe(Config.withDefault(Duration.minutes(3)))),
   groups: knob("BRIDGE_GROUPS", Config.boolean("BRIDGE_GROUPS").pipe(Config.withDefault(false))),
   allowedSenders: knob("BRIDGE_ALLOWED_SENDERS", Config.string("BRIDGE_ALLOWED_SENDERS").pipe(Config.map(list), Config.withDefault([]))),
   offlineWindow: knob("BRIDGE_OFFLINE_WINDOW", Config.duration("BRIDGE_OFFLINE_WINDOW").pipe(Config.withDefault(Duration.zero))),

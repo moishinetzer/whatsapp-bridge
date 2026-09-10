@@ -57,7 +57,44 @@ export class MediaDownloadFailed extends Schema.TaggedError<MediaDownloadFailed>
   }
 }
 
+/** The message to quote, edit, delete or mark read is not one the bridge saw or sent this run. */
+export class MessageUnknown extends Schema.TaggedError<MessageUnknown>()(
+  "MessageUnknown",
+  { chatId: ChatId, messageId: MessageId, reason: Schema.String },
+  { httpApiStatus: 404 },
+) {
+  override get message() {
+    return `message ${this.messageId} unknown: ${this.reason}`
+  }
+}
+
+/** WhatsApp only allows edits for 15 minutes and deletes for everyone for about 2 days. */
+export class MessageTooOld extends Schema.TaggedError<MessageTooOld>()(
+  "MessageTooOld",
+  { chatId: ChatId, messageId: MessageId, operation: Schema.String, limitMs: Schema.Number, ageMs: Schema.Number },
+  { httpApiStatus: 409 },
+) {
+  override get message() {
+    return `cannot ${this.operation} ${this.messageId}: sent ${Math.round(this.ageMs / 1000)} s ago, WhatsApp allows ${Math.round(this.limitMs / 1000)} s`
+  }
+}
+
 export type WhatsAppError = NotConnected | SendFailed
+/** Sends that quote, edits and deletes can also fail because the target message is unknown or too old. */
+export type MessageError = MessageUnknown | MessageTooOld
+
+/** Something happened to a message the bridge had accepted, or someone reacted in a handled chat. */
+export type InboundUpdate =
+  | { readonly _tag: "Edited"; readonly chatId: ChatId; readonly messageId: MessageId; readonly text: string }
+  | { readonly _tag: "Deleted"; readonly chatId: ChatId; readonly messageId: MessageId }
+  | {
+      readonly _tag: "Reaction"
+      readonly chatId: ChatId
+      readonly messageId: MessageId
+      readonly senderId: string
+      readonly emoji: string
+      readonly onOurMessage: boolean
+    }
 export type MediaTransportError = MediaUnavailable | MediaTooLarge | MediaDownloadFailed
 
 export interface DownloadedMedia {
@@ -75,6 +112,8 @@ export interface SendOptions {
    * that timed out but actually went through is never delivered twice.
    */
   readonly messageId?: MessageId | undefined
+  /** Send as a reply to this message. `MessageUnknown` when the bridge never saw or sent it. */
+  readonly quoteMessageId?: MessageId | undefined
 }
 
 export interface WhatsAppShape {
@@ -84,9 +123,17 @@ export interface WhatsAppShape {
   readonly linked: Effect.Effect<LinkedIdentity>
   /** A fresh outbound message id in WhatsApp's format. */
   readonly newOutboundId: Effect.Effect<MessageId>
-  readonly sendText: (chatId: ChatId, text: string, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError>
+  readonly sendText: (chatId: ChatId, text: string, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError | MessageUnknown>
   /** Send a file (image, video, audio or document) with the bytes already in memory; see `Outbound.load`. */
-  readonly sendMedia: (chatId: ChatId, media: OutboundMedia, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError>
+  readonly sendMedia: (chatId: ChatId, media: OutboundMedia, options?: SendOptions) => Effect.Effect<MessageId, WhatsAppError | MessageUnknown>
+  /** Replace the text of a message the bridge sent this run (WhatsApp: within 15 minutes). */
+  readonly editText: (chatId: ChatId, messageId: MessageId, text: string) => Effect.Effect<void, WhatsAppError | MessageError>
+  /** Delete for everyone a message the bridge sent this run (WhatsApp: within about 2 days). */
+  readonly deleteMessage: (chatId: ChatId, messageId: MessageId) => Effect.Effect<void, WhatsAppError | MessageError>
+  /** Mark accepted inbound messages as read (blue ticks). Unknown ids are skipped. */
+  readonly markRead: (chatId: ChatId, messageIds: ReadonlyArray<MessageId>) => Effect.Effect<void, WhatsAppError>
+  /** Edits, deletes and reactions on messages in handled chats, after the bridge accepted them. */
+  readonly updates: Stream.Stream<InboundUpdate>
   readonly react: (chatId: ChatId, messageId: MessageId, emoji: string) => Effect.Effect<void, WhatsAppError>
   readonly unreact: (chatId: ChatId, messageId: MessageId) => Effect.Effect<void, WhatsAppError>
   readonly setTyping: (chatId: ChatId, composing: boolean) => Effect.Effect<void, WhatsAppError>

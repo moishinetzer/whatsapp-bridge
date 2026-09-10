@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { MessageId } from "./ids.ts"
 
 /** How WhatsApp presents an outgoing file. `document` sends anything as a file, full quality, no preview. */
 export const OutboundKind = Schema.Literals(["image", "video", "audio", "document"])
@@ -23,6 +24,8 @@ export const OutboundMediaPayload = Schema.Struct({
   fileName: Schema.optionalKey(Schema.String),
   /** Audio only: send as a voice note (needs `audio/ogg; codecs=opus`) instead of an audio file. */
   voiceNote: Schema.optionalKey(Schema.Boolean),
+  /** Send as a reply to this message (a message the bridge saw or sent). */
+  quoteMessageId: Schema.optionalKey(MessageId),
 }).check(
   Schema.makeFilter((o) =>
     (o.path === undefined) === (o.data === undefined) ? { path: [], issue: "give exactly one of path or data" } : true,
@@ -38,9 +41,34 @@ export interface OutboundMedia {
   readonly caption?: string
   readonly fileName?: string
   readonly voiceNote?: boolean
+  readonly quoteMessageId?: MessageId
+}
+
+/** A text bubble, optionally as a reply to a message. */
+export interface OutgoingText {
+  readonly text: string
+  readonly quoteMessageId?: MessageId
 }
 
 /** One item of a reply: a text bubble or a file. */
-export type Outgoing = string | OutboundMedia
+export type Outgoing = OutgoingText | OutboundMedia
 
-export const isMedia = (item: Outgoing): item is OutboundMedia => typeof item !== "string"
+export const isMedia = (item: Outgoing): item is OutboundMedia => "bytes" in item
+
+/** A plain text bubble. */
+export const text = (body: string, quoteMessageId?: MessageId): OutgoingText =>
+  quoteMessageId === undefined ? { text: body } : { text: body, quoteMessageId }
+
+/** Accepts the loose shapes callers use (plain strings included) and returns proper items. */
+export const outgoing = (items: ReadonlyArray<string | Outgoing>): ReadonlyArray<Outgoing> =>
+  items.map((item) => (typeof item === "string" ? { text: item } : item))
+
+/**
+ * One entry of `replies` on the wire: a string, or an object when the bubble
+ * should quote a message.
+ */
+export const ReplyItem = Schema.Union([
+  Schema.String,
+  Schema.Struct({ text: Schema.String, quoteMessageId: Schema.optionalKey(MessageId) }),
+])
+export type ReplyItem = typeof ReplyItem.Type

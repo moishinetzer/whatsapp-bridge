@@ -3,7 +3,7 @@ import { HttpClient, HttpClientRequest, HttpClientResponse, HttpIncomingMessage 
 import { BridgeConfig } from "../config.ts"
 import { ChatId, TurnId } from "../domain/ids.ts"
 import { InboundMessage } from "../domain/message.ts"
-import { OutboundMediaPayload, type Outgoing } from "../domain/outbound.ts"
+import { OutboundMediaPayload, outgoing, type Outgoing } from "../domain/outbound.ts"
 import { Outbound } from "./Outbound.ts"
 import type { ResponderKind } from "../domain/status.ts"
 
@@ -80,7 +80,7 @@ export const PongResponderLive = (slow: Duration.Input) =>
       kind: "pong",
       respond: Effect.fn("Responder.pong")(function* (turn: TurnPayload) {
         yield* Effect.sleep(slow)
-        return { _tag: "Replies", replies: [pongText(turn)] } as const
+        return { _tag: "Replies", replies: outgoing([pongText(turn)]) } as const
       }),
     }),
   )
@@ -110,7 +110,7 @@ export const HttpResponderLive = Layer.effect(
         const body = yield* HttpIncomingMessage.schemaBodyJson(HandlerResponse)(ok)
         if (body.async === true) return { _tag: "External" } as const
         const files = yield* Effect.forEach(body.attachments ?? [], outbound.load)
-        const replies: ReadonlyArray<Outgoing> = [...(body.replies ?? []), ...(body.text ? [body.text] : []), ...files]
+        const replies: ReadonlyArray<Outgoing> = [...outgoing(body.replies ?? []), ...outgoing(body.text ? [body.text] : []), ...files]
         return { _tag: "Replies", replies } as const
       },
       (effect, turn) =>

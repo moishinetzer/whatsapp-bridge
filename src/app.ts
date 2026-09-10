@@ -96,7 +96,7 @@ export const coreLayer = (transport: BaileysOptions, overrides: Partial<BridgeCo
 /** The daemon: transport + turn engine + local HTTP API. */
 export const daemonLayer = (overrides: Partial<BridgeConfigShape> = {}) => {
   const Core = coreLayer({ mode: "serve" }, overrides)
-  const Registry = TurnRegistryLive
+  const Registry = TurnRegistryLive.pipe(Layer.provide(Core))
   const Media = MediaStoreLive.pipe(Layer.provide([Core, NodeServices.layer]))
   const Outbound = OutboundLive.pipe(Layer.provide([Core, NodeServices.layer]))
   const Responder = ResponderLive.pipe(Layer.provide([Core, Outbound, FetchHttpClient.layer]))

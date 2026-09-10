@@ -11,8 +11,10 @@ Intro answers as **Intro, Moishi's assistant**, on this number. Warm, short, Wha
 1. Subscribe to `GET /events`. Remember the `seq` of every event; on reconnect pass `?since=<seq>`.
 2. On `TurnOpened`, read all of `messages` (they are one burst from one chat, oldest first) and generate one reply for the whole burst.
 3. `POST /turns/{turnId}/reply` with the text. The 👀 on those messages disappears once it is sent.
-4. On `TurnSuperseded`, stop working on that turn. The next `TurnOpened` for the chat contains the old messages plus the new ones; answer that instead. A late reply to the old turn gets `409 TurnSuperseded` and is not sent.
-5. On `TurnFailed`, the 👀 stays on those messages. If the reason is something Intro can fix (for example a handler error), it may `POST /chats/{chatId}/messages` a short note or simply wait for Moishi's next message, which starts a clean turn.
+4. On `TurnSuperseded`, stop working on that turn. The next `TurnOpened` for the chat contains the old messages plus the new ones (or the corrected text, after an edit); answer that instead. A late reply to the old turn gets `409 TurnSuperseded` and is not sent.
+5. Taking longer than a minute? `POST /turns/{turnId}/progress {"text": "Checking…"}` keeps typing alive, extends the deadline, and puts a bubble in the chat that the reply can replace with `replaceProgress: true`. Cannot do it at all? `POST /turns/{turnId}/abandon {"reason", "text"}` fails the turn and tells the user in your words.
+6. On `TurnFailed`, the eye has already come off and the failure text has gone out; nothing to repair. On `TurnCancelled`, the user deleted the messages; do nothing.
+7. `ReactionReceived` on one of Intro's messages is feedback; `MessageEdited` after an answer went out is a cue to answer again if the change matters.
 
 `GET /turns` lists what is still open, for catching up after a restart.
 
@@ -33,7 +35,7 @@ Sending works the same way in reverse. Write the file on the bridge machine and 
 
 ## Being alive
 
-Moishi's signal that Intro saw a message is the 👀; the bridge applies it, Intro does not need to. Intro's signal that the *line* is alive is `GET /health` (`ok` versus `needs_relink`). When it reports `needs_relink`, Intro cannot fix that from code: it tells Moishi (through whatever other channel it has) to run `npm run link` on the bridge machine.
+Moishi's signal that Intro saw a message is the blue ticks plus the 👀 on the newest unanswered message; the bridge applies both, Intro does not need to. Correcting an earlier answer is `PATCH /chats/{chatId}/messages/{messageId}` within 15 minutes; quoting the message being answered (`quoteMessageId`) is worth it when several questions are in flight. Intro's signal that the *line* is alive is `GET /health` (`ok` versus `needs_relink`). When it reports `needs_relink`, Intro cannot fix that from code: it tells Moishi (through whatever other channel it has) to run `npm run link` on the bridge machine.
 
 ## Operating it
 
